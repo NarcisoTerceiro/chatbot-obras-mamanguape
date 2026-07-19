@@ -1,7 +1,16 @@
 // ============================================================
 //  sheets.js
-//  Le a planilha "ChatBot - Obras Mamanguape" no Google Sheets
-//  usando uma Conta de Servico (Service Account) so de leitura.
+//  Le a planilha configurada em GOOGLE_SHEETS_ID usando uma
+//  Conta de Servico (Service Account) so de leitura.
+//
+//  MODO AUTOMATICO: por padrao, o bot detecta sozinho TODAS as
+//  abas que existem na planilha (nao precisa listar SHEETS_TABS).
+//  Isso permite trocar de planilha livremente, sem reconfigurar.
+//
+//  Se quiser limitar manualmente a certas abas, defina a variavel
+//  de ambiente SHEETS_TABS (separadas por virgula). Deixe vazia
+//  ou remova para usar o modo automatico (recomendado).
+//
 //  Cada linha vira um objeto { coluna: valor } usando a 1a linha
 //  da aba como cabecalho -> funciona com qualquer conjunto de colunas.
 // ============================================================
@@ -9,7 +18,10 @@
 import { google } from "googleapis";
 
 const SHEET_ID = process.env.GOOGLE_SHEETS_ID;
-const TABS = (process.env.SHEETS_TABS || "EM_ANDAMENTO")
+
+// Se SHEETS_TABS estiver definida (e nao vazia), usa so essas abas.
+// Caso contrario, o bot detecta sozinho todas as abas da planilha.
+const TABS_MANUAIS = (process.env.SHEETS_TABS || "")
   .split(",")
   .map((t) => t.trim())
   .filter(Boolean);
@@ -34,6 +46,27 @@ const sheetsApi = google.sheets({ version: "v4", auth: getAuth() });
 let cache = { data: null, time: 0 };
 const CACHE_MS = 60 * 1000; // 60 segundos
 
+// --- Cache separado da LISTA de abas (nomes mudam bem menos que os dados) ---
+let cacheAbas = { nomes: null, time: 0 };
+const CACHE_ABAS_MS = 5 * 60 * 1000; // 5 minutos
+
+// Descobre sozinho todos os nomes de abas que existem na planilha atual.
+async function listarAbasDaPlanilha() {
+  const agora = Date.now();
+  if (cacheAbas.nomes && agora - cacheAbas.time < CACHE_ABAS_MS) {
+    return cacheAbas.nomes;
+  }
+
+  const resp = await sheetsApi.spreadsheets.get({
+    spreadsheetId: SHEET_ID,
+    fields: "sheets.properties.title",
+  });
+
+  const nomes = (resp.data.sheets || []).map((s) => s.properties.title);
+  cacheAbas = { nomes, time: agora };
+  return nomes;
+}
+
 // Converte uma aba (matriz de linhas) em lista de objetos usando o cabecalho.
 function rowsToObjects(rows, tabName) {
   if (!rows || rows.length < 2) return [];
@@ -47,22 +80,32 @@ function rowsToObjects(rows, tabName) {
   });
 }
 
-// Retorna TODAS as obras de TODAS as abas configuradas (com cache).
+// Retorna TODAS as obras de TODAS as abas (manuais ou detectadas automaticamente).
 export async function getObras() {
   const agora = Date.now();
   if (cache.data && agora - cache.time < CACHE_MS) {
     return cache.data;
   }
 
+  // Usa as abas manuais se configuradas; senao, detecta sozinho.
+  const tabs = TABS_MANUAIS.length > 0
+    ? TABS_MANUAIS
+    : await listarAbasDaPlanilha();
+
+  if (tabs.length === 0) {
+    cache = { data: [], time: agora };
+    return [];
+  }
+
   // Le todas as abas de uma vez
   const resp = await sheetsApi.spreadsheets.values.batchGet({
     spreadsheetId: SHEET_ID,
-    ranges: TABS, // pegar a aba inteira: basta passar o nome da aba
+    ranges: tabs, // pegar a aba inteira: basta passar o nome da aba
   });
 
   const todas = [];
   (resp.data.valueRanges || []).forEach((vr, idx) => {
-    const nomeAba = TABS[idx];
+    const nomeAba = tabs[idx];
     todas.push(...rowsToObjects(vr.values, nomeAba));
   });
 
