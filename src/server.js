@@ -28,9 +28,10 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
-// Quantas obras mostrar no maximo numa unica resposta (WhatsApp fica ilegivel
-// se vier informacao demais de uma vez).
+// Quantas obras mostrar no maximo numa resposta DETALHADA (cada uma ocupa
+// bastante espaço). Numa resposta RESUMIDA (so nomes), cabe bem mais.
 const LIMITE_RESULTADOS = 3;
+const LIMITE_RESUMIDO = 15;
 
 // --- Memoria de curto prazo por cidadao (numero de WhatsApp) ---
 // Guarda a(s) ultima(s) obra(s) que essa pessoa perguntou, para que
@@ -85,6 +86,34 @@ app.post("/webhook", (req, res) => {
 //  Formatacao: o SISTEMA monta o texto da resposta (sem IA),
 //  usando exatamente as colunas que existirem na planilha.
 // ------------------------------------------------------------
+
+// Tenta achar o campo que funciona como "nome" da obra, testando nomes
+// comuns de coluna. Se nao achar nenhum, usa o primeiro campo preenchido.
+function campoNome(obra) {
+  const candidatos = ["OBJETO DA OBRA", "OBJETO", "NOME DA OBRA", "NOME", "OBRA"];
+  for (const c of candidatos) {
+    if (obra[c]) return obra[c];
+  }
+  const primeiro = Object.entries(obra).find(([k, v]) => k !== "_aba" && v);
+  return primeiro ? primeiro[1] : "Obra sem nome cadastrado";
+}
+
+function campoStatus(obra) {
+  return obra["STATUS"] || obra["Status"] || obra["SITUAÇÃO"] || "";
+}
+
+// Resposta RESUMIDA: so o nome (+ status, se existir) - para quando a
+// pessoa so quer uma lista rapida, sem todos os detalhes.
+function formatarResumido(obra) {
+  const status = campoStatus(obra);
+  return status ? `• ${campoNome(obra)} (${status})` : `• ${campoNome(obra)}`;
+}
+
+function formatarListaResumida(obras) {
+  return obras.map((o) => formatarResumido(o)).join("\n");
+}
+
+// Resposta COMPLETA: todos os campos preenchidos da obra.
 function formatarObra(obra) {
   const linhas = [];
   for (const [chave, valor] of Object.entries(obra)) {
@@ -150,14 +179,26 @@ async function processarWebhook(payload) {
       return;
     }
 
-    // Passo D: listagem geral - o sistema lista as obras direto, sem IA.
+    // Passo D: listagem geral - o sistema lista as obras direto, sem IA
+    // "redigir" nada - so decide RESUMIDO ou COMPLETO conforme a IA percebeu.
     if (interpretacao.tipo === "listagem") {
+      if (interpretacao.detalhe === "resumido") {
+        const lista = obras.slice(0, LIMITE_RESUMIDO);
+        const texto =
+          `Temos ${obras.length} obra(s) cadastrada(s):\n\n` +
+          formatarListaResumida(lista) +
+          (obras.length > LIMITE_RESUMIDO
+            ? `\n\n...e mais ${obras.length - LIMITE_RESUMIDO}. Pergunte por uma obra específica para ver detalhes.`
+            : "");
+        await enviarTexto(de, texto);
+        return;
+      }
       const lista = obras.slice(0, LIMITE_RESULTADOS);
       const texto =
-        `Temos ${obras.length} obra(s) cadastrada(s). Aqui estão as primeiras:\n\n` +
+        `Temos ${obras.length} obra(s) cadastrada(s). Aqui estão as primeiras, com detalhes:\n\n` +
         formatarLista(lista) +
         (obras.length > LIMITE_RESULTADOS
-          ? `\n\n...e mais ${obras.length - LIMITE_RESULTADOS}. Pergunte por bairro, rua ou tipo para ver mais detalhes.`
+          ? `\n\n...e mais ${obras.length - LIMITE_RESULTADOS}. Pergunte por bairro, rua ou tipo para ver mais.`
           : "");
       await enviarTexto(de, texto);
       return;
@@ -199,11 +240,16 @@ async function processarWebhook(payload) {
     // Guarda essas obras como contexto para a proxima pergunta dessa pessoa.
     salvarContexto(de, encontradas);
 
-    // Passo F: o SISTEMA monta e envia a resposta com os dados encontrados.
-    const texto =
-      encontradas.length === 1
-        ? formatarObra(encontradas[0])
-        : `Encontrei ${encontradas.length} obra(s):\n\n` + formatarLista(encontradas);
+    // Passo F: o SISTEMA monta e envia a resposta com os dados encontrados,
+    // resumida ou completa conforme a IA percebeu que a pessoa quer.
+    let texto;
+    if (interpretacao.detalhe === "resumido" && encontradas.length > 1) {
+      texto = `Encontrei ${encontradas.length} obra(s):\n\n` + formatarListaResumida(encontradas);
+    } else if (encontradas.length === 1) {
+      texto = formatarObra(encontradas[0]);
+    } else {
+      texto = `Encontrei ${encontradas.length} obra(s):\n\n` + formatarLista(encontradas);
+    }
 
     await enviarTexto(de, texto);
   } catch (e) {

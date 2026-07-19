@@ -18,22 +18,32 @@ const SYSTEM_PROMPT = `Voce interpreta perguntas de cidadaos sobre obras publica
 de uma prefeitura, enviadas por WhatsApp de forma informal, formal, com girias,
 abreviacoes ou erros de digitacao.
 
-Sua UNICA tarefa: extrair os termos de busca reais que devem ser usados para
-procurar na planilha de obras (bairro, rua, tipo de obra, nome de obra, empresa,
-etc.), normalizando girias e sinonimos para termos comuns em obras publicas.
-Exemplos de normalizacao: "asfalto"/"asfaltamento" -> "pavimentacao";
-"colegio" -> "escola"; "postinho"/"posto" -> "UBS" ou "posto de saude";
-"pracinha" -> "praca".
+Sua tarefa tem duas partes:
+
+1) Extrair os termos de busca reais que devem ser usados para procurar na
+planilha de obras (bairro, rua, tipo de obra, nome de obra, empresa, etc.),
+normalizando girias e sinonimos para termos comuns em obras publicas.
+Exemplos: "asfalto"/"asfaltamento" -> "pavimentacao"; "colegio" -> "escola";
+"postinho"/"posto" -> "UBS" ou "posto de saude"; "pracinha" -> "praca".
+
+2) Decidir o NIVEL DE DETALHE que a pessoa quer na resposta:
+- "resumido": quando ela pede so os nomes, uma lista rapida, "quais obras
+  tem", "me fala os nomes", ou qualquer pedido que nao peça detalhes
+  especificos.
+- "completo": quando ela pede detalhes especificos de uma obra (valor,
+  empresa, status, prazo, engenheiro responsavel, percentual executado,
+  etc.) ou faz uma pergunta especifica sobre uma obra.
 
 Tambem identifique se a mensagem e uma SAUDACAO/conversa solta sem pedido de
-informacao especifica (ex: "oi", "bom dia", "obrigado", "tudo bem?") ou um
-pedido de LISTAGEM GERAL (ex: "quais obras existem", "quais obras estao
-cadastradas", "me mostra as obras").
+informacao (ex: "oi", "bom dia", "obrigado") ou um pedido de LISTAGEM GERAL
+(ex: "quais obras existem", "quais obras estao cadastradas", "me mostra as
+obras", "me fala os nomes das obras").
 
 Responda SOMENTE com um JSON valido, sem texto antes ou depois, no formato:
-{"tipo": "busca" | "saudacao" | "listagem", "termos": ["termo1", "termo2"]}
+{"tipo": "busca" | "saudacao" | "listagem", "termos": ["termo1", "termo2"], "detalhe": "resumido" | "completo"}
 
-Se tipo for "saudacao" ou "listagem", "termos" pode ser uma lista vazia.`;
+Se tipo for "saudacao", "termos" pode ser lista vazia e "detalhe" irrelevante.
+Se tipo for "listagem", "termos" normalmente e lista vazia.`;
 
 export async function interpretarPergunta(pergunta) {
   const body = {
@@ -76,10 +86,11 @@ export async function interpretarPergunta(pergunta) {
     return {
       tipo: interpretado.tipo || "busca",
       termos: Array.isArray(interpretado.termos) ? interpretado.termos : [],
+      detalhe: interpretado.detalhe === "resumido" ? "resumido" : "completo",
     };
   } catch {
     // Se a IA nao devolver um JSON valido, cai para busca com a frase crua -
     // o sistema ainda tenta buscar direto pelo texto original.
-    return { tipo: "busca", termos: [] };
+    return { tipo: "busca", termos: [], detalhe: "completo" };
   }
 }
