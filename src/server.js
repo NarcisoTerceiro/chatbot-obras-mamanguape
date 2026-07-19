@@ -116,6 +116,9 @@ async function processarWebhook(payload) {
       interpretacao = { tipo: "busca", termos: [] };
     }
 
+    // LOG TEMPORARIO DE DEBUG - remover depois de confirmar que esta ok
+    console.log("DEBUG interpretacao:", JSON.stringify(interpretacao));
+
     // Passo C: saudacao / conversa solta - resposta fixa do sistema, sem buscar.
     if (interpretacao.tipo === "saudacao") {
       await enviarTexto(
@@ -142,8 +145,10 @@ async function processarWebhook(payload) {
     // Passo E: busca especifica - usa os termos da IA; se vier vazio, cai
     // para a busca direta pelo texto cru da pergunta (respaldo).
     let encontradas = buscarObrasPorTermos(interpretacao.termos, obras, LIMITE_RESULTADOS);
+    console.log(`DEBUG busca por termos da IA: ${encontradas.length} resultado(s)`);
     if (encontradas.length === 0) {
       encontradas = buscarObras(pergunta, obras, LIMITE_RESULTADOS);
+      console.log(`DEBUG busca direta pelo texto: ${encontradas.length} resultado(s)`);
     }
 
     if (encontradas.length === 0) {
