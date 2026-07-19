@@ -30,7 +30,7 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
 // Quantas obras mostrar no maximo numa unica resposta (WhatsApp fica ilegivel
 // se vier informacao demais de uma vez).
-const LIMITE_RESULTADOS = 5;
+const LIMITE_RESULTADOS = 3;
 
 // Rota de saude (util pra manter o servico "acordado" e testar no navegador).
 app.get("/", (_req, res) => res.send("Chatbot de Obras de Mamanguape no ar."));
@@ -68,7 +68,9 @@ function formatarObra(obra) {
   const linhas = [];
   for (const [chave, valor] of Object.entries(obra)) {
     if (chave === "_aba" || !valor) continue;
-    linhas.push(`• *${chave}*: ${valor}`);
+    const texto = valor.toString();
+    const valorCurto = texto.length > 200 ? texto.slice(0, 200) + "…" : texto;
+    linhas.push(`• *${chave}*: ${valorCurto}`);
   }
   return linhas.join("\n");
 }
