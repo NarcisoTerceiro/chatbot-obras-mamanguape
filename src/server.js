@@ -4,6 +4,12 @@
 //  Fluxo (igual ao item 2 do documento):
 //  WhatsApp -> Webhook (aqui) -> Google Sheets (busca) ->
 //  Groq (interpreta e responde) -> WhatsApp Cloud API (envia)
+//
+//  A IA (Groq) sempre participa da conversa: quando a busca por
+//  palavra-chave nao encontra nada especifico, o bot manda TODAS
+//  as obras pra IA, para que ela consiga responder perguntas
+//  abertas/gerais (ex: "qual obra ta perto de terminar?"),
+//  formais ou informais, sem depender de um padrao fixo de frase.
 // ============================================================
 
 import "dotenv/config";
@@ -20,6 +26,10 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
+// Limite de obras a enviar pra IA quando a busca por palavra-chave nao
+// encontra nada especifico (evita mandar uma planilha gigante de uma vez).
+const LIMITE_OBRAS_GERAL = 40;
+
 // Rota de saude (util pra manter o servico "acordado" e testar no navegador).
 app.get("/", (_req, res) => res.send("Chatbot de Obras de Mamanguape no ar."));
 
@@ -30,9 +40,6 @@ app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
-
-  // LOG TEMPORARIO DE DEBUG - remover depois que o webhook verificar certo
-  console.log(`DEBUG webhook: mode=${mode} | token recebido="${token}" | token esperado="${VERIFY_TOKEN}"`);
 
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
     console.log("Webhook verificado com sucesso.");
@@ -70,24 +77,35 @@ async function processarWebhook(payload) {
   console.log(`Pergunta de ${de}: ${pergunta}`);
 
   try {
-    // Passo A: le a planilha (com cache) e busca as obras que combinam.
+    // Passo A: le a planilha (com cache).
     const obras = await getObras();
-    const encontradas = buscarObras(pergunta, obras);
 
-    // Passo B: se nada bateu, responde de forma simpatica sem gastar IA.
-    if (encontradas.length === 0) {
+    if (obras.length === 0) {
       await enviarTexto(
         de,
-        "Nao encontrei nenhuma obra correspondente. Tente citar o bairro, " +
-          "a rua ou o tipo da obra (ex.: pavimentacao, praca, escola)."
+        "No momento nao encontrei nenhuma obra cadastrada na base. " +
+          "Tente novamente mais tarde."
       );
       return;
     }
 
-    // Passo C: a IA formula a resposta usando SO os dados encontrados.
-    const resposta = await responderComIA(pergunta, encontradas);
+    // Passo B: tenta achar obras especificas pela palavra-chave da pergunta
+    // (bairro, rua, tipo, nome). Isso deixa a resposta mais precisa quando
+    // o cidadao ja cita algo especifico.
+    const encontradas = buscarObras(pergunta, obras);
 
-    // Passo D: envia de volta pelo WhatsApp.
+    // Passo C: se a busca por palavra-chave nao achou nada especifico,
+    // NAO desiste - manda a lista geral de obras pra IA conversar sobre
+    // isso, cobrindo perguntas abertas ("qual obra ta quase pronta?",
+    // "quais obras existem?", "oi", "obrigado", etc.), formais ou
+    // informais, sem depender de um padrao fixo de frase.
+    const dadosParaIA =
+      encontradas.length > 0 ? encontradas : obras.slice(0, LIMITE_OBRAS_GERAL);
+
+    // Passo D: a IA sempre participa - formula a resposta usando os dados.
+    const resposta = await responderComIA(pergunta, dadosParaIA);
+
+    // Passo E: envia de volta pelo WhatsApp.
     await enviarTexto(de, resposta || "Nao consegui gerar a resposta agora.");
   } catch (e) {
     console.error("Falha no processamento:", e);
