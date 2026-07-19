@@ -3,15 +3,18 @@
 //
 //  Fluxo:
 //  WhatsApp -> Webhook (aqui)
-//           -> IA (Groq) SO INTERPRETA a pergunta e extrai termos
+//           -> IA (Groq) INTERPRETA a pergunta e extrai termos
 //           -> Sistema (search.js) busca na planilha (Google Sheets)
-//           -> Sistema MONTA a resposta com os dados encontrados
+//           -> Sistema entrega as obras encontradas de volta a IA
+//           -> IA (Groq) REDIGE a resposta final do jeito que o
+//              cidadao pediu (resumida, completa, ou so um dado
+//              especifico: valor, data, prazo, empresa...)
 //           -> WhatsApp Cloud API envia ao cidadao
 //
-//  A IA nunca acessa a planilha nem redige a resposta final -
-//  ela so ajuda a entender o que o cidadao quis dizer, mesmo de
-//  forma informal, com girias ou erros de digitacao. Quem busca
-//  e quem informa o cidadao e sempre o sistema.
+//  A IA nunca acessa a planilha diretamente e nunca inventa dado:
+//  ela so redige em cima do que o SISTEMA encontrou. Se a IA de
+//  redacao falhar (ex.: limite atingido), o proprio sistema monta
+//  a resposta com um formatador simples, sem travar o atendimento.
 // ============================================================
 
 import "dotenv/config";
@@ -19,7 +22,7 @@ import express from "express";
 
 import { getObras } from "./sheets.js";
 import { buscarObrasPorTermos, buscarObras } from "./search.js";
-import { interpretarPergunta } from "./groq.js";
+import { interpretarPergunta, redigirResposta } from "./groq.js";
 import { enviarTexto } from "./whatsapp.js";
 
 const app = express();
@@ -83,8 +86,9 @@ app.post("/webhook", (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  Formatacao: o SISTEMA monta o texto da resposta (sem IA),
-//  usando exatamente as colunas que existirem na planilha.
+//  Formatacao de RESPALDO (fallback): usada so quando a IA de
+//  redacao falha. O SISTEMA monta o texto usando exatamente as
+//  colunas que existirem na planilha, sem depender da IA.
 // ------------------------------------------------------------
 
 // Tenta achar o campo que funciona como "nome" da obra, testando nomes
@@ -102,8 +106,7 @@ function campoStatus(obra) {
   return obra["STATUS"] || obra["Status"] || obra["SITUAÇÃO"] || "";
 }
 
-// Resposta RESUMIDA: so o nome (+ status, se existir) - para quando a
-// pessoa so quer uma lista rapida, sem todos os detalhes.
+// Resposta RESUMIDA: so o nome (+ status, se existir).
 function formatarResumido(obra) {
   const status = campoStatus(obra);
   return status ? `• ${campoNome(obra)} (${status})` : `• ${campoNome(obra)}`;
@@ -127,6 +130,18 @@ function formatarObra(obra) {
 
 function formatarLista(obras) {
   return obras.map((o, i) => `${i + 1}) ${formatarObra(o)}`).join("\n\n");
+}
+
+// Monta a resposta localmente (sem IA) a partir das obras encontradas.
+// Usada como respaldo quando a IA de redacao nao responde.
+function montarRespostaLocal(encontradas, detalhe) {
+  if (detalhe === "resumido" && encontradas.length > 1) {
+    return `Encontrei ${encontradas.length} obra(s):\n\n` + formatarListaResumida(encontradas);
+  }
+  if (encontradas.length === 1) {
+    return formatarObra(encontradas[0]);
+  }
+  return `Encontrei ${encontradas.length} obra(s):\n\n` + formatarLista(encontradas);
 }
 
 // ------------------------------------------------------------
@@ -163,7 +178,7 @@ async function processarWebhook(payload) {
       interpretacao = await interpretarPergunta(pergunta);
     } catch (e) {
       console.error("IA de interpretacao falhou, usando busca direta:", e.message);
-      interpretacao = { tipo: "busca", termos: [] };
+      interpretacao = { tipo: "busca", termos: [], detalhe: "completo" };
     }
 
     // LOG TEMPORARIO DE DEBUG - remover depois de confirmar que esta ok
@@ -179,28 +194,31 @@ async function processarWebhook(payload) {
       return;
     }
 
-    // Passo D: listagem geral - o sistema lista as obras direto, sem IA
-    // "redigir" nada - so decide RESUMIDO ou COMPLETO conforme a IA percebeu.
+    // Passo D: listagem geral - o sistema entrega as obras e a IA redige a
+    // lista (resumida ou completa). Se a IA falhar, usa o formatador local.
     if (interpretacao.tipo === "listagem") {
-      if (interpretacao.detalhe === "resumido") {
-        const lista = obras.slice(0, LIMITE_RESUMIDO);
-        const texto =
-          `Temos ${obras.length} obra(s) cadastrada(s):\n\n` +
-          formatarListaResumida(lista) +
-          (obras.length > LIMITE_RESUMIDO
-            ? `\n\n...e mais ${obras.length - LIMITE_RESUMIDO}. Pergunte por uma obra específica para ver detalhes.`
-            : "");
-        await enviarTexto(de, texto);
-        return;
+      const resumido = interpretacao.detalhe === "resumido";
+      const limite = resumido ? LIMITE_RESUMIDO : LIMITE_RESULTADOS;
+      const lista = obras.slice(0, limite);
+      const restante = obras.length - lista.length;
+
+      let corpo;
+      try {
+        corpo = await redigirResposta(pergunta, lista, interpretacao.detalhe);
+      } catch (e) {
+        console.error("IA de redacao (listagem) falhou, usando formatador local:", e.message);
+        corpo = resumido
+          ? `Temos ${obras.length} obra(s) cadastrada(s):\n\n` + formatarListaResumida(lista)
+          : `Temos ${obras.length} obra(s) cadastrada(s). Aqui estão as primeiras, com detalhes:\n\n` +
+            formatarLista(lista);
       }
-      const lista = obras.slice(0, LIMITE_RESULTADOS);
-      const texto =
-        `Temos ${obras.length} obra(s) cadastrada(s). Aqui estão as primeiras, com detalhes:\n\n` +
-        formatarLista(lista) +
-        (obras.length > LIMITE_RESULTADOS
-          ? `\n\n...e mais ${obras.length - LIMITE_RESULTADOS}. Pergunte por bairro, rua ou tipo para ver mais.`
-          : "");
-      await enviarTexto(de, texto);
+
+      const rodape =
+        restante > 0
+          ? `\n\n...e mais ${restante}. Pergunte por uma obra específica (bairro, rua, tipo ou nome) para ver detalhes.`
+          : "";
+
+      await enviarTexto(de, corpo + rodape);
       return;
     }
 
@@ -240,15 +258,15 @@ async function processarWebhook(payload) {
     // Guarda essas obras como contexto para a proxima pergunta dessa pessoa.
     salvarContexto(de, encontradas);
 
-    // Passo F: o SISTEMA monta e envia a resposta com os dados encontrados,
-    // resumida ou completa conforme a IA percebeu que a pessoa quer.
+    // Passo F: o SISTEMA entrega as obras encontradas para a IA, que REDIGE a
+    // resposta final do jeito que o cidadao pediu (resumida, completa ou so um
+    // dado especifico). Se a IA de redacao falhar, usa o formatador local.
     let texto;
-    if (interpretacao.detalhe === "resumido" && encontradas.length > 1) {
-      texto = `Encontrei ${encontradas.length} obra(s):\n\n` + formatarListaResumida(encontradas);
-    } else if (encontradas.length === 1) {
-      texto = formatarObra(encontradas[0]);
-    } else {
-      texto = `Encontrei ${encontradas.length} obra(s):\n\n` + formatarLista(encontradas);
+    try {
+      texto = await redigirResposta(pergunta, encontradas, interpretacao.detalhe);
+    } catch (e) {
+      console.error("IA de redacao falhou, usando formatador local:", e.message);
+      texto = montarRespostaLocal(encontradas, interpretacao.detalhe);
     }
 
     await enviarTexto(de, texto);
