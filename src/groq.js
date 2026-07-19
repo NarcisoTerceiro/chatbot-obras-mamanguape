@@ -1,59 +1,48 @@
 // ============================================================
 //  groq.js
-//  Envia a pergunta + os dados da(s) obra(s) encontrada(s)
-//  para a Groq (API compativel com OpenAI) e recebe a resposta
-//  em linguagem natural. A IA so pode usar os dados fornecidos
-//  para fatos sobre obras, mas pode conversar naturalmente
-//  (saudacoes, agradecimentos, perguntas abertas/gerais).
+//  A IA (Groq) tem UMA SO funcao aqui: ENTENDER a pergunta do
+//  cidadao (mesmo informal, com girias ou erros de digitacao) e
+//  transformar isso em termos de busca reais, que o SISTEMA
+//  (search.js) vai usar para procurar na planilha.
+//
+//  A IA NAO redige a resposta final e NAO recebe os dados da
+//  planilha - ela so interpreta a pergunta. Quem busca e quem
+//  informa o cidadao e sempre o sistema (server.js + search.js).
 // ============================================================
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 
-const SYSTEM_PROMPT = `Voce e o assistente de obras publicas da Prefeitura de Mamanguape (PB),
-falando com o cidadao pelo WhatsApp. Responda sempre em portugues do Brasil.
+const SYSTEM_PROMPT = `Voce interpreta perguntas de cidadaos sobre obras publicas
+de uma prefeitura, enviadas por WhatsApp de forma informal, formal, com girias,
+abreviacoes ou erros de digitacao.
 
-Estilo: converse de forma natural, educada e objetiva - pode ser tanto formal quanto
-informal, adaptando-se ao tom da mensagem do cidadao. Nao existe um "padrao fixo" de
-frase que o cidadao precisa usar: ele pode perguntar de qualquer jeito (formal,
-informal, direto, com erros de digitacao, girias, etc.) e voce deve entender a
-intencao e responder de forma util.
+Sua UNICA tarefa: extrair os termos de busca reais que devem ser usados para
+procurar na planilha de obras (bairro, rua, tipo de obra, nome de obra, empresa,
+etc.), normalizando girias e sinonimos para termos comuns em obras publicas.
+Exemplos de normalizacao: "asfalto"/"asfaltamento" -> "pavimentacao";
+"colegio" -> "escola"; "postinho"/"posto" -> "UBS" ou "posto de saude";
+"pracinha" -> "praca".
 
-Sobre saudacoes e conversa solta (ex.: "oi", "bom dia", "obrigado", "tudo bem?"):
-responda de forma cordial e breve, e convide a pessoa a perguntar sobre alguma obra,
-sem inventar dados.
+Tambem identifique se a mensagem e uma SAUDACAO/conversa solta sem pedido de
+informacao especifica (ex: "oi", "bom dia", "obrigado", "tudo bem?") ou um
+pedido de LISTAGEM GERAL (ex: "quais obras existem", "quais obras estao
+cadastradas", "me mostra as obras").
 
-Sobre perguntas relacionadas a obras: use EXCLUSIVAMENTE os dados fornecidos abaixo.
-NUNCA invente prazos, valores, percentuais ou status que nao estejam nos dados. Se os
-dados nao trouxerem a informacao especifica pedida, diga claramente que essa
-informacao nao consta na base, mas ainda assim tente ajudar com o que houver
-disponivel (ex.: liste as obras existentes, ou a mais proxima do que foi perguntado).
+Responda SOMENTE com um JSON valido, sem texto antes ou depois, no formato:
+{"tipo": "busca" | "saudacao" | "listagem", "termos": ["termo1", "termo2"]}
 
-Para perguntas abertas ou comparativas (ex.: "qual obra esta mais perto de terminar?",
-"quais obras existem no momento?", "tem alguma obra na minha rua?"), analise TODAS as
-obras fornecidas e responda com base nelas, mesmo que a pergunta nao cite um bairro
-ou tipo de obra especifico.
+Se tipo for "saudacao" ou "listagem", "termos" pode ser uma lista vazia.`;
 
-Quando houver mais de uma obra relevante, resuma cada uma em poucas linhas, de forma
-clara e facil de ler no WhatsApp.`;
-
-export async function responderComIA(pergunta, obras) {
-  // Monta o bloco de dados que a IA vai poder usar.
-  const dados = JSON.stringify(obras, null, 2);
-
+export async function interpretarPergunta(pergunta) {
   const body = {
     model: GROQ_MODEL,
-    temperature: 0.3,
-    max_tokens: 600,
+    temperature: 0,
+    max_tokens: 150,
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
-      {
-        role: "user",
-        content:
-          `Dados disponiveis sobre obras (pode ser uma lista parcial ou geral):\n${dados}\n\n` +
-          `Mensagem do cidadao: "${pergunta}"`,
-      },
+      { role: "user", content: pergunta },
     ],
   };
 
@@ -68,9 +57,25 @@ export async function responderComIA(pergunta, obras) {
 
   if (!resp.ok) {
     const erro = await resp.text();
-    throw new Error(`Groq respondeu ${resp.status}: ${erro}`);
+    const err = new Error(`Groq respondeu ${resp.status}: ${erro}`);
+    err.status = resp.status;
+    throw err;
   }
 
   const data = await resp.json();
-  return data.choices?.[0]?.message?.content?.trim() || "";
+  const texto = data.choices?.[0]?.message?.content?.trim() || "{}";
+
+  try {
+    // Remove eventuais cercas de markdown (```json ... ```) se a IA colocar.
+    const limpo = texto.replace(/^```json\s*|```$/g, "").trim();
+    const interpretado = JSON.parse(limpo);
+    return {
+      tipo: interpretado.tipo || "busca",
+      termos: Array.isArray(interpretado.termos) ? interpretado.termos : [],
+    };
+  } catch {
+    // Se a IA nao devolver um JSON valido, cai para busca com a frase crua -
+    // o sistema ainda tenta buscar direto pelo texto original.
+    return { tipo: "busca", termos: [] };
+  }
 }
