@@ -1,0 +1,45 @@
+# ============================================================
+#  render.yaml  -  Blueprint do Render
+#  Ao conectar o repositorio no Render (New > Blueprint), ele le
+#  este arquivo e cria o servico web gratuito automaticamente.
+# ============================================================
+services:
+  - type: web
+    name: chatbot-obras-mamanguape
+    runtime: node
+    plan: free                    # <- plano GRATUITO (R$ 0,00)
+    branch: main                  # troque se seu branch tiver outro nome
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    autoDeploy: true              # todo "git push" reimplanta sozinho
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+
+      # --- Segredos: sync:false = o Render pergunta o valor no painel ---
+      # (assim NAO ficam salvos no GitHub)
+      - key: WHATSAPP_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: VERIFY_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GOOGLE_SHEETS_ID
+        sync: false
+
+      # --- Valores fixos (podem ficar no repo tranquilamente) ---
+      - key: GRAPH_API_VERSION
+        value: v22.0
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: SHEETS_TABS
+        value: EM_ANDAMENTO,EM_LICITACAO,EM_PROJETO,PAVIMENTACAO,PENDENCIAS
+
+      # --- Credencial do Google (via Secret File no Render) ---
+      # Voce vai criar um "Secret File" chamado service-account.json no painel;
+      # o Render o monta neste caminho, ja apontado aqui:
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/service-account.json
