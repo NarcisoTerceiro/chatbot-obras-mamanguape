@@ -31,6 +31,9 @@ app.get("/webhook", (req, res) => {
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
+  // LOG TEMPORARIO DE DEBUG - remover depois que o webhook verificar certo
+  console.log(`DEBUG webhook: mode=${mode} | token recebido="${token}" | token esperado="${VERIFY_TOKEN}"`);
+
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
     console.log("Webhook verificado com sucesso.");
     return res.status(200).send(challenge); // devolve o desafio -> confirma
