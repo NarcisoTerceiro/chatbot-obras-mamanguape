@@ -40,6 +40,7 @@ export async function interpretarPergunta(pergunta) {
     model: GROQ_MODEL,
     temperature: 0,
     max_tokens: 150,
+    response_format: { type: "json_object" },
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: pergunta },
@@ -64,6 +65,9 @@ export async function interpretarPergunta(pergunta) {
 
   const data = await resp.json();
   const texto = data.choices?.[0]?.message?.content?.trim() || "{}";
+
+  // LOG TEMPORARIO DE DEBUG - remover depois de confirmar que esta ok
+  console.log("DEBUG resposta crua da IA:", JSON.stringify(texto));
 
   try {
     // Remove eventuais cercas de markdown (```json ... ```) se a IA colocar.

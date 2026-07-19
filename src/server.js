@@ -32,6 +32,27 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 // se vier informacao demais de uma vez).
 const LIMITE_RESULTADOS = 3;
 
+// --- Memoria de curto prazo por cidadao (numero de WhatsApp) ---
+// Guarda a(s) ultima(s) obra(s) que essa pessoa perguntou, para que
+// perguntas de acompanhamento (ex.: "quanto gastou?", "quem e a empresa?")
+// sem repetir o nome/bairro da obra ainda funcionem.
+const contextoPorUsuario = new Map();
+const CONTEXTO_VALIDADE_MS = 10 * 60 * 1000; // 10 minutos
+
+function salvarContexto(de, obras) {
+  contextoPorUsuario.set(de, { obras, time: Date.now() });
+}
+
+function lerContexto(de) {
+  const ctx = contextoPorUsuario.get(de);
+  if (!ctx) return null;
+  if (Date.now() - ctx.time > CONTEXTO_VALIDADE_MS) {
+    contextoPorUsuario.delete(de);
+    return null;
+  }
+  return ctx.obras;
+}
+
 // Rota de saude (util pra manter o servico "acordado" e testar no navegador).
 app.get("/", (_req, res) => res.send("Chatbot de Obras de Mamanguape no ar."));
 
@@ -152,13 +173,31 @@ async function processarWebhook(payload) {
     }
 
     if (encontradas.length === 0) {
-      await enviarTexto(
-        de,
-        "Não encontrei nenhuma obra correspondente. Tente citar o bairro, " +
-          "a rua ou o tipo da obra (ex.: pavimentação, praça, escola)."
-      );
+      // Nada encontrado agora - tenta reaproveitar o contexto da(s) ultima(s)
+      // obra(s) que essa pessoa perguntou ha pouco tempo (pergunta de
+      // acompanhamento, tipo "quanto gastou?" sem citar a obra de novo).
+      const contexto = lerContexto(de);
+      if (contexto && contexto.length > 0) {
+        console.log("DEBUG usando contexto anterior do usuario");
+        encontradas = contexto;
+      }
+    }
+
+    if (encontradas.length === 0) {
+      // Nada encontrado e nenhum contexto anterior: em vez de dizer que nao
+      // achou nada, o sistema mostra um resumo geral das obras cadastradas,
+      // para que o cidadao sempre receba alguma informacao util.
+      const lista = obras.slice(0, LIMITE_RESULTADOS);
+      const texto =
+        `Não encontrei uma obra específica para essa pergunta. Temos ${obras.length} obra(s) cadastrada(s) no momento. Aqui estão algumas:\n\n` +
+        formatarLista(lista) +
+        `\n\nVocê pode perguntar por bairro, rua, tipo de obra ou nome específico para ver mais detalhes.`;
+      await enviarTexto(de, texto);
       return;
     }
+
+    // Guarda essas obras como contexto para a proxima pergunta dessa pessoa.
+    salvarContexto(de, encontradas);
 
     // Passo F: o SISTEMA monta e envia a resposta com os dados encontrados.
     const texto =
