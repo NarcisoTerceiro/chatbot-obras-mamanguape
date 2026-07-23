@@ -253,7 +253,14 @@ async function processarWebhook(payload) {
         interpretacao = await interpretarPergunta(pergunta, historico);
       } catch (e) {
         console.error("IA de interpretacao falhou, usando busca direta:", e.message);
-        interpretacao = { tipo: "busca", termos: [], detalhe: "completo", operacao: "", filtro_status: "" };
+        interpretacao = {
+          tipo: "busca",
+          termos: [],
+          detalhe: "completo",
+          operacao: "",
+          filtro_status: "",
+          falhou: true,
+        };
       }
 
       // LOG TEMPORARIO DE DEBUG - remover depois de confirmar que esta ok
@@ -360,11 +367,15 @@ async function processarWebhook(payload) {
       //  Passo F: BUSCA especifica
       // ------------------------------------------------------
       else {
-        let encontradas = buscarObrasPorTermos(interpretacao.termos, obras, LIMITE_RESULTADOS);
+        // Numa resposta resumida cabem bem mais obras do que numa detalhada.
+        const limiteBusca =
+          interpretacao.detalhe === "resumido" ? LIMITE_RESUMIDO : LIMITE_RESULTADOS;
+
+        let encontradas = buscarObrasPorTermos(interpretacao.termos, obras, limiteBusca);
         console.log(`DEBUG busca por termos da IA: ${encontradas.length} resultado(s)`);
 
         if (encontradas.length === 0) {
-          encontradas = buscarObras(pergunta, obras, LIMITE_RESULTADOS);
+          encontradas = buscarObras(pergunta, obras, limiteBusca);
           console.log(`DEBUG busca direta pelo texto: ${encontradas.length} resultado(s)`);
         }
 
@@ -372,7 +383,7 @@ async function processarWebhook(payload) {
         // ("e tem mais alguma por la?", "e sobre isso na Vila Nova?").
         if (encontradas.length === 0 && termosAnteriores.length > 0) {
           const combinados = [...new Set([...termosAnteriores, ...interpretacao.termos])];
-          encontradas = buscarObrasPorTermos(combinados, obras, LIMITE_RESULTADOS);
+          encontradas = buscarObrasPorTermos(combinados, obras, limiteBusca);
           console.log(
             `DEBUG busca combinada com termos anteriores [${combinados.join(", ")}]: ` +
               `${encontradas.length} resultado(s)`
@@ -390,18 +401,30 @@ async function processarWebhook(payload) {
           // MELHORIA 3: em vez de despejar a listagem geral, o bot pede a
           // pista que falta. Listagem geral so quando o pedido FOI de listagem.
           falhasParaGuardar = memoria.falhas + 1;
-          const semPista = interpretacao.termos.length === 0;
+          // So tratamos como pergunta vaga quando a IA REALMENTE entendeu e nao
+          // achou pista. Se a IA falhou (erro na API), a pergunta pode ter sido
+          // clara - nesse caso nao devolvemos "nao entendi", que soa errado.
+          const semPista = interpretacao.termos.length === 0 && !interpretacao.falhou;
 
           logPerguntaSemResultado(
             pergunta,
             interpretacao.termos,
-            semPista ? "pergunta_ambigua" : "termos_sem_correspondencia"
+            interpretacao.falhou
+              ? "ia_indisponivel"
+              : semPista
+              ? "pergunta_ambigua"
+              : "termos_sem_correspondencia"
           );
 
           if (semPista) {
             texto =
               "Não entendi bem qual obra você quer saber. Pode me dizer o bairro, a rua " +
               "ou o nome da obra?";
+          } else if (interpretacao.falhou) {
+            texto =
+              `Não encontrei nenhuma obra com esses termos. Temos ${obras.length} obra(s) ` +
+              `cadastradas — tente pelo bairro, pela rua, pelo tipo (pavimentação, escola, ` +
+              `UBS, praça) ou pela situação (em andamento, concluída, paralisada).`;
           } else {
             texto =
               `Não encontrei nenhuma obra relacionada a "${interpretacao.termos.join(", ")}" ` +

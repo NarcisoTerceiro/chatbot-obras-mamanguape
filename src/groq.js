@@ -46,6 +46,11 @@ const OPERACOES_VALIDAS = new Set([
 // ------------------------------------------------------------
 //  Funcao auxiliar generica pra chamar a API do Groq.
 // ------------------------------------------------------------
+// IMPORTANTE: o modelo openai/gpt-oss-120b e um modelo de RACIOCINIO. Os
+// tokens que ele gasta "pensando" contam dentro do limite de geracao. Se o
+// limite for baixo demais, o raciocinio consome tudo e a resposta volta VAZIA
+// (erro 400 json_validate_failed). Por isso usamos max_completion_tokens
+// folgado e reasoning_effort "low" na etapa de interpretacao.
 async function chamarGroq(body) {
   const resp = await fetch(GROQ_URL, {
     method: "POST",
@@ -147,23 +152,43 @@ Exemplos:
 "quantas estao paradas?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"contar_por_status","filtro_status":"paralisada"}`;
 
 export async function interpretarPergunta(pergunta, historico = []) {
-  const texto = await chamarGroq({
+  const mensagens = [
+    { role: "system", content: SYSTEM_PROMPT_INTERPRETAR },
+    ...prepararHistorico(historico),
+    { role: "user", content: pergunta },
+  ];
+
+  const base = {
     model: GROQ_MODEL,
     temperature: 0,
-    max_tokens: 200,
-    response_format: { type: "json_object" },
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT_INTERPRETAR },
-      ...prepararHistorico(historico),
-      { role: "user", content: pergunta },
-    ],
-  });
+    // Orcamento generoso: cobre o raciocinio do modelo + o JSON final.
+    max_completion_tokens: 1024,
+    // Menos raciocinio = menos token gasto e menos risco de estourar.
+    reasoning_effort: "low",
+    messages: mensagens,
+  };
+
+  let texto = "";
+  try {
+    // Tentativa 1: modo JSON nativo (mais confiavel quando funciona).
+    texto = await chamarGroq({ ...base, response_format: { type: "json_object" } });
+  } catch (e) {
+    // Se o modelo estourar o orcamento no modo JSON, ele devolve 400 com
+    // geracao vazia. Tentamos de novo SEM o modo JSON: o prompt ja pede JSON
+    // puro, e o parser abaixo limpa eventuais cercas de markdown.
+    console.error("Interpretacao em modo JSON falhou, tentando sem:", e.message);
+    texto = await chamarGroq(base);
+  }
 
   // LOG TEMPORARIO DE DEBUG - remover depois de confirmar que esta ok
   console.log("DEBUG resposta crua da IA (interpretar):", JSON.stringify(texto));
 
   try {
-    const limpo = (texto || "{}").replace(/^```json\s*|```$/g, "").trim();
+    // Pega o primeiro objeto JSON que aparecer, mesmo com texto em volta.
+    const bruto = (texto || "").replace(/```json|```/g, "").trim();
+    const inicio = bruto.indexOf("{");
+    const fim = bruto.lastIndexOf("}");
+    const limpo = inicio >= 0 && fim > inicio ? bruto.slice(inicio, fim + 1) : "{}";
     const it = JSON.parse(limpo);
 
     const tiposValidos = ["busca", "saudacao", "listagem", "agregacao"];
@@ -182,10 +207,18 @@ export async function interpretarPergunta(pergunta, historico = []) {
       detalhe: it.detalhe === "resumido" ? "resumido" : "completo",
       operacao,
       filtro_status: typeof it.filtro_status === "string" ? it.filtro_status.trim() : "",
+      falhou: false,
     };
   } catch {
     // Sem JSON valido -> busca com a frase crua (o sistema ainda tenta buscar).
-    return { tipo: "busca", termos: [], detalhe: "completo", operacao: "", filtro_status: "" };
+    return {
+      tipo: "busca",
+      termos: [],
+      detalhe: "completo",
+      operacao: "",
+      filtro_status: "",
+      falhou: true,
+    };
   }
 }
 
@@ -281,7 +314,9 @@ export async function redigirResposta(pergunta, obras, detalhe, historico = [], 
   const texto = await chamarGroq({
     model: GROQ_MODEL_RESPOSTA,
     temperature: 0.2,
-    max_tokens: 800,
+    // Cobre o raciocinio do modelo + o texto final da mensagem.
+    max_completion_tokens: 2048,
+    reasoning_effort: "low",
     messages: [
       { role: "system", content: SYSTEM_PROMPT_RESPOSTA },
       ...prepararHistorico(historico),

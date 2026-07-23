@@ -22,9 +22,14 @@ const STOPWORDS = new Set([
   "a", "o", "as", "os", "de", "da", "do", "das", "dos", "e", "em", "no",
   "na", "nos", "nas", "um", "uma", "que", "qual", "como", "esta", "estar",
   "para", "por", "com", "sobre", "favor", "quero", "saber", "me", "diz",
-  "fala", "ai", "ta", "the", "obra", "obras", "situacao", "andamento",
+  "fala", "ai", "ta", "the", "obra", "obras",
   "gostaria", "poderia", "sabe", "algum", "alguma", "voce", "tem", "ha",
 ]);
+
+// ATENCAO: palavras como "andamento", "paralisada", "concluida" e "situacao"
+// NAO entram na lista acima de proposito - elas sao VALORES da coluna STATUS
+// da planilha. Se virarem stopword, perguntas como "quais obras estao em
+// andamento?" perdem justamente a palavra que identifica o que se procura.
 
 // Quebra um texto em palavras-chave uteis (>= 3 letras, sem stopwords).
 function keywords(texto) {
@@ -37,6 +42,18 @@ function keywords(texto) {
 // Junta todos os valores de uma obra num unico texto pesquisavel.
 function textoDaObra(obra) {
   return normalize(Object.values(obra).join(" "));
+}
+
+// Verifica se um termo aparece no texto da obra, tolerando plural e pequenas
+// variacoes de terminacao. Sem isso, "paralisadas" (plural, como o cidadao
+// escreve) nao casaria com "Paralisada" (singular, como esta na planilha).
+function casaTermo(texto, termo) {
+  if (texto.includes(termo)) return true;
+  // Plural simples: "paralisadas" -> "paralisada"
+  if (termo.endsWith("s") && texto.includes(termo.slice(0, -1))) return true;
+  // Variacao de genero/terminacao: "concluidos" -> "concluid"
+  if (termo.length >= 7 && texto.includes(termo.slice(0, -2))) return true;
+  return false;
 }
 
 // Pontua e ordena as obras de acordo com uma lista de termos ja prontos.
@@ -54,7 +71,7 @@ function pontuarObras(termos, obras, limite) {
       const texto = textoDaObra(obra);
       let pontos = 0;
       for (const termo of termosNormalizados) {
-        if (texto.includes(termo)) pontos += 1;
+        if (casaTermo(texto, termo)) pontos += 1;
       }
       return { obra, pontos };
     })
