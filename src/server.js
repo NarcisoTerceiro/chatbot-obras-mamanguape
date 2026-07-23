@@ -19,7 +19,7 @@
 import "dotenv/config";
 import express from "express";
 
-import { getObras } from "./sheets.js";
+import { getObras, getDiagnostico } from "./sheets.js";
 import { buscarObrasPorTermos, buscarObras } from "./search.js";
 import { interpretarPergunta, redigirResposta } from "./groq.js";
 import { executarAgregacao } from "./agregacao.js";
@@ -95,6 +95,30 @@ function logPerguntaSemResultado(pergunta, termos, motivo) {
 
 // Rota de saude (util pra manter o servico "acordado" e testar no navegador).
 app.get("/", (_req, res) => res.send("Chatbot de Obras de Mamanguape no ar."));
+
+// ------------------------------------------------------------
+//  Rota de DIAGNOSTICO da planilha (protegida pelo VERIFY_TOKEN).
+//  Abra no navegador:
+//    https://SEU-APP.onrender.com/diagnostico?token=SEU_VERIFY_TOKEN
+//  Mostra quantas obras foram lidas de cada aba, quais colunas foram
+//  detectadas e um exemplo de obra - util para conferir se a planilha
+//  esta sendo lida do jeito certo.
+// ------------------------------------------------------------
+app.get("/diagnostico", async (req, res) => {
+  if (req.query.token !== VERIFY_TOKEN) return res.sendStatus(403);
+  try {
+    const obras = await getObras();
+    const diag = getDiagnostico();
+    res.json({
+      total_de_obras: obras.length,
+      abas: diag.abas,
+      exemplo_de_obra: obras[0] || null,
+      lido_em: diag.quando,
+    });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
 
 // ------------------------------------------------------------
 //  1) VERIFICACAO DO WEBHOOK (a Meta chama isso 1 vez, via GET)
