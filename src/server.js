@@ -299,6 +299,13 @@ function detectarEscolha(pergunta, obrasContexto) {
   return null;
 }
 
+// Detecta o comando de SAIR da obra em foco: "x", "sair", "voltar", "menu".
+function ehSaidaFoco(msg) {
+  return /^\s*(x|sair|voltar|menu|inicio|in[ií]cio|outra|outras|outra obra)\s*[.!]*\s*$/i.test(
+    msg || ""
+  );
+}
+
 function montarRespostaLocal(encontradas, detalhe) {
   if (detalhe === "resumido" && encontradas.length > 1) {
     return `Encontrei ${encontradas.length} obra(s):\n\n` + formatarListaResumida(encontradas);
@@ -362,7 +369,47 @@ async function processarWebhook(payload) {
     if (obras.length === 0) {
       texto =
         "No momento não encontrei nenhuma obra cadastrada na base. Tente novamente mais tarde.";
-    } else {
+    }
+
+    // ------------------------------------------------------
+    //  MODO OBRA FOCADA: depois que a pessoa escolheu uma obra da lista,
+    //  ela fica "dentro" dessa obra. QUALQUER pergunta e respondida sobre
+    //  essa obra pela IA (linguagem livre, sem padrao fixo), ate a pessoa
+    //  enviar "X" para sair. Isso evita reabrir listas ou interpretar errado.
+    // ------------------------------------------------------
+    else if (memoria.tipo === "obra_focada" && obrasContexto.length >= 1) {
+      const obraFocada = obrasContexto[0];
+
+      if (ehSaidaFoco(pergunta)) {
+        console.log("DEBUG saindo do modo obra focada");
+        texto =
+          "Certo, saí dessa obra. 👍 Pode perguntar sobre qualquer outra — por bairro, " +
+          "rua, tipo de obra ou nome.";
+        tipoParaGuardar = "";
+        obrasParaGuardar = [];
+        termosParaGuardar = [];
+        falhasParaGuardar = 0;
+      } else {
+        // Qualquer pergunta sobre a obra em foco: a IA responde livremente,
+        // usando so os dados dessa obra + o historico da conversa.
+        console.log("DEBUG pergunta dentro da obra focada:", campoNome(obraFocada));
+        obrasParaGuardar = [obraFocada];
+        tipoParaGuardar = "obra_focada";
+        falhasParaGuardar = 0;
+        try {
+          texto = await redigirResposta(pergunta, [obraFocada], "completo", historico);
+        } catch (e) {
+          console.error("IA de redacao (obra focada) falhou, usando local:", e.message);
+          texto = formatarObra(obraFocada);
+        }
+        // Lembrete discreto de como sair (so de vez em quando, pra nao poluir).
+        if (Math.random() < 0.34) {
+          texto += "\n\n_(envie *X* para sair desta obra)_";
+        }
+      }
+    }
+
+    else {
       // Passo B: a IA interpreta a pergunta usando o historico da conversa.
       let interpretacao;
       try {
@@ -413,7 +460,7 @@ async function processarWebhook(payload) {
       else if (escolha) {
         console.log("DEBUG selecao de obra pelo contexto:", campoNome(escolha));
         obrasParaGuardar = [escolha];
-        tipoParaGuardar = "busca";
+        tipoParaGuardar = "obra_focada"; // entra no modo obra focada
         falhasParaGuardar = 0;
         try {
           texto = await redigirResposta(pergunta, [escolha], "completo", historico);
@@ -421,6 +468,9 @@ async function processarWebhook(payload) {
           console.error("IA de redacao (selecao) falhou, usando local:", e.message);
           texto = formatarObra(escolha);
         }
+        texto +=
+          "\n\n_Você está vendo esta obra. Pergunte o que quiser sobre ela; " +
+          "envie *X* para ver outras._";
       }
 
       // Confirmacao curta ("sim") logo apos detalhar UMA obra: segue NAQUELA
