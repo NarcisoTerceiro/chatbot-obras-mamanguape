@@ -388,13 +388,29 @@ async function processarWebhook(payload) {
       //  SELECAO DE OBRA: se na mensagem anterior o bot listou varias
       //  opcoes e pediu para escolher, e agora a pessoa respondeu "2",
       //  "a segunda" ou "a de pavimentacao", detalhamos SO aquela obra.
+      //  Se respondeu algo que NAO e uma escolha clara, repetimos a lista.
       // ------------------------------------------------------
-      const escolha =
-        memoria.tipo === "aguardando_escolha"
-          ? detectarEscolha(pergunta, obrasContexto)
-          : null;
+      const aguardandoEscolha = memoria.tipo === "aguardando_escolha";
+      const escolha = aguardandoEscolha ? detectarEscolha(pergunta, obrasContexto) : null;
 
-      if (escolha) {
+      // Mensagens curtas de confirmacao/continuacao ("sim", "isso", "pode",
+      // "aham", "quero", "manda") NAO sao busca nova - a pessoa esta seguindo
+      // com a obra que ja estava em pauta.
+      const ehConfirmacao = /^\s*(sim|isso|isso mesmo|pode|pode ser|claro|quero|queria|manda|mostra|aham|ok|blz|beleza|por favor|pf|s)\s*[.!]*\s*$/i.test(
+        pergunta || ""
+      );
+
+      if (aguardandoEscolha && !escolha && obrasContexto.length >= 2) {
+        // Estava esperando um numero e a pessoa respondeu algo vago -> repete
+        // a lista das mesmas obras, sem sair procurando outras.
+        console.log("DEBUG resposta vaga durante escolha - repetindo a lista");
+        tipoParaGuardar = "aguardando_escolha";
+        obrasParaGuardar = obrasContexto;
+        texto =
+          "Só pra confirmar qual das obras. " + montarPerguntaDeEscolha(obrasContexto);
+      }
+
+      else if (escolha) {
         console.log("DEBUG selecao de obra pelo contexto:", campoNome(escolha));
         obrasParaGuardar = [escolha];
         tipoParaGuardar = "busca";
@@ -404,6 +420,22 @@ async function processarWebhook(payload) {
         } catch (e) {
           console.error("IA de redacao (selecao) falhou, usando local:", e.message);
           texto = formatarObra(escolha);
+        }
+      }
+
+      // Confirmacao curta ("sim") logo apos detalhar UMA obra: segue NAQUELA
+      // obra (mostra o que foi oferecido: prazo, empresa...), sem reabrir lista.
+      else if (ehConfirmacao && !aguardandoEscolha && obrasContexto.length >= 1) {
+        const obraAtual = obrasContexto[0];
+        console.log("DEBUG confirmacao - seguindo na obra atual:", campoNome(obraAtual));
+        obrasParaGuardar = [obraAtual];
+        tipoParaGuardar = "busca";
+        falhasParaGuardar = 0;
+        try {
+          texto = await redigirResposta(pergunta, [obraAtual], "completo", historico);
+        } catch (e) {
+          console.error("IA de redacao (confirmacao) falhou, usando local:", e.message);
+          texto = formatarObra(obraAtual);
         }
       }
 
