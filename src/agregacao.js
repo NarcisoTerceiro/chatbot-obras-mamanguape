@@ -79,20 +79,21 @@ function acharCampoStatus(obra) {
   return (
     chaves.find((k) => {
       const n = normalize(k);
-      return n.includes("status") || n.includes("situacao");
+      return n.includes("status") || n.includes("situa");
     }) || null
   );
 }
 
 // Acha a coluna que serve de nome/objeto da obra.
 function acharCampoNome(obra) {
-  const candidatos = ["OBJETO DA OBRA", "OBJETO", "NOME DA OBRA", "NOME", "OBRA"];
+  const candidatos = ["OBJETO DA OBRA", "OBJETO", "NOME DA OBRA", "NOME", "OBRA", "RUA"];
   for (const c of candidatos) if (obra[c]) return c;
   const chaves = Object.keys(obra).filter((k) => k !== "_aba");
   return (
     chaves.find((k) => {
       const n = normalize(k);
-      return n.includes("objeto") || n.includes("nome") || n.includes("obra");
+      return n.includes("objeto") || n.includes("nome") || n.includes("obra") ||
+             n.includes("rua") || n.includes("logradouro");
     }) || chaves[0] || null
   );
 }

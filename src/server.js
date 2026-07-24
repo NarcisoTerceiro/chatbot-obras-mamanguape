@@ -152,16 +152,38 @@ app.post("/webhook", (req, res) => {
 // ------------------------------------------------------------
 
 function campoNome(obra) {
-  const candidatos = ["OBJETO DA OBRA", "OBJETO", "NOME DA OBRA", "NOME", "OBRA"];
+  // Nomes comuns em varias abas (obras) e tambem "RUA" (aba de pavimentacao).
+  const candidatos = [
+    "OBJETO DA OBRA", "OBJETO", "NOME DA OBRA", "NOME", "OBRA",
+    "RUA", "LOGRADOURO", "ENDEREÇO", "ENDERECO",
+  ];
   for (const c of candidatos) {
     if (obra[c]) return obra[c];
+  }
+  // Fallback: procura qualquer coluna cujo nome contenha objeto/obra/rua/nome.
+  for (const [k, v] of Object.entries(obra)) {
+    if (k === "_aba" || !v) continue;
+    const n = k.toLowerCase();
+    if (n.includes("objeto") || n.includes("obra") || n.includes("rua") || n.includes("nome")) {
+      return v;
+    }
   }
   const primeiro = Object.entries(obra).find(([k, v]) => k !== "_aba" && v);
   return primeiro ? primeiro[1] : "Obra sem nome cadastrado";
 }
 
 function campoStatus(obra) {
-  return obra["STATUS"] || obra["Status"] || obra["SITUAÇÃO"] || obra["SITUACAO"] || "";
+  // "STATUS" (maioria das abas) ou "SITUAÇÃO" (aba de pavimentacao).
+  if (obra["STATUS"]) return obra["STATUS"];
+  if (obra["Status"]) return obra["Status"];
+  if (obra["SITUAÇÃO"]) return obra["SITUAÇÃO"];
+  if (obra["SITUACAO"]) return obra["SITUACAO"];
+  for (const [k, v] of Object.entries(obra)) {
+    if (k === "_aba" || !v) continue;
+    const n = k.toLowerCase();
+    if (n.includes("status") || n.includes("situa")) return v;
+  }
+  return "";
 }
 
 // MELHORIA 4: emoji conforme o status, para leitura visual rapida.
