@@ -229,6 +229,76 @@ function formatarLista(obras) {
   return obras.map((o, i) => `${i + 1}) ${formatarObra(o)}`).join("\n\n");
 }
 
+// Quando varias obras casam com a pergunta, mostramos uma lista curta e
+// numerada e pedimos para a pessoa escolher - sem despejar a ficha de todas.
+function montarPerguntaDeEscolha(obras) {
+  const linhas = obras.map((o, i) => {
+    const status = campoStatus(o);
+    const emoji = emojiStatus(status);
+    const sufixo = status ? ` — ${status}` : "";
+    return `${i + 1}. ${emoji ? emoji + " " : ""}${campoNome(o)}${sufixo}`;
+  });
+  return (
+    `Encontrei ${obras.length} obras relacionadas. Sobre qual você quer saber?\n\n` +
+    linhas.join("\n") +
+    `\n\nÉ só responder o número (ex.: "1") ou o nome.`
+  );
+}
+
+// Detecta se a mensagem atual e a ESCOLHA de uma das obras que o bot acabou
+// de listar. Retorna a obra escolhida, ou null se nao for uma escolha clara.
+// Cobre: "2", "a 2", "a segunda", "a de pavimentacao", "a primeira".
+function detectarEscolha(pergunta, obrasContexto) {
+  if (!obrasContexto || obrasContexto.length < 2) return null;
+
+  const bruto = (pergunta || "").toLowerCase().trim();
+
+  // 1) Numero: "2", "a 2", "op 3", "numero 1".
+  const mNum = bruto.match(/\b(\d{1,2})\b/);
+  if (mNum) {
+    const idx = parseInt(mNum[1], 10) - 1;
+    if (idx >= 0 && idx < obrasContexto.length) return obrasContexto[idx];
+  }
+
+  // 2) Ordinais por extenso.
+  const ordinais = {
+    primeira: 0, primeiro: 0,
+    segunda: 1, segundo: 1,
+    terceira: 2, terceiro: 2,
+    quarta: 3, quarto: 3,
+    quinta: 4, quinto: 4,
+    ultima: obrasContexto.length - 1, ultimo: obrasContexto.length - 1,
+  };
+  for (const [palavra, idx] of Object.entries(ordinais)) {
+    if (new RegExp(`\\b${palavra}\\b`).test(bruto) && idx >= 0 && idx < obrasContexto.length) {
+      return obrasContexto[idx];
+    }
+  }
+
+  // 3) Trecho do nome: "a de pavimentacao", "a rua do jacare".
+  const semAcento = (s) =>
+    (s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const palavrasMsg = semAcento(bruto)
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 4);
+  if (palavrasMsg.length > 0) {
+    let melhor = null;
+    let melhorPontos = 0;
+    for (const obra of obrasContexto) {
+      const nome = semAcento(campoNome(obra));
+      const pontos = palavrasMsg.filter((w) => nome.includes(w)).length;
+      if (pontos > melhorPontos) {
+        melhorPontos = pontos;
+        melhor = obra;
+      }
+    }
+    if (melhorPontos > 0) return melhor;
+  }
+
+  return null;
+}
+
 function montarRespostaLocal(encontradas, detalhe) {
   if (detalhe === "resumido" && encontradas.length > 1) {
     return `Encontrei ${encontradas.length} obra(s):\n\n` + formatarListaResumida(encontradas);
@@ -315,9 +385,32 @@ async function processarWebhook(payload) {
       if (interpretacao.termos.length > 0) termosParaGuardar = interpretacao.termos;
 
       // ------------------------------------------------------
+      //  SELECAO DE OBRA: se na mensagem anterior o bot listou varias
+      //  opcoes e pediu para escolher, e agora a pessoa respondeu "2",
+      //  "a segunda" ou "a de pavimentacao", detalhamos SO aquela obra.
+      // ------------------------------------------------------
+      const escolha =
+        memoria.tipo === "aguardando_escolha"
+          ? detectarEscolha(pergunta, obrasContexto)
+          : null;
+
+      if (escolha) {
+        console.log("DEBUG selecao de obra pelo contexto:", campoNome(escolha));
+        obrasParaGuardar = [escolha];
+        tipoParaGuardar = "busca";
+        falhasParaGuardar = 0;
+        try {
+          texto = await redigirResposta(pergunta, [escolha], "completo", historico);
+        } catch (e) {
+          console.error("IA de redacao (selecao) falhou, usando local:", e.message);
+          texto = formatarObra(escolha);
+        }
+      }
+
+      // ------------------------------------------------------
       //  Passo C: SAUDACAO - resposta fixa do sistema (sem Groq).
       // ------------------------------------------------------
-      if (interpretacao.tipo === "saudacao") {
+      else if (interpretacao.tipo === "saudacao") {
         texto = saudacaoAleatoria();
         falhasParaGuardar = 0;
       }
@@ -483,20 +576,25 @@ async function processarWebhook(payload) {
             texto += textoEscalada();
             falhasParaGuardar = 0;
           }
-        } else {
+        } else if (encontradas.length === 1) {
+          // Uma unica obra: detalha direto.
           obrasParaGuardar = encontradas;
           falhasParaGuardar = 0;
           try {
-            texto = await redigirResposta(
-              pergunta,
-              encontradas,
-              interpretacao.detalhe,
-              historico
-            );
+            texto = await redigirResposta(pergunta, encontradas, interpretacao.detalhe, historico);
           } catch (e) {
             console.error("IA de redacao falhou, usando formatador local:", e.message);
             texto = montarRespostaLocal(encontradas, interpretacao.detalhe);
           }
+        } else {
+          // Varias obras casaram: em vez de despejar a ficha de todas, lista as
+          // opcoes curtas e pergunta qual. Marcamos o estado como
+          // "aguardando_escolha" para que a proxima mensagem ("a 2", "a de
+          // pavimentacao") seja tratada como selecao e detalhe so aquela.
+          obrasParaGuardar = encontradas;
+          tipoParaGuardar = "aguardando_escolha";
+          falhasParaGuardar = 0;
+          texto = montarPerguntaDeEscolha(encontradas);
         }
       }
     }
