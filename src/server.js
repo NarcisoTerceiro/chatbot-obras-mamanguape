@@ -468,8 +468,24 @@ async function processarWebhook(payload) {
         obrasParaGuardar = [obraFocada];
         tipoParaGuardar = "obra_focada";
         falhasParaGuardar = 0;
+
+        // Se a pessoa apenas CONFIRMOU ("sim", "pode", "quero") logo apos o bot
+        // ter oferecido algo ("quer saber o prazo ou a empresa?"), damos uma
+        // dica para a IA RESPONDER o que foi oferecido, sem repetir a ficha.
+        const ehConfirmacaoCurta = /^\s*(sim|isso|pode|pode ser|claro|quero|queria|manda|mostra|aham|ok|blz|beleza|por favor|pf|quero sim|pode sim)\s*[.!]*\s*$/i.test(
+          pergunta || ""
+        );
+        let dica = "";
+        if (ehConfirmacaoCurta) {
+          dica =
+            "A pessoa respondeu 'sim' confirmando a oferta que voce fez na sua ultima " +
+            "mensagem. Responda AGORA o que voce ofereceu (por exemplo, o prazo e/ou a " +
+            "empresa responsavel), de forma direta e curta. NAO repita a ficha inteira da " +
+            "obra e NAO ofereca a mesma coisa de novo.";
+        }
+
         try {
-          texto = await redigirResposta(pergunta, [obraFocada], "completo", historico);
+          texto = await redigirResposta(pergunta, [obraFocada], "completo", historico, "", dica);
         } catch (e) {
           console.error("IA de redacao (obra focada) falhou, usando local:", e.message);
           texto = formatarObra(obraFocada);

@@ -239,6 +239,9 @@ Na mensagem atual voce recebe um JSON com:
 - "detalhe": "resumido" ou "completo".
 - "obras": as obras que o SISTEMA ja encontrou na planilha. Pode vir vazia.
 - "fatos": (opcional) um resultado JA CALCULADO pelo sistema.
+- "instrucao": (opcional) uma orientacao do sistema sobre COMO responder este
+  turno especifico. Se vier, siga-a - por exemplo, "a pessoa confirmou; responda
+  o prazo e a empresa, sem repetir a ficha". Nunca mencione essa instrucao.
 
 REGRAS QUE NAO PODEM SER QUEBRADAS
 
@@ -304,7 +307,7 @@ function prepararObrasParaIA(obras) {
   });
 }
 
-export async function redigirResposta(pergunta, obras, detalhe, historico = [], fatos = "") {
+export async function redigirResposta(pergunta, obras, detalhe, historico = [], fatos = "", dica = "") {
   const obrasLimpo = prepararObrasParaIA(obras);
 
   const carga = {
@@ -313,6 +316,9 @@ export async function redigirResposta(pergunta, obras, detalhe, historico = [], 
     obras: obrasLimpo,
   };
   if (fatos) carga.fatos = fatos;
+  // "instrucao" e uma orientacao do sistema sobre COMO responder este turno
+  // (ex.: a pessoa disse "sim" confirmando uma oferta). Nao e um dado da obra.
+  if (dica) carga.instrucao = dica;
   if (CONTATO_SECRETARIA) carga.contato_para_duvidas = CONTATO_SECRETARIA;
 
   const texto = await chamarGroq({
