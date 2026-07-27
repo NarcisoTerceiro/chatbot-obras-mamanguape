@@ -44,6 +44,24 @@ function textoDaObra(obra) {
   return normalize(Object.values(obra).join(" "));
 }
 
+// Extrai o NOME/objeto da obra (o campo que melhor a identifica). Bater no
+// nome vale muito mais do que bater em qualquer outra coluna.
+function nomeDaObra(obra) {
+  const candidatos = [
+    "OBJETO DA OBRA", "OBJETO", "NOME DA OBRA", "NOME", "OBRA",
+    "RUA", "LOGRADOURO", "ENDEREÇO", "ENDERECO",
+  ];
+  for (const c of candidatos) if (obra[c]) return normalize(obra[c]);
+  for (const [k, v] of Object.entries(obra)) {
+    if (k === "_aba" || !v) continue;
+    const n = k.toLowerCase();
+    if (n.includes("objeto") || n.includes("obra") || n.includes("rua") || n.includes("nome")) {
+      return normalize(v);
+    }
+  }
+  return "";
+}
+
 // Verifica se um termo aparece no texto da obra, tolerando plural e pequenas
 // variacoes de terminacao. Sem isso, "paralisadas" (plural, como o cidadao
 // escreve) nao casaria com "Paralisada" (singular, como esta na planilha).
@@ -56,29 +74,80 @@ function casaTermo(texto, termo) {
   return false;
 }
 
+// Peso extra quando o termo bate no NOME da obra (nao so em qualquer coluna).
+const PESO_NOME = 3;
+// Bonus decisivo quando TODAS as palavras da busca estao no nome da obra
+// (a pessoa escreveu praticamente o nome exato).
+const BONUS_NOME_COMPLETO = 50;
+// So mostra junto do vencedor quem tiver pelo menos esta fracao da pontuacao
+// dele. Assim, quando ha um nome que bate certinho, as correspondencias fracas
+// (que so compartilham palavras genericas) sao descartadas e nao viram lista.
+const FRACAO_RELEVANCIA = 0.6;
+
+// Descobre palavras "onipresentes": as que aparecem em quase todas as obras
+// (ex.: o nome da cidade, "prefeitura", "municipal"). Elas nao ajudam a
+// distinguir uma obra da outra, entao sao ignoradas na busca - senao um termo
+// desses faria a busca "casar" com a base inteira.
+function palavrasOnipresentes(obras) {
+  const total = obras.length;
+  if (total < 5) return new Set(); // base pequena: nao vale filtrar
+  const contagem = new Map();
+  for (const obra of obras) {
+    const vistas = new Set(textoDaObra(obra).split(/\s+/).filter((w) => w.length >= 3));
+    for (const w of vistas) contagem.set(w, (contagem.get(w) || 0) + 1);
+  }
+  const limite = total * 0.6; // aparece em 60%+ das obras -> onipresente
+  const set = new Set();
+  for (const [w, n] of contagem) if (n >= limite) set.add(w);
+  return set;
+}
+
 // Pontua e ordena as obras de acordo com uma lista de termos ja prontos.
 function pontuarObras(termos, obras, limite) {
   if (!termos || termos.length === 0) return [];
 
-  const termosNormalizados = termos
+  const onipresentes = palavrasOnipresentes(obras);
+
+  let termosNormalizados = termos
     .flatMap((t) => keywords(t)) // cada termo pode ter mais de uma palavra
     .filter(Boolean);
 
+  // Remove palavras onipresentes (nome da cidade etc.) - MAS so se ainda sobrar
+  // algum termo util; se a pessoa buscou SO por uma dessas, mantemos.
+  const semOnipresentes = termosNormalizados.filter((t) => !onipresentes.has(t));
+  if (semOnipresentes.length > 0) termosNormalizados = semOnipresentes;
+
   if (termosNormalizados.length === 0) return [];
+  const nPalavras = termosNormalizados.length;
 
   const pontuadas = obras
     .map((obra) => {
       const texto = textoDaObra(obra);
-      let pontos = 0;
+      const nome = nomeDaObra(obra);
+      let base = 0; // quantos termos batem em qualquer coluna
+      let emNome = 0; // quantos termos batem no NOME da obra
       for (const termo of termosNormalizados) {
-        if (casaTermo(texto, termo)) pontos += 1;
+        if (casaTermo(texto, termo)) base += 1;
+        if (nome && casaTermo(nome, termo)) emNome += 1;
       }
-      return { obra, pontos };
+      let pontos = base + emNome * PESO_NOME;
+      // Se a busca tem 2+ palavras e TODAS estao no nome, essa e claramente
+      // a obra certa: ganha um empurrao decisivo para vencer sozinha.
+      if (nPalavras >= 2 && emNome === nPalavras) pontos += BONUS_NOME_COMPLETO;
+      return { obra, pontos, base };
     })
-    .filter((x) => x.pontos > 0)
+    // Precisa bater em pelo menos um termo (em qualquer coluna) para entrar.
+    .filter((x) => x.base > 0)
     .sort((a, b) => b.pontos - a.pontos);
 
-  return pontuadas.slice(0, limite).map((x) => x.obra);
+  if (pontuadas.length === 0) return [];
+
+  // Filtro de relevancia: descarta correspondencias muito mais fracas que a
+  // melhor. Se uma obra domina (nome exato), so ela passa -> resposta direta.
+  const topo = pontuadas[0].pontos;
+  const relevantes = pontuadas.filter((x) => x.pontos >= topo * FRACAO_RELEVANCIA);
+
+  return relevantes.slice(0, limite).map((x) => x.obra);
 }
 
 // -------- 1) Busca usando termos ja prontos (vindos da IA) --------

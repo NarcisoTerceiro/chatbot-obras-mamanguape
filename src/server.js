@@ -332,6 +332,30 @@ function ehSaidaFoco(msg) {
   );
 }
 
+// Estando dentro de uma obra (modo foco), verifica se a mensagem aponta
+// claramente para OUTRA obra da base - ou seja, a pessoa quer trocar de obra
+// sem precisar digitar "X". So retorna true quando a busca acha uma obra que
+// NAO e a focada e o match e razoavelmente forte (>= 2 palavras uteis), para
+// nao confundir perguntas sobre a propria obra ("qual o valor?") com troca.
+function mensagemApontaOutraObra(pergunta, obraFocada, obras) {
+  const palavras = (pergunta || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 4);
+  // Precisa de conteudo suficiente para parecer o nome de uma obra.
+  if (palavras.length < 2) return false;
+
+  const achadas = buscarObras(pergunta, obras, 3);
+  if (achadas.length === 0) return false;
+
+  const nomeFocada = campoNome(obraFocada);
+  // Se a melhor obra encontrada e diferente da que esta em foco, e troca.
+  return campoNome(achadas[0]) !== nomeFocada;
+}
+
 function montarRespostaLocal(encontradas, detalhe) {
   if (detalhe === "resumido" && encontradas.length > 1) {
     return `Encontrei ${encontradas.length} obra(s):\n\n` + formatarListaResumida(encontradas);
@@ -393,6 +417,24 @@ async function processarWebhook(payload) {
     // Passo A: le a planilha (com cache).
     const obras = await getObras();
 
+    // Estamos no modo obra focada? Sim, EXCETO quando a pessoa (sem digitar
+    // "X") escreve algo que bate claramente com OUTRA obra da base - nesse caso
+    // ela quer trocar de obra, entao saimos do foco e tratamos como busca nova.
+    const focadaAtual =
+      memoria.tipo === "obra_focada" && obrasContexto.length >= 1 ? obrasContexto[0] : null;
+    const trocarDeObra =
+      focadaAtual &&
+      !ehSaidaFoco(pergunta) &&
+      mensagemApontaOutraObra(pergunta, focadaAtual, obras);
+    const emFoco = !!focadaAtual && !trocarDeObra;
+
+    if (trocarDeObra) {
+      console.log("DEBUG saida automatica do foco: a mensagem aponta outra obra");
+      // Zera o foco; o fluxo normal abaixo trata esta mensagem como busca nova.
+      tipoParaGuardar = "";
+      termosParaGuardar = [];
+    }
+
     if (obras.length === 0) {
       texto =
         "No momento não encontrei nenhuma obra cadastrada na base. Tente novamente mais tarde.";
@@ -404,9 +446,10 @@ async function processarWebhook(payload) {
     //  essa obra pela IA (linguagem livre, sem padrao fixo), ate a pessoa
     //  enviar "X" para sair. Isso evita reabrir listas ou interpretar errado.
     // ------------------------------------------------------
-    else if (memoria.tipo === "obra_focada" && obrasContexto.length >= 1) {
+    else if (emFoco) {
       const obraFocada = obrasContexto[0];
 
+      // A pessoa quer sair explicitamente ("x", "sair", "menu").
       if (ehSaidaFoco(pergunta)) {
         console.log("DEBUG saindo do modo obra focada");
         texto =
@@ -416,7 +459,9 @@ async function processarWebhook(payload) {
         obrasParaGuardar = [];
         termosParaGuardar = [];
         falhasParaGuardar = 0;
-      } else {
+      }
+
+      else {
         // Qualquer pergunta sobre a obra em foco: a IA responde livremente,
         // usando so os dados dessa obra + o historico da conversa.
         console.log("DEBUG pergunta dentro da obra focada:", campoNome(obraFocada));

@@ -130,6 +130,10 @@ girias e sinonimos para o vocabulario de obras publicas:
 "quadra" -> "quadra poliesportiva"; "creche" -> "creche".
 NAO coloque em "termos" palavras genericas como "obra", "valor", "prazo",
 "situacao" - elas nao ajudam a localizar a obra.
+NAO coloque o nome da cidade ("Mamanguape") sozinho como termo: quase toda obra
+fica em Mamanguape, entao isso nao distingue nada. Use o NOME/tipo da obra e o
+BAIRRO especifico. Ex.: em "praca de lazer em Nova Mamanguape", os termos uteis
+sao "praca de lazer" e "nova" (o bairro Nova Mamanguape) - nao "mamanguape".
 Se a mensagem for vaga demais e nao houver contexto ("e aquela obra ali?"),
 devolva "termos" como lista vazia - o sistema vai pedir mais detalhes.
 
