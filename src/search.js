@@ -62,15 +62,30 @@ function nomeDaObra(obra) {
   return "";
 }
 
-// Verifica se um termo aparece no texto da obra, tolerando plural e pequenas
-// variacoes de terminacao. Sem isso, "paralisadas" (plural, como o cidadao
-// escreve) nao casaria com "Paralisada" (singular, como esta na planilha).
+// Verifica se um termo aparece no texto da obra COMO PALAVRA (nao como pedaco
+// de outra palavra). Sem o limite de palavra, "UBS" casaria com "pUBlico" e
+// "ilUMinacao publica", trazendo obras que nao tem nada a ver. Usamos limites
+// de palavra (\b) e toleramos plural/terminacao so em palavras mais longas.
 function casaTermo(texto, termo) {
-  if (texto.includes(termo)) return true;
-  // Plural simples: "paralisadas" -> "paralisada"
-  if (termo.endsWith("s") && texto.includes(termo.slice(0, -1))) return true;
-  // Variacao de genero/terminacao: "concluidos" -> "concluid"
-  if (termo.length >= 7 && texto.includes(termo.slice(0, -2))) return true;
+  if (!termo) return false;
+  // Escapa caracteres especiais para montar a regex com seguranca.
+  const esc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  // Casa o termo inteiro como palavra: \bTERMO\b
+  if (new RegExp(`\\b${esc(termo)}\\b`).test(texto)) return true;
+
+  // Tolerancia de terminacao SO para palavras longas (>= 5 letras), para nao
+  // afrouxar siglas e termos curtos como "UBS", "rua", "led".
+  if (termo.length >= 5) {
+    // Plural simples: "paralisadas" -> casa "paralisada"
+    if (termo.endsWith("s") && new RegExp(`\\b${esc(termo.slice(0, -1))}`).test(texto)) {
+      return true;
+    }
+    // Variacao de genero/terminacao: "concluidos" -> casa "concluid..."
+    if (termo.length >= 7 && new RegExp(`\\b${esc(termo.slice(0, -2))}`).test(texto)) {
+      return true;
+    }
+  }
   return false;
 }
 
