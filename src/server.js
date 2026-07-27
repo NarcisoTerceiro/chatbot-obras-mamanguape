@@ -377,8 +377,32 @@ const SAUDACOES = [
     "Posso informar situação, valor, prazo e empresa responsável das obras. É só perguntar.",
 ];
 
+// Fechos para quando a pessoa AGRADECE ou se DESPEDE (nao é entrada).
+const DESPEDIDAS = [
+  "De nada! Precisando de mais alguma informação sobre as obras, é só chamar. 👍",
+  "Por nada! Estou por aqui sempre que quiser acompanhar as obras da cidade.",
+  "Imagina! Qualquer dúvida sobre as obras públicas, é só mandar mensagem.",
+];
+
 function saudacaoAleatoria() {
   return SAUDACOES[Math.floor(Math.random() * SAUDACOES.length)];
+}
+
+function despedidaAleatoria() {
+  return DESPEDIDAS[Math.floor(Math.random() * DESPEDIDAS.length)];
+}
+
+// Detecta se a saudacao e, na verdade, um AGRADECIMENTO ou DESPEDIDA
+// ("obrigado", "valeu", "tchau", "ate mais") em vez de uma entrada ("oi").
+function ehDespedida(msg) {
+  const t = (msg || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+  // Radicais sem \b no fim, para casar "obrigado", "obrigada", "agradeço" etc.
+  return /(\bobrigad|\bobg\b|\bvlw\b|\bvaleu\b|agradec|\bgrato\b|\bgrata\b|\btchau|\bate mais\b|\bate logo\b|\bate breve\b|\bfalou\b|\bflw\b|nada mais|so isso|era so isso|encerrar)/.test(
+    t
+  );
 }
 
 // Frase de escalada, usada quando o bot nao consegue ajudar repetidamente.
@@ -596,7 +620,9 @@ async function processarWebhook(payload) {
       //  Passo C: SAUDACAO - resposta fixa do sistema (sem Groq).
       // ------------------------------------------------------
       else if (interpretacao.tipo === "saudacao") {
-        texto = saudacaoAleatoria();
+        // Distingue despedida/agradecimento ("obrigado", "tchau") de entrada
+        // ("oi", "bom dia"): cada um recebe um fecho adequado.
+        texto = ehDespedida(pergunta) ? despedidaAleatoria() : saudacaoAleatoria();
         falhasParaGuardar = 0;
       }
 
