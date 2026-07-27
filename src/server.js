@@ -48,7 +48,7 @@ const MEMORIA_VALIDADE_MS = 10 * 60 * 1000; // 10 minutos
 const MAX_HISTORICO = 8; // guarda ate 8 mensagens (~4 trocas)
 
 function memoriaVazia() {
-  return { historico: [], obras: [], termos: [], tipo: "", falhas: 0 };
+  return { historico: [], obras: [], termos: [], tipo: "", falhas: 0, mostradas: 0 };
 }
 
 function lerMemoria(de) {
@@ -64,6 +64,7 @@ function lerMemoria(de) {
     termos: m.termos || [],
     tipo: m.tipo || "",
     falhas: m.falhas || 0,
+    mostradas: m.mostradas || 0,
   };
 }
 
@@ -74,6 +75,7 @@ function salvarMemoria(de, dados) {
     termos: dados.termos || [],
     tipo: dados.tipo || "",
     falhas: dados.falhas || 0,
+    mostradas: dados.mostradas || 0,
     time: Date.now(),
   });
 }
@@ -229,19 +231,43 @@ function formatarLista(obras) {
   return obras.map((o, i) => `${i + 1}) ${formatarObra(o)}`).join("\n\n");
 }
 
-// Quando varias obras casam com a pergunta, mostramos uma lista curta e
-// numerada e pedimos para a pessoa escolher - sem despejar a ficha de todas.
-function montarPerguntaDeEscolha(obras) {
-  const linhas = obras.map((o, i) => {
+// Quantas opcoes mostrar por vez quando ha varias obras parecidas.
+const PAGINA_ESCOLHA = 3;
+
+// Monta uma "pagina" da lista de opcoes, comecando de 'jaMostradas'. Mantem a
+// numeracao global (se ja mostrou 3, a proxima comeca no 4). Retorna o texto e
+// quantas opcoes ficam mostradas no total ate aqui.
+function montarPerguntaDeEscolha(lista, jaMostradas = 0) {
+  const fim = Math.min(jaMostradas + PAGINA_ESCOLHA, lista.length);
+  const slice = lista.slice(jaMostradas, fim);
+
+  const linhas = slice.map((o, k) => {
+    const i = jaMostradas + k; // indice global (0-based)
     const status = campoStatus(o);
     const emoji = emojiStatus(status);
     const sufixo = status ? ` — ${status}` : "";
     return `${i + 1}. ${emoji ? emoji + " " : ""}${campoNome(o)}${sufixo}`;
   });
-  return (
-    `Encontrei ${obras.length} obras relacionadas. Sobre qual você quer saber?\n\n` +
-    linhas.join("\n") +
-    `\n\nÉ só responder o número (ex.: "1") ou o nome.`
+
+  const restante = lista.length - fim;
+  const cabecalho =
+    jaMostradas === 0
+      ? `Encontrei ${lista.length} obras relacionadas. Sobre qual você quer saber?`
+      : `Mais ${slice.length} obra(s):`;
+
+  const rodape =
+    restante > 0
+      ? `\n\nResponda o número (ex.: "${jaMostradas + 1}") ou o nome — ou digite ` +
+        `*MAIS* para ver as próximas ${Math.min(PAGINA_ESCOLHA, restante)}.`
+      : `\n\nÉ só responder o número ou o nome.`;
+
+  return { texto: cabecalho + "\n\n" + linhas.join("\n") + rodape, mostradas: fim };
+}
+
+// Detecta o pedido de "ver mais" opcoes durante a escolha.
+function ehVerMais(msg) {
+  return /^\s*(mais|ver mais|mais obras|mostra mais|proxim[oa]|próxim[oa]|continuar|continua|segue|\+)\s*[.!]*\s*$/i.test(
+    msg || ""
   );
 }
 
@@ -361,6 +387,7 @@ async function processarWebhook(payload) {
   let termosParaGuardar = termosAnteriores;
   let tipoParaGuardar = memoria.tipo;
   let falhasParaGuardar = memoria.falhas;
+  let mostradasParaGuardar = memoria.mostradas;
 
   try {
     // Passo A: le a planilha (com cache).
@@ -439,6 +466,7 @@ async function processarWebhook(payload) {
       // ------------------------------------------------------
       const aguardandoEscolha = memoria.tipo === "aguardando_escolha";
       const escolha = aguardandoEscolha ? detectarEscolha(pergunta, obrasContexto) : null;
+      const pediuMais = aguardandoEscolha && !escolha && ehVerMais(pergunta);
 
       // Mensagens curtas de confirmacao/continuacao ("sim", "isso", "pode",
       // "aham", "quero", "manda") NAO sao busca nova - a pessoa esta seguindo
@@ -447,14 +475,28 @@ async function processarWebhook(payload) {
         pergunta || ""
       );
 
-      if (aguardandoEscolha && !escolha && obrasContexto.length >= 2) {
-        // Estava esperando um numero e a pessoa respondeu algo vago -> repete
-        // a lista das mesmas obras, sem sair procurando outras.
-        console.log("DEBUG resposta vaga durante escolha - repetindo a lista");
-        tipoParaGuardar = "aguardando_escolha";
+      if (pediuMais && memoria.mostradas < obrasContexto.length) {
+        // "MAIS": mostra a proxima pagina de opcoes, mantendo a numeracao.
+        console.log(
+          `DEBUG ver mais opcoes: ${memoria.mostradas}/${obrasContexto.length} ja mostradas`
+        );
+        const pagina = montarPerguntaDeEscolha(obrasContexto, memoria.mostradas);
+        texto = pagina.texto;
         obrasParaGuardar = obrasContexto;
-        texto =
-          "Só pra confirmar qual das obras. " + montarPerguntaDeEscolha(obrasContexto);
+        tipoParaGuardar = "aguardando_escolha";
+        mostradasParaGuardar = pagina.mostradas;
+      }
+
+      else if (aguardandoEscolha && !escolha && obrasContexto.length >= 2) {
+        // Estava esperando um numero e a pessoa respondeu algo vago -> repete
+        // a mesma pagina de opcoes, sem sair procurando outras.
+        console.log("DEBUG resposta vaga durante escolha - repetindo a pagina");
+        const jaMostradas = Math.max(0, memoria.mostradas - PAGINA_ESCOLHA);
+        const pagina = montarPerguntaDeEscolha(obrasContexto, jaMostradas);
+        texto = "Só pra confirmar qual das obras. " + pagina.texto;
+        obrasParaGuardar = obrasContexto;
+        tipoParaGuardar = "aguardando_escolha";
+        mostradasParaGuardar = memoria.mostradas;
       }
 
       else if (escolha) {
@@ -588,23 +630,23 @@ async function processarWebhook(payload) {
       //  Passo F: BUSCA especifica
       // ------------------------------------------------------
       else {
-        // Numa resposta resumida cabem bem mais obras do que numa detalhada.
-        const limiteBusca =
-          interpretacao.detalhe === "resumido" ? LIMITE_RESUMIDO : LIMITE_RESULTADOS;
+        // Busca TODAS as candidatas relevantes (nao so 3), para poder paginar
+        // com "MAIS". O filtro de relevancia do search.js ja faz o nome exato
+        // vencer sozinho; aqui so ampliamos o teto para casos com muitas obras.
+        const TETO_CANDIDATAS = 30;
 
-        let encontradas = buscarObrasPorTermos(interpretacao.termos, obras, limiteBusca);
+        let encontradas = buscarObrasPorTermos(interpretacao.termos, obras, TETO_CANDIDATAS);
         console.log(`DEBUG busca por termos da IA: ${encontradas.length} resultado(s)`);
 
         if (encontradas.length === 0) {
-          encontradas = buscarObras(pergunta, obras, limiteBusca);
+          encontradas = buscarObras(pergunta, obras, TETO_CANDIDATAS);
           console.log(`DEBUG busca direta pelo texto: ${encontradas.length} resultado(s)`);
         }
 
-        // MELHORIA 5: refinamento - combina os termos anteriores com os novos
-        // ("e tem mais alguma por la?", "e sobre isso na Vila Nova?").
+        // MELHORIA 5: refinamento - combina os termos anteriores com os novos.
         if (encontradas.length === 0 && termosAnteriores.length > 0) {
           const combinados = [...new Set([...termosAnteriores, ...interpretacao.termos])];
-          encontradas = buscarObrasPorTermos(combinados, obras, limiteBusca);
+          encontradas = buscarObrasPorTermos(combinados, obras, TETO_CANDIDATAS);
           console.log(
             `DEBUG busca combinada com termos anteriores [${combinados.join(", ")}]: ` +
               `${encontradas.length} resultado(s)`
@@ -669,14 +711,14 @@ async function processarWebhook(payload) {
             texto = montarRespostaLocal(encontradas, interpretacao.detalhe);
           }
         } else {
-          // Varias obras casaram: em vez de despejar a ficha de todas, lista as
-          // opcoes curtas e pergunta qual. Marcamos o estado como
-          // "aguardando_escolha" para que a proxima mensagem ("a 2", "a de
-          // pavimentacao") seja tratada como selecao e detalhe so aquela.
+          // Varias obras casaram: mostra a PRIMEIRA pagina de opcoes e guarda a
+          // lista completa. "MAIS" mostra as proximas; o numero escolhe a obra.
           obrasParaGuardar = encontradas;
           tipoParaGuardar = "aguardando_escolha";
           falhasParaGuardar = 0;
-          texto = montarPerguntaDeEscolha(encontradas);
+          const pagina = montarPerguntaDeEscolha(encontradas, 0);
+          texto = pagina.texto;
+          mostradasParaGuardar = pagina.mostradas;
         }
       }
     }
@@ -700,6 +742,7 @@ async function processarWebhook(payload) {
     termos: termosParaGuardar,
     tipo: tipoParaGuardar,
     falhas: falhasParaGuardar,
+    mostradas: mostradasParaGuardar,
   });
 
   await enviarTexto(de, texto);
