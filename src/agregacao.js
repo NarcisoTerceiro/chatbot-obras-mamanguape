@@ -173,24 +173,40 @@ function agregarContarPorStatus(obras, filtroStatus) {
   // Se a pessoa perguntou por um status especifico, responde so ele.
   if (filtroStatus) {
     const alvo = normalize(filtroStatus);
+    // Sinonimos comuns que o cidadao usa vs. o que costuma estar na planilha.
+    const sinonimos = {
+      parada: "paralisada", parado: "paralisada", paradas: "paralisada",
+      parados: "paralisada", pausada: "paralisada", suspensa: "paralisada",
+      pronta: "concluida", prontas: "concluida", finalizada: "concluida",
+      terminada: "concluida", entregue: "concluida",
+      andamento: "andamento", executando: "andamento", tocando: "andamento",
+    };
+    const alvos = new Set([alvo]);
+    if (sinonimos[alvo]) alvos.add(sinonimos[alvo]);
+
     let achou = null;
     for (const [chave, qtd] of contagem) {
       const n = normalize(chave);
-      if (n.includes(alvo) || alvo.includes(n)) {
-        achou = { chave, qtd };
-        break;
+      for (const a of alvos) {
+        if (n.includes(a) || a.includes(n)) {
+          achou = { chave, qtd };
+          break;
+        }
       }
+      if (achou) break;
     }
     if (achou) {
-      const exemplos = obras
-        .filter((o) => {
-          const campo = acharCampoStatus(o);
-          return campo && (o[campo] || "").trim() === achou.chave;
-        })
-        .slice(0, 3);
+      // Devolve TODAS as obras daquele status (nao so 3), para que o sistema
+      // possa listar por completo se a pessoa pedir.
+      const doStatus = obras.filter((o) => {
+        const campo = acharCampoStatus(o);
+        return campo && (o[campo] || "").trim() === achou.chave;
+      });
       return {
         fatos: `Existem ${achou.qtd} obra(s) com status "${achou.chave}".`,
-        obras: exemplos,
+        obras: doStatus,
+        // marca que "obras" e a lista COMPLETA do filtro (nao apenas exemplos)
+        listaCompleta: true,
       };
     }
     return {
