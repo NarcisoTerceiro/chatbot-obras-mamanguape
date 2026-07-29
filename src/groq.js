@@ -1,30 +1,39 @@
 // ============================================================
-//  groq.js
-//  A IA (Groq) CONDUZ a conversa e tem MEMORIA: em cada chamada
-//  recebe o historico recente do cidadao, entao entende referencias
-//  e perguntas de acompanhamento ("e o prazo?", "quanto custou?").
+//  groq.js  (nome mantido por compatibilidade - hoje e o modulo de IA)
 //
-//  Duas funcoes:
+//  MULTI-PROVEDOR: o bot usa o Google GEMINI como IA principal (mais
+//  inteligente) e o GROQ como reserva automatica. Se um falhar (limite,
+//  erro, fora do ar), o outro assume na hora - o cidadao nem percebe.
 //
-//  1) interpretarPergunta(pergunta, historico): ENTENDE o pedido
-//     (informal, girias, erros) e devolve tipo + termos de busca +
-//     nivel de detalhe + (se for o caso) a operacao de AGREGACAO.
-//     Com isso o SISTEMA busca / calcula.
+//  Configuracao (variaveis de ambiente no Render / .env):
+//    GEMINI_API_KEY  -> chave do Google AI Studio (aistudio.google.com/apikey)
+//    GEMINI_MODEL    -> opcional (padrao: gemini-2.5-flash)
+//    GROQ_API_KEY    -> chave do Groq (reserva)
+//    GROQ_MODEL      -> opcional (padrao: openai/gpt-oss-120b)
 //
-//  2) redigirResposta(pergunta, obras, detalhe, historico, fatos):
-//     depois que o SISTEMA achou as obras (e, em agregacoes, ja fez
-//     a conta), a IA recebe SOMENTE esses dados e REDIGE a resposta
-//     final, conectada com o que ja foi dito.
-//
-//  A IA NUNCA acessa a planilha, NUNCA faz conta e NUNCA inventa
-//  dado. Quem busca e calcula e sempre o sistema.
+//  A ORDEM e: Gemini primeiro (se a chave existir), Groq depois.
+//  Se so houver a chave do Groq, funciona 100% no Groq como antes.
 // ============================================================
 
-const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
-// Da pra usar um modelo diferente pra redacao, se quiser. Por padrao usa o mesmo.
-const GROQ_MODEL_RESPOSTA = process.env.GROQ_MODEL_RESPOSTA || GROQ_MODEL;
+const PROVEDORES = [];
+
+if (process.env.GEMINI_API_KEY) {
+  PROVEDORES.push({
+    nome: "gemini",
+    url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    key: process.env.GEMINI_API_KEY,
+    model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+  });
+}
+
+if (process.env.GROQ_API_KEY) {
+  PROVEDORES.push({
+    nome: "groq",
+    url: "https://api.groq.com/openai/v1/chat/completions",
+    key: process.env.GROQ_API_KEY,
+    model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
+  });
+}
 
 // Contato para escalar quando o bot nao resolve (opcional, via .env).
 const CONTATO_SECRETARIA = process.env.CONTATO_SECRETARIA || "";
@@ -46,30 +55,47 @@ const OPERACOES_VALIDAS = new Set([
 // ------------------------------------------------------------
 //  Funcao auxiliar generica pra chamar a API do Groq.
 // ------------------------------------------------------------
-// IMPORTANTE: o modelo openai/gpt-oss-120b e um modelo de RACIOCINIO. Os
-// tokens que ele gasta "pensando" contam dentro do limite de geracao. Se o
-// limite for baixo demais, o raciocinio consome tudo e a resposta volta VAZIA
-// (erro 400 json_validate_failed). Por isso usamos max_completion_tokens
-// folgado e reasoning_effort "low" na etapa de interpretacao.
-async function chamarGroq(body) {
-  const resp = await fetch(GROQ_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${GROQ_KEY}`,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!resp.ok) {
-    const erro = await resp.text();
-    const err = new Error(`Groq respondeu ${resp.status}: ${erro}`);
-    err.status = resp.status;
-    throw err;
+// Chama a IA tentando cada provedor na ordem (Gemini -> Groq). O "body" NAO
+// deve conter "model": ele e definido aqui conforme o provedor da vez.
+// Observacao sobre parametros: usamos max_tokens (aceito por ambos) e
+// reasoning_effort (Groq: gpt-oss; Gemini: mapeia para o "thinking").
+async function chamarIA(body) {
+  if (PROVEDORES.length === 0) {
+    throw new Error("Nenhuma chave de IA configurada (GEMINI_API_KEY ou GROQ_API_KEY).");
   }
 
-  const data = await resp.json();
-  return data.choices?.[0]?.message?.content?.trim() || "";
+  let ultimoErro = null;
+
+  for (const prov of PROVEDORES) {
+    try {
+      const resp = await fetch(prov.url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${prov.key}`,
+        },
+        body: JSON.stringify({ ...body, model: prov.model }),
+      });
+
+      if (!resp.ok) {
+        const erro = await resp.text();
+        const err = new Error(`${prov.nome} respondeu ${resp.status}: ${erro.slice(0, 300)}`);
+        err.status = resp.status;
+        throw err;
+      }
+
+      const data = await resp.json();
+      const texto = data.choices?.[0]?.message?.content?.trim() || "";
+      if (!texto) throw new Error(`${prov.nome} devolveu resposta vazia`);
+      return texto;
+    } catch (e) {
+      console.error(`IA (${prov.nome}) falhou:`, e.message);
+      ultimoErro = e;
+      // tenta o proximo provedor da lista
+    }
+  }
+
+  throw ultimoErro || new Error("Todos os provedores de IA falharam.");
 }
 
 // Normaliza o historico em mensagens que a API entende.
@@ -163,11 +189,11 @@ export async function interpretarPergunta(pergunta, historico = []) {
   ];
 
   const base = {
-    model: GROQ_MODEL,
     temperature: 0,
     // Orcamento generoso: cobre o raciocinio do modelo + o JSON final.
-    max_completion_tokens: 1024,
-    // Menos raciocinio = menos token gasto e menos risco de estourar.
+    // (max_tokens e aceito tanto pelo Gemini quanto pelo Groq.)
+    max_tokens: 1024,
+    // Menos raciocinio = menos token e menos risco de estourar.
     reasoning_effort: "low",
     messages: mensagens,
   };
@@ -175,13 +201,13 @@ export async function interpretarPergunta(pergunta, historico = []) {
   let texto = "";
   try {
     // Tentativa 1: modo JSON nativo (mais confiavel quando funciona).
-    texto = await chamarGroq({ ...base, response_format: { type: "json_object" } });
+    texto = await chamarIA({ ...base, response_format: { type: "json_object" } });
   } catch (e) {
     // Se o modelo estourar o orcamento no modo JSON, ele devolve 400 com
     // geracao vazia. Tentamos de novo SEM o modo JSON: o prompt ja pede JSON
     // puro, e o parser abaixo limpa eventuais cercas de markdown.
     console.error("Interpretacao em modo JSON falhou, tentando sem:", e.message);
-    texto = await chamarGroq(base);
+    texto = await chamarIA(base);
   }
 
   // LOG TEMPORARIO DE DEBUG - remover depois de confirmar que esta ok
@@ -328,11 +354,10 @@ export async function redigirResposta(pergunta, obras, detalhe, historico = [], 
   if (dica) carga.instrucao = dica;
   if (CONTATO_SECRETARIA) carga.contato_para_duvidas = CONTATO_SECRETARIA;
 
-  const texto = await chamarGroq({
-    model: GROQ_MODEL_RESPOSTA,
+  const texto = await chamarIA({
     temperature: 0.2,
     // Cobre o raciocinio do modelo + o texto final da mensagem.
-    max_completion_tokens: 2048,
+    max_tokens: 2048,
     reasoning_effort: "low",
     messages: [
       { role: "system", content: SYSTEM_PROMPT_RESPOSTA },
