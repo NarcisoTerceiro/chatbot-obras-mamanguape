@@ -560,6 +560,14 @@ async function processarWebhook(payload) {
       const pediuMais = aguardandoEscolha && !escolha && ehVerMais(pergunta);
       const pediuTodas = aguardandoEscolha && !escolha && ehVerTodas(pergunta);
 
+      // Se, no meio da escolha, a pessoa faz uma PERGUNTA NOVA de verdade
+      // (frase com conteudo, ou com "?"), nao repetimos a lista - deixamos a
+      // pergunta seguir o fluxo normal (interpretacao/busca/agregacao).
+      const palavrasUteis = (pergunta || "")
+        .split(/\s+/)
+        .filter((w) => w.replace(/[^a-za-u00e0-\u00fc0-9]/gi, "").length >= 3).length;
+      const pareceNovaPergunta = /\?/.test(pergunta || "") || palavrasUteis >= 3;
+
       // Mensagens curtas de confirmacao/continuacao ("sim", "isso", "pode",
       // "aham", "quero", "manda") NAO sao busca nova - a pessoa esta seguindo
       // com a obra que ja estava em pauta.
@@ -596,9 +604,10 @@ async function processarWebhook(payload) {
         mostradasParaGuardar = pagina.mostradas;
       }
 
-      else if (aguardandoEscolha && !escolha && obrasContexto.length >= 2) {
-        // Estava esperando um numero e a pessoa respondeu algo vago -> repete
-        // a mesma pagina de opcoes, sem sair procurando outras.
+      else if (aguardandoEscolha && !escolha && !pareceNovaPergunta && obrasContexto.length >= 2) {
+        // Estava esperando um numero e a pessoa respondeu algo vago e CURTO ->
+        // repete a mesma pagina de opcoes. (Perguntas novas de verdade seguem
+        // o fluxo normal em vez de ficarem presas aqui.)
         console.log("DEBUG resposta vaga durante escolha - repetindo a pagina");
         const jaMostradas = Math.max(0, memoria.mostradas - PAGINA_ESCOLHA);
         const pagina = montarPerguntaDeEscolha(obrasContexto, jaMostradas);

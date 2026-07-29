@@ -209,6 +209,18 @@ function agregarContarPorStatus(obras, filtroStatus) {
         listaCompleta: true,
       };
     }
+    // O filtro nao casou com nenhum STATUS. Antes de dizer que nao existe,
+    // tenta casar com a ABA de origem (_aba): "licitacao" -> EM_LICITACAO,
+    // "projeto" -> EM_PROJETO, "pavimentacao" -> PAVIMENTACAO etc.
+    const daAba = obras.filter((o) => normalize(o._aba || "").includes(alvo));
+    if (daAba.length > 0) {
+      return {
+        fatos: `Existem ${daAba.length} obra(s) na aba "${daAba[0]._aba}".`,
+        obras: daAba,
+        listaCompleta: true,
+      };
+    }
+
     return {
       fatos:
         `Nao existe nenhuma obra com o status "${filtroStatus}" na base. ` +
