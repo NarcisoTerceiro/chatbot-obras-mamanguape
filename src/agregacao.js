@@ -184,14 +184,24 @@ function agregarContarPorStatus(obras, filtroStatus) {
     const alvos = new Set([alvo]);
     if (sinonimos[alvo]) alvos.add(sinonimos[alvo]);
 
+    // Prioridade de casamento: 1) EXATO ("em andamento" == "Em andamento"),
+    // 2) o status COMECA com o alvo, 3) o status CONTEM o alvo. Sem isso,
+    // "em andamento" casaria com "Habilitacao em andamento" por vir primeiro.
     let achou = null;
-    for (const [chave, qtd] of contagem) {
-      const n = normalize(chave);
-      for (const a of alvos) {
-        if (n.includes(a) || a.includes(n)) {
-          achou = { chave, qtd };
-          break;
+    for (const nivel of ["exato", "comeca", "contem"]) {
+      for (const [chave, qtd] of contagem) {
+        const n = normalize(chave);
+        for (const a of alvos) {
+          const bate =
+            nivel === "exato" ? n === a :
+            nivel === "comeca" ? n.startsWith(a) :
+            (n.includes(a) || a.includes(n));
+          if (bate) {
+            achou = { chave, qtd };
+            break;
+          }
         }
+        if (achou) break;
       }
       if (achou) break;
     }
@@ -212,7 +222,14 @@ function agregarContarPorStatus(obras, filtroStatus) {
     // O filtro nao casou com nenhum STATUS. Antes de dizer que nao existe,
     // tenta casar com a ABA de origem (_aba): "licitacao" -> EM_LICITACAO,
     // "projeto" -> EM_PROJETO, "pavimentacao" -> PAVIMENTACAO etc.
-    const daAba = obras.filter((o) => normalize(o._aba || "").includes(alvo));
+    // IMPORTANTE: nomes de aba usam underline ("EM_LICITACAO") e a pessoa fala
+    // com espaco ("em licitacao") - normalizamos os dois para espacos.
+    const limpaAba = (t) => normalize(t).replace(/[_\-]+/g, " ").trim();
+    const alvoAba = limpaAba(filtroStatus);
+    const daAba = obras.filter((o) => {
+      const aba = limpaAba(o._aba || "");
+      return aba.includes(alvoAba) || alvoAba.includes(aba);
+    });
     if (daAba.length > 0) {
       return {
         fatos: `Existem ${daAba.length} obra(s) na aba "${daAba[0]._aba}".`,
