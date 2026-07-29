@@ -20,7 +20,7 @@ import "dotenv/config";
 import express from "express";
 
 import { getObras, getDiagnostico } from "./sheets.js";
-import { buscarObrasPorTermos, buscarObras } from "./search.js";
+import { buscarObrasPorTermos, buscarObras, buscarPorEngenheiro } from "./search.js";
 import { interpretarPergunta, redigirResposta } from "./groq.js";
 import { executarAgregacao } from "./agregacao.js";
 import { enviarTexto } from "./whatsapp.js";
@@ -657,6 +657,41 @@ async function processarWebhook(payload) {
         // ("oi", "bom dia"): cada um recebe um fecho adequado.
         texto = ehDespedida(pergunta) ? despedidaAleatoria() : saudacaoAleatoria();
         falhasParaGuardar = 0;
+      }
+
+      // ------------------------------------------------------
+      //  Passo D0: OBRAS DE UM ENGENHEIRO
+      //  Busca o nome SO na coluna de engenheiro. Lista paginavel.
+      // ------------------------------------------------------
+      else if (interpretacao.tipo === "engenheiro") {
+        const nomeEng = interpretacao.termos.join(" ").trim();
+        const doEng = buscarPorEngenheiro(nomeEng, obras, 30);
+        console.log(`DEBUG busca por engenheiro "${nomeEng}": ${doEng.length} obra(s)`);
+
+        if (doEng.length === 0) {
+          falhasParaGuardar = memoria.falhas + 1;
+          logPerguntaSemResultado(pergunta, interpretacao.termos, "engenheiro_sem_obras");
+          texto =
+            `Não encontrei obras com um engenheiro chamado "${nomeEng}". ` +
+            `Confira o nome, ou pergunte por bairro, tipo de obra ou nome da obra.`;
+        } else if (doEng.length === 1) {
+          obrasParaGuardar = doEng;
+          tipoParaGuardar = "obra_focada";
+          falhasParaGuardar = 0;
+          try {
+            texto = await redigirResposta(pergunta, doEng, "completo", historico);
+          } catch (e) {
+            texto = formatarObra(doEng[0]);
+          }
+          texto += "\n\n_Você está vendo esta obra. Pergunte o que quiser; envie *X* para ver outras._";
+        } else {
+          obrasParaGuardar = doEng;
+          tipoParaGuardar = "aguardando_escolha";
+          falhasParaGuardar = 0;
+          const pagina = montarPerguntaDeEscolha(doEng, 0);
+          mostradasParaGuardar = pagina.mostradas;
+          texto = `Encontrei ${doEng.length} obra(s) do engenheiro ${nomeEng}:\n\n${pagina.texto}`;
+        }
       }
 
       // ------------------------------------------------------

@@ -175,3 +175,39 @@ export function buscarObras(pergunta, obras, limite = 5) {
   const termos = keywords(pergunta);
   return pontuarObras(termos, obras, limite);
 }
+
+
+// ------------------------------------------------------------
+//  Busca por ENGENHEIRO / responsavel
+//  Quando a pergunta e "obras do engenheiro X", procuramos o nome X SO na
+//  coluna de engenheiro (nao na linha inteira) - senao "Carlos" casaria com
+//  qualquer texto que tenha "Carlos" em qualquer campo.
+// ------------------------------------------------------------
+
+// Colunas que costumam guardar o nome do engenheiro/arquiteto responsavel.
+function valorEngenheiro(obra) {
+  for (const [k, v] of Object.entries(obra)) {
+    if (k === "_aba" || !v) continue;
+    const n = normalize(k);
+    if (n.includes("engenheiro") || n.includes("arquiteto") || n.includes("responsavel")) {
+      return normalize(v);
+    }
+  }
+  return "";
+}
+
+// Recebe o nome (ou parte) do engenheiro e devolve as obras cujo campo de
+// engenheiro contem esse nome. Ex.: "carlos" -> obras do Eng. Carlos Andrade.
+export function buscarPorEngenheiro(nome, obras, limite = 30) {
+  const alvo = keywords(nome); // palavras uteis do nome buscado
+  if (alvo.length === 0) return [];
+
+  const achadas = obras.filter((obra) => {
+    const eng = valorEngenheiro(obra);
+    if (!eng) return false;
+    // casa se TODAS as palavras do nome buscado aparecem no campo engenheiro
+    return alvo.every((p) => casaTermo(eng, p) || eng.includes(p));
+  });
+
+  return achadas.slice(0, limite);
+}

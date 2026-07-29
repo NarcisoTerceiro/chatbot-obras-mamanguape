@@ -133,6 +133,9 @@ Classifique a mensagem em um destes TIPOS:
 - "agregacao": pergunta que exige CONTA ou COMPARACAO sobre o conjunto de obras
   (ex: "qual a obra mais cara?", "quantas obras estao paralisadas?", "quanto
   foi gasto no total?", "quantas obras tem?").
+- "engenheiro": pergunta por obras de um ENGENHEIRO ou responsavel especifico
+  (ex: "obras do engenheiro Carlos", "o que o Paulo Nunes toca", "obras da
+  arquiteta Ana"). Coloque em "termos" APENAS o nome da pessoa (ex: ["Carlos"]).
 - "busca": qualquer pergunta sobre uma obra ou grupo de obras especifico
   (por bairro, rua, tipo, nome, empresa).
 
@@ -169,7 +172,7 @@ Decida o NIVEL DE DETALHE:
   engenheiro, percentual executado) ou pergunta sobre uma obra so.
 
 Responda SOMENTE com um JSON valido, sem texto antes ou depois:
-{"tipo":"busca"|"saudacao"|"listagem"|"agregacao","termos":["termo1"],"detalhe":"resumido"|"completo","operacao":"","filtro_status":""}
+{"tipo":"busca"|"saudacao"|"listagem"|"agregacao"|"engenheiro","termos":["termo1"],"detalhe":"resumido"|"completo","operacao":"","filtro_status":""}
 
 Deixe "operacao" e "filtro_status" como string vazia quando o tipo nao for
 "agregacao".
@@ -179,7 +182,7 @@ Exemplos:
 "quais obras tem?" -> {"tipo":"listagem","termos":[],"detalhe":"resumido","operacao":"","filtro_status":""}
 "quanto custou o asfalto do centro?" -> {"tipo":"busca","termos":["pavimentacao","centro"],"detalhe":"completo","operacao":"","filtro_status":""}
 "qual a obra mais cara?" -> {"tipo":"agregacao","termos":[],"detalhe":"completo","operacao":"maior_valor","filtro_status":""}
-"quantas estao paradas?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"contar_por_status","filtro_status":"paralisada"}`;
+"quantas estao paradas?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"contar_por_status","filtro_status":"paralisada"}\n"obras do engenheiro Carlos" -> {"tipo":"engenheiro","termos":["Carlos"],"detalhe":"resumido","operacao":"","filtro_status":""}`;
 
 export async function interpretarPergunta(pergunta, historico = []) {
   const mensagens = [
@@ -221,7 +224,7 @@ export async function interpretarPergunta(pergunta, historico = []) {
     const limpo = inicio >= 0 && fim > inicio ? bruto.slice(inicio, fim + 1) : "{}";
     const it = JSON.parse(limpo);
 
-    const tiposValidos = ["busca", "saudacao", "listagem", "agregacao"];
+    const tiposValidos = ["busca", "saudacao", "listagem", "agregacao", "engenheiro"];
     const tipo = tiposValidos.includes(it.tipo) ? it.tipo : "busca";
 
     // Valida a operacao: se a IA inventar uma que o sistema nao executa,
