@@ -232,7 +232,7 @@ function formatarLista(obras) {
 }
 
 // Quantas opcoes mostrar por vez quando ha varias obras parecidas.
-const PAGINA_ESCOLHA = 3;
+const PAGINA_ESCOLHA = 5;
 
 // Monta uma "pagina" da lista de opcoes, comecando de 'jaMostradas'. Mantem a
 // numeracao global (se ja mostrou 3, a proxima comeca no 4). Retorna o texto e
@@ -257,11 +257,17 @@ function montarPerguntaDeEscolha(lista, jaMostradas = 0) {
 
   const rodape =
     restante > 0
-      ? `\n\nResponda o número (ex.: "${jaMostradas + 1}") ou o nome — ou digite ` +
-        `*MAIS* para ver as próximas ${Math.min(PAGINA_ESCOLHA, restante)}.`
+      ? `\n\nResponda o número (ex.: "${jaMostradas + 1}") ou o nome. Digite ` +
+        `*MAIS* para ver as próximas ${Math.min(PAGINA_ESCOLHA, restante)} ou *TODAS* para a lista completa.`
       : `\n\nÉ só responder o número ou o nome.`;
 
   return { texto: cabecalho + "\n\n" + linhas.join("\n") + rodape, mostradas: fim };
+}
+
+// Detecta o pedido de ver TODAS as opcoes de uma vez ("todas", "lista todas").
+function ehVerTodas(msg) {
+  const t = (msg || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  return /\b(todas|todos|tudo|completa|completo|lista tudo|liste todas|me da todas|mostra todas)\b/.test(t);
 }
 
 // Detecta o pedido de "ver mais" opcoes durante a escolha.
@@ -552,6 +558,7 @@ async function processarWebhook(payload) {
       const aguardandoEscolha = memoria.tipo === "aguardando_escolha";
       const escolha = aguardandoEscolha ? detectarEscolha(pergunta, obrasContexto) : null;
       const pediuMais = aguardandoEscolha && !escolha && ehVerMais(pergunta);
+      const pediuTodas = aguardandoEscolha && !escolha && ehVerTodas(pergunta);
 
       // Mensagens curtas de confirmacao/continuacao ("sim", "isso", "pode",
       // "aham", "quero", "manda") NAO sao busca nova - a pessoa esta seguindo
@@ -560,7 +567,24 @@ async function processarWebhook(payload) {
         pergunta || ""
       );
 
-      if (pediuMais && memoria.mostradas < obrasContexto.length) {
+      if (pediuTodas && obrasContexto.length >= 2) {
+        // "TODAS": mostra a lista completa de uma vez (resumida e numerada).
+        console.log(`DEBUG listar todas: ${obrasContexto.length} obra(s)`);
+        const linhas = obrasContexto.map((o, i) => {
+          const st = campoStatus(o);
+          const em = emojiStatus(st);
+          return `${i + 1}. ${em ? em + " " : ""}${campoNome(o)}${st ? ` — ${st}` : ""}`;
+        });
+        texto =
+          `Aqui estão todas as ${obrasContexto.length} obra(s):\n\n` +
+          linhas.join("\n") +
+          `\n\nResponda o número para ver os detalhes de uma delas.`;
+        obrasParaGuardar = obrasContexto;
+        tipoParaGuardar = "aguardando_escolha";
+        mostradasParaGuardar = obrasContexto.length;
+      }
+
+      else if (pediuMais && memoria.mostradas < obrasContexto.length) {
         // "MAIS": mostra a proxima pagina de opcoes, mantendo a numeracao.
         console.log(
           `DEBUG ver mais opcoes: ${memoria.mostradas}/${obrasContexto.length} ja mostradas`
@@ -694,38 +718,18 @@ async function processarWebhook(payload) {
 
       // ------------------------------------------------------
       //  Passo E: LISTAGEM geral
+      //  O SISTEMA monta a lista (formatacao deterministica, sem IA - evita
+      //  repeticao/eco do modelo) e ela e PAGINAVEL: MAIS mostra as proximas,
+      //  o numero escolhe uma obra para ver os detalhes.
       // ------------------------------------------------------
       else if (interpretacao.tipo === "listagem") {
-        const resumido = interpretacao.detalhe === "resumido";
-        const limite = resumido ? LIMITE_RESUMIDO : LIMITE_RESULTADOS;
-        const lista = obras.slice(0, limite);
-        const restante = obras.length - lista.length;
-        obrasParaGuardar = lista;
+        obrasParaGuardar = obras;
+        tipoParaGuardar = "aguardando_escolha";
         falhasParaGuardar = 0;
 
-        let corpo;
-        try {
-          corpo = await redigirResposta(
-            pergunta,
-            lista,
-            interpretacao.detalhe,
-            historico,
-            `A base tem ${obras.length} obra(s) cadastrada(s) no total. ` +
-              `Estao sendo mostradas ${lista.length} delas.`
-          );
-        } catch (e) {
-          console.error("IA de redacao (listagem) falhou, usando local:", e.message);
-          corpo = resumido
-            ? `Temos ${obras.length} obra(s) cadastrada(s):\n\n` + formatarListaResumida(lista)
-            : `Temos ${obras.length} obra(s) cadastrada(s). Aqui estão as primeiras:\n\n` +
-              formatarLista(lista);
-        }
-
-        const rodape =
-          restante > 0
-            ? `\n\n...e mais ${restante}. Pergunte por bairro, rua, tipo ou nome para ver detalhes.`
-            : "";
-        texto = corpo + rodape;
+        const pagina = montarPerguntaDeEscolha(obras, 0);
+        mostradasParaGuardar = pagina.mostradas;
+        texto = `Temos ${obras.length} obra(s) cadastrada(s).\n\n${pagina.texto}`;
       }
 
       // ------------------------------------------------------
