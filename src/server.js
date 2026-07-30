@@ -709,6 +709,7 @@ async function processarWebhook(payload) {
 
         const resultado = executarAgregacao(interpretacao.operacao, base, {
           filtro_status: interpretacao.filtro_status,
+          pista_valor: interpretacao.pista_valor || "",
         });
 
         console.log(

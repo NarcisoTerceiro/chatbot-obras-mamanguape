@@ -65,10 +65,22 @@ export function formatarMoeda(n) {
 // ------------------------------------------------------------
 
 // Acha a coluna que parece ser o VALOR da obra. Prefere "valor total".
-function acharCampoValor(obra) {
+function acharCampoValor(obra, pista = "") {
   const chaves = Object.keys(obra).filter((k) => k !== "_aba");
-  const comValor = chaves.filter((k) => normalize(k).includes("valor"));
+  const comValor = chaves.filter((k) => {
+    const n = normalize(k);
+    return n.includes("valor") || n.includes("investimento") || n.includes("custo");
+  });
   if (comValor.length === 0) return null;
+
+  const p = normalize(pista);
+  // Se a pergunta deu uma pista ("inicial", "executado", "pago", "aditivo"),
+  // tenta achar a coluna que corresponde a ela.
+  if (p) {
+    const alvo = comValor.find((k) => normalize(k).includes(p));
+    if (alvo) return alvo;
+  }
+  // Padrao: prefere "valor total da obra" (o mais completo).
   const total = comValor.find((k) => normalize(k).includes("total"));
   return total || comValor[0];
 }
@@ -108,10 +120,10 @@ function nomeDaObra(obra) {
 // ------------------------------------------------------------
 
 // Monta a lista de obras que tem valor numerico legivel.
-function obrasComValor(obras) {
+function obrasComValor(obras, pista = "") {
   const lista = [];
   for (const obra of obras) {
-    const campo = acharCampoValor(obra);
+    const campo = acharCampoValor(obra, pista);
     if (!campo) continue;
     const n = parseNumero(obra[campo]);
     if (n == null) continue;
@@ -120,8 +132,8 @@ function obrasComValor(obras) {
   return lista;
 }
 
-function agregarExtremo(obras, maior) {
-  const lista = obrasComValor(obras);
+function agregarExtremo(obras, maior, pista = "") {
+  const lista = obrasComValor(obras, pista);
   if (lista.length === 0) return null;
 
   lista.sort((a, b) => (maior ? b.valor - a.valor : a.valor - b.valor));
@@ -137,8 +149,8 @@ function agregarExtremo(obras, maior) {
   };
 }
 
-function agregarSoma(obras) {
-  const lista = obrasComValor(obras);
+function agregarSoma(obras, pista = "") {
+  const lista = obrasComValor(obras, pista);
   if (lista.length === 0) return null;
 
   const total = lista.reduce((acc, x) => acc + x.valor, 0);
@@ -149,7 +161,26 @@ function agregarSoma(obras) {
       `A soma dos valores e ${formatarMoeda(total)}, ` +
       `considerando ${lista.length} obra(s) com valor informado` +
       (semValor > 0 ? ` (${semValor} obra(s) estao sem valor na base).` : ".") ,
-    obras: lista.slice(0, 3).map((x) => x.obra),
+    // devolve TODAS as obras somadas (ordenadas por valor), para listar completo
+    obras: lista.sort((a, b) => b.valor - a.valor).map((x) => x.obra),
+    listaCompleta: true,
+  };
+}
+
+function agregarMedia(obras, pista = "") {
+  const lista = obrasComValor(obras, pista);
+  if (lista.length === 0) return null;
+
+  const total = lista.reduce((acc, x) => acc + x.valor, 0);
+  const media = total / lista.length;
+
+  return {
+    fatos:
+      `A media de valor e ${formatarMoeda(media)}, ` +
+      `calculada sobre ${lista.length} obra(s) com valor informado ` +
+      `(soma total de ${formatarMoeda(total)}).`,
+    obras: lista.sort((a, b) => b.valor - a.valor).map((x) => x.obra),
+    listaCompleta: true,
   };
 }
 
@@ -275,13 +306,17 @@ function agregarContarTotal(obras) {
 export function executarAgregacao(operacao, obras, opcoes = {}) {
   if (!Array.isArray(obras) || obras.length === 0) return null;
 
+  const pista = opcoes.pista_valor || ""; // ex.: "inicial", "executado", "pago"
+
   switch (operacao) {
     case "maior_valor":
-      return agregarExtremo(obras, true);
+      return agregarExtremo(obras, true, pista);
     case "menor_valor":
-      return agregarExtremo(obras, false);
+      return agregarExtremo(obras, false, pista);
     case "soma_valor":
-      return agregarSoma(obras);
+      return agregarSoma(obras, pista);
+    case "media_valor":
+      return agregarMedia(obras, pista);
     case "contar_por_status":
       return agregarContarPorStatus(obras, opcoes.filtro_status || "");
     case "contar_total":

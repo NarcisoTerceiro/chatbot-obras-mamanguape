@@ -1,21 +1,35 @@
 // ============================================================
 //  groq.js  (nome mantido por compatibilidade - hoje e o modulo de IA)
 //
-//  MULTI-PROVEDOR: o bot usa o Google GEMINI como IA principal (mais
-//  inteligente) e o GROQ como reserva automatica. Se um falhar (limite,
-//  erro, fora do ar), o outro assume na hora - o cidadao nem percebe.
+//  MULTI-PROVEDOR: a IA principal e o CEREBRAS (rapido e inteligente); se
+//  faltar a chave dele, usa o GEMINI; e o GROQ fica como ultima reserva. Se
+//  um provedor falhar (limite, erro, fora do ar), o proximo assume na hora -
+//  o cidadao nem percebe.
 //
 //  Configuracao (variaveis de ambiente no Render / .env):
+//    CEREBRAS_API_KEY -> chave do Cerebras (cloud.cerebras.ai) - PRINCIPAL
+//    CEREBRAS_MODEL   -> opcional (padrao: llama-3.3-70b)
 //    GEMINI_API_KEY  -> chave do Google AI Studio (aistudio.google.com/apikey)
 //    GEMINI_MODEL    -> opcional (padrao: gemini-2.5-flash)
 //    GROQ_API_KEY    -> chave do Groq (reserva)
 //    GROQ_MODEL      -> opcional (padrao: openai/gpt-oss-120b)
 //
-//  A ORDEM e: Gemini primeiro (se a chave existir), Groq depois.
+//  A ORDEM e: Cerebras -> Gemini -> Groq (usa o primeiro que tiver chave).
 //  Se so houver a chave do Groq, funciona 100% no Groq como antes.
 // ============================================================
 
 const PROVEDORES = [];
+
+// Cerebras entra como IA PRINCIPAL (mais inteligente e muito rapido). Endpoint
+// compativel com OpenAI. Modelo configuravel por CEREBRAS_MODEL.
+if (process.env.CEREBRAS_API_KEY) {
+  PROVEDORES.push({
+    nome: "cerebras",
+    url: "https://api.cerebras.ai/v1/chat/completions",
+    key: process.env.CEREBRAS_API_KEY,
+    model: process.env.CEREBRAS_MODEL || "llama-3.3-70b",
+  });
+}
 
 if (process.env.GEMINI_API_KEY) {
   PROVEDORES.push({
@@ -48,6 +62,7 @@ const OPERACOES_VALIDAS = new Set([
   "maior_valor",
   "menor_valor",
   "soma_valor",
+  "media_valor",
   "contar_por_status",
   "contar_total",
 ]);
@@ -143,13 +158,18 @@ Quando o tipo for "agregacao", escolha a "operacao":
 - "maior_valor"  -> obra mais cara / de maior valor
 - "menor_valor"  -> obra mais barata / de menor valor
 - "soma_valor"   -> total investido / quanto foi gasto somando
+- "media_valor"  -> valor medio das obras
 - "contar_por_status" -> quantas obras estao em determinada situacao. Nesse caso
   preencha "filtro_status" com o status citado (ex: "paralisada", "concluida",
   "em andamento"). Se a pessoa pedir a contagem geral por situacao, deixe
   "filtro_status" vazio.
 - "contar_total" -> quantas obras existem no total
-Se a agregacao for limitada a um recorte (ex: "obra mais cara do Centro"),
-coloque esse recorte em "termos" (ex: ["centro"]).
+Se a agregacao for limitada a um RECORTE (ex: "quanto foi investido no Centro",
+"media das escolas", "total gasto em pavimentacao"), coloque o recorte em
+"termos" (ex: ["centro"], ["escola"], ["pavimentacao"]). O sistema filtra por
+esses termos ANTES de calcular.
+Se a pergunta indicar QUAL valor usar (ex: "valor inicial", "executado", "pago",
+"aditivo"), coloque a pista em "pista_valor". Senao, deixe vazio (usa o total).
 
 Para "busca" e "agregacao" com recorte, extraia em "termos" as palavras que
 realmente identificam a obra (bairro, rua, tipo, nome, empresa), normalizando
@@ -172,17 +192,16 @@ Decida o NIVEL DE DETALHE:
   engenheiro, percentual executado) ou pergunta sobre uma obra so.
 
 Responda SOMENTE com um JSON valido, sem texto antes ou depois:
-{"tipo":"busca"|"saudacao"|"listagem"|"agregacao"|"engenheiro","termos":["termo1"],"detalhe":"resumido"|"completo","operacao":"","filtro_status":""}
+{"tipo":"busca"|"saudacao"|"listagem"|"agregacao"|"engenheiro","termos":["termo1"],"detalhe":"resumido"|"completo","operacao":"","filtro_status":"","pista_valor":""}
 
-Deixe "operacao" e "filtro_status" como string vazia quando o tipo nao for
-"agregacao".
+Deixe "operacao", "filtro_status" e "pista_valor" vazios quando nao se aplicarem.
 
 Exemplos:
 "bom dia" -> {"tipo":"saudacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":""}
 "quais obras tem?" -> {"tipo":"listagem","termos":[],"detalhe":"resumido","operacao":"","filtro_status":""}
 "quanto custou o asfalto do centro?" -> {"tipo":"busca","termos":["pavimentacao","centro"],"detalhe":"completo","operacao":"","filtro_status":""}
 "qual a obra mais cara?" -> {"tipo":"agregacao","termos":[],"detalhe":"completo","operacao":"maior_valor","filtro_status":""}
-"quantas estao paradas?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"contar_por_status","filtro_status":"paralisada"}\n"obras do engenheiro Carlos" -> {"tipo":"engenheiro","termos":["Carlos"],"detalhe":"resumido","operacao":"","filtro_status":""}`;
+"quantas estao paradas?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"contar_por_status","filtro_status":"paralisada"}\n"obras do engenheiro Carlos" -> {"tipo":"engenheiro","termos":["Carlos"],"detalhe":"resumido","operacao":"","filtro_status":""}\n"quanto foi investido no centro?" -> {"tipo":"agregacao","termos":["centro"],"detalhe":"resumido","operacao":"soma_valor","filtro_status":"","pista_valor":""}\n"media de valor das escolas?" -> {"tipo":"agregacao","termos":["escola"],"detalhe":"resumido","operacao":"media_valor","filtro_status":"","pista_valor":""}`;
 
 export async function interpretarPergunta(pergunta, historico = []) {
   const mensagens = [
@@ -240,6 +259,7 @@ export async function interpretarPergunta(pergunta, historico = []) {
       detalhe: it.detalhe === "resumido" ? "resumido" : "completo",
       operacao,
       filtro_status: typeof it.filtro_status === "string" ? it.filtro_status.trim() : "",
+      pista_valor: typeof it.pista_valor === "string" ? it.pista_valor.trim() : "",
       falhou: false,
     };
   } catch {
@@ -250,6 +270,7 @@ export async function interpretarPergunta(pergunta, historico = []) {
       detalhe: "completo",
       operacao: "",
       filtro_status: "",
+      pista_valor: "",
       falhou: true,
     };
   }
@@ -260,8 +281,39 @@ export async function interpretarPergunta(pergunta, historico = []) {
 // ============================================================
 
 const SYSTEM_PROMPT_RESPOSTA = `Voce e o assistente de obras publicas da Prefeitura de
-Mamanguape, atendendo cidadaos pelo WhatsApp. Voce conduz a conversa de forma
-natural e lembra do que ja foi dito (recebe o historico recente).
+Mamanguape, atendendo cidadaos pelo WhatsApp.
+
+======================= COMO VOCE DEVE AGIR =======================
+Voce interpreta a intencao do usuario e entende exatamente o que ele deseja.
+Identifica as informacoes necessarias e usa os dados que o sistema ja consultou
+na base (planilha) para responder. Quando a solicitacao exige calculo (somas,
+totais, contagens, medias, comparacoes), esses calculos JA foram feitos pelo
+sistema e chegam prontos no campo "fatos" - voce apenas apresenta o resultado,
+sem refazer a conta.
+
+Depois de ter as informacoes, voce organiza e apresenta a resposta de forma
+clara, natural e no formato que o usuario pediu: resumida, detalhada ou objetiva.
+Ao longo da conversa voce mantem o contexto, entende diferentes formas de fazer a
+mesma pergunta, evita respostas confusas, nao se perde no fluxo e fornece
+informacoes precisas, coerentes e confiaveis - uma experiencia rapida, eficiente
+e natural.
+===================================================================
+
+======================= REGRA ABSOLUTA (LEIA PRIMEIRO) =======================
+Voce responde SOMENTE com base nos dados fornecidos nesta mensagem (os campos
+"obras" e "fatos"). Esses dados sao a UNICA fonte de verdade.
+- Se a informacao pedida NAO estiver explicita nesses dados, diga com clareza:
+  "Nao encontrei essa informacao na base de obras." e, se fizer sentido, sugira
+  uma consulta relacionada (ex.: perguntar por bairro, status ou nome da obra).
+- NUNCA invente, estime, deduza, arredonde ou complete valores, datas, prazos,
+  status, percentuais, nomes de empresa ou de engenheiro que nao estejam
+  escritos nos dados. Nao "preencha lacunas" com suposicoes.
+- Se um numero ou data nao aparece nos dados, NAO escreva nenhum numero ou data.
+- NUNCA faca contas por conta propria: use os totais que vierem em "fatos".
+- Prefira dizer que a informacao nao consta a arriscar uma resposta errada.
+Informar um dado errado de obra publica e um erro grave. Na duvida, diga que
+nao consta na base.
+=============================================================================
 
 Na mensagem atual voce recebe um JSON com:
 - "pergunta": o que o cidadao escreveu (pode ser informal).
