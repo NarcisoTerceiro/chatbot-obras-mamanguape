@@ -1,35 +1,21 @@
 // ============================================================
 //  groq.js  (nome mantido por compatibilidade - hoje e o modulo de IA)
 //
-//  MULTI-PROVEDOR: a IA principal e o CEREBRAS (rapido e inteligente); se
-//  faltar a chave dele, usa o GEMINI; e o GROQ fica como ultima reserva. Se
-//  um provedor falhar (limite, erro, fora do ar), o proximo assume na hora -
-//  o cidadao nem percebe.
+//  MULTI-PROVEDOR: a IA principal e o GEMINI e o GROQ fica como reserva
+//  automatica. Se um falhar (limite, erro, fora do ar), o outro assume na
+//  hora - o cidadao nem percebe.
 //
 //  Configuracao (variaveis de ambiente no Render / .env):
-//    CEREBRAS_API_KEY -> chave do Cerebras (cloud.cerebras.ai) - PRINCIPAL
-//    CEREBRAS_MODEL   -> opcional (padrao: llama-3.3-70b)
-//    GEMINI_API_KEY  -> chave do Google AI Studio (aistudio.google.com/apikey)
+//    GEMINI_API_KEY  -> chave do Google AI Studio (aistudio.google.com/apikey) - PRINCIPAL
 //    GEMINI_MODEL    -> opcional (padrao: gemini-2.5-flash)
 //    GROQ_API_KEY    -> chave do Groq (reserva)
 //    GROQ_MODEL      -> opcional (padrao: openai/gpt-oss-120b)
 //
-//  A ORDEM e: Cerebras -> Gemini -> Groq (usa o primeiro que tiver chave).
+//  A ORDEM e: Gemini -> Groq (usa o primeiro que tiver chave).
 //  Se so houver a chave do Groq, funciona 100% no Groq como antes.
 // ============================================================
 
 const PROVEDORES = [];
-
-// Cerebras entra como IA PRINCIPAL (mais inteligente e muito rapido). Endpoint
-// compativel com OpenAI. Modelo configuravel por CEREBRAS_MODEL.
-if (process.env.CEREBRAS_API_KEY) {
-  PROVEDORES.push({
-    nome: "cerebras",
-    url: "https://api.cerebras.ai/v1/chat/completions",
-    key: process.env.CEREBRAS_API_KEY,
-    model: process.env.CEREBRAS_MODEL || "llama-3.3-70b",
-  });
-}
 
 if (process.env.GEMINI_API_KEY) {
   PROVEDORES.push({
@@ -132,6 +118,18 @@ function prepararHistorico(historico) {
 const SYSTEM_PROMPT_INTERPRETAR = `Voce interpreta perguntas de cidadaos sobre obras publicas
 de uma prefeitura, enviadas por WhatsApp de forma informal, formal, com girias,
 abreviacoes ou erros de digitacao.
+
+PRINCIPIOS (siga sempre):
+1. Foque no que a pessoa REALMENTE quer, nao nas palavras exatas. "ta pronta a
+   creche?", "a creche ja acabou?" e "situacao da creche" pedem a mesma coisa.
+2. Entenda a mesma pergunta escrita de varios jeitos (formal, informal, com erro).
+3. Na duvida entre dois tipos, escolha o mais especifico que caiba. Ex.: se cita
+   o nome de uma pessoa como responsavel, e "engenheiro"; se pede um total/quantos,
+   e "agregacao"; caso contrario, "busca".
+4. So classifique como "saudacao" se NAO houver nenhum pedido de informacao junto.
+5. Extraia termos que DISTINGUEM a obra (bairro, tipo, nome), nunca palavras vazias.
+6. Responda SEMPRE com um JSON valido e completo - nunca texto solto.
+
 
 Voce recebe o HISTORICO recente da conversa seguido da mensagem atual. USE o
 historico para resolver referencias: se a pessoa disser "e o prazo?", "quanto
@@ -364,7 +362,17 @@ COMO CONVERSAR
    palavras, em linguagem simples.
 
 10) Se "obras" e "fatos" vierem vazios, nao invente nada: peca a pista que
-    falta (bairro, rua ou nome da obra) em uma frase curta e cordial.
+    falta (bairro, rua ou nome da obra) em uma frase curta e cordial - e, se
+    fizer sentido, sugira uma consulta parecida (por bairro, status ou tipo).
+
+11) Apresente de forma ORGANIZADA e facil de ler. Em respostas com varios dados,
+    use uma linha por informacao com o rotulo em *negrito* (ex.: "*Status:* ...").
+    Valores em reais no formato brasileiro (R$ 1.408.500,00). Datas por extenso
+    curto quando ajudar.
+
+12) Adapte o FORMATO ao que a pessoa pediu: se pediu "resumido" ou so um dado,
+    seja direto e curto; se pediu "detalhado" ou "tudo", organize os campos.
+    Um tom cordial, humano e prestativo - nunca robotico nem burocratico.
 
 NUNCA REPETIR
 - Nao repita frases nem blocos que voce ja enviou nas mensagens anteriores do
