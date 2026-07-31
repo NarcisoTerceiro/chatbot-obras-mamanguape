@@ -758,6 +758,19 @@ async function processarWebhook(payload) {
               "específica — é só dizer o bairro ou o nome.";
             falhasParaGuardar = memoria.falhas + 1;
           }
+        } else if (resultado.listaCampo && resultado.listaCampo.length > 0) {
+          // Lista de um CAMPO por obra (ex.: engenheiro de cada obra).
+          // Mostra em blocos para nao estourar o WhatsApp.
+          const BLOCO = 20;
+          const linhas = resultado.listaCampo;
+          const primeiras = linhas.slice(0, BLOCO);
+          const resto = linhas.length - primeiras.length;
+          texto = `${resultado.fatos}\n\n` + primeiras.join("\n");
+          if (resto > 0) {
+            texto += `\n\n...e mais ${resto}. Refine por bairro, status ou tipo para ver menos de cada vez.`;
+          }
+          obrasParaGuardar = resultado.obras.slice(0, 10);
+          falhasParaGuardar = 0;
         } else if (resultado.listaCompleta && resultado.obras.length > 0) {
           // Contagem por status com a lista COMPLETA em maos. Guardamos todas as
           // obras como opcoes paginaveis: o cidadao pode ver todas (MAIS),

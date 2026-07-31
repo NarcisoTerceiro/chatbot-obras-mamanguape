@@ -469,6 +469,25 @@ export function executarReceita(receita, obras) {
       listaCompleta: true,
     };
   }
+  // "listar" com um CAMPO especifico: mostra o valor desse campo por obra.
+  // Ex.: "nome dos engenheiros de cada obra" -> obra + engenheiro.
+  if (tipo.includes("listar") && ag.campo) {
+    const linhas = [];
+    for (const o of filtradas) {
+      const colNome = acharColuna(o, "nome");
+      const colCampo = acharColuna(o, ag.campo);
+      const nomeObra = (colNome && o[colNome]) || "Obra";
+      const valorCampo = (colCampo && o[colCampo]) || "nao informado";
+      linhas.push(`• *${nomeObra}*: ${valorCampo}`);
+    }
+    return {
+      fatos: `Aqui esta o que voce pediu, para ${filtradas.length} obra(s):`,
+      obras: filtradas,
+      listaCampo: linhas, // linhas ja formatadas (obra: valor do campo)
+      listaCompleta: true,
+    };
+  }
+
   // "listar" (padrao): so devolve as obras filtradas
   return {
     fatos: `Encontrei ${filtradas.length} obra(s) com esse criterio.`,

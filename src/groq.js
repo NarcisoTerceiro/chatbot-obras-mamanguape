@@ -180,6 +180,12 @@ VALOR TOTAL DA OBRA, OBJETO DA OBRA...). Prefira a "receita" quando a pergunta
 combina condicoes (ex.: "obras da Construtora Ativa acima de 500 mil", "qual
 engenheiro tem mais obras concluidas", "media das escolas do centro").
 Quando usar "receita", ainda coloque "tipo":"agregacao".
+Se a pessoa pedir UM CAMPO especifico DE CADA obra (ex.: "nome dos engenheiros
+de cada obra", "o status de todas", "a empresa de cada obra", "os bairros"),
+use tipo "agregacao" com uma receita de listar apontando o campo:
+  {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","receita":{"filtros":[],"agregacao":{"tipo":"listar","campo":"ENGENHEIRO"}}}
+Troque "ENGENHEIRO" pela coluna pedida (STATUS, EMPRESA, BAIRRO, etc.). Se houver
+recorte (ex.: "engenheiros das obras do centro"), adicione o filtro do bairro.
 Se a agregacao for limitada a um RECORTE (ex: "quanto foi investido no Centro",
 "media das escolas", "total gasto em pavimentacao"), coloque o recorte em
 "termos" (ex: ["centro"], ["escola"], ["pavimentacao"]). O sistema filtra por
