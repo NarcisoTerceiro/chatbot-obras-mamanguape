@@ -162,6 +162,24 @@ Quando o tipo for "agregacao", escolha a "operacao":
   "em andamento"). Se a pessoa pedir a contagem geral por situacao, deixe
   "filtro_status" vazio.
 - "contar_total" -> quantas obras existem no total
+
+Alem das operacoes acima, para perguntas de agregacao MAIS COMPLEXAS (com
+filtros combinados, comparacoes por valor, por empresa, por engenheiro, etc.),
+voce PODE montar uma RECEITA generica no campo "receita", assim:
+  "receita": {
+    "filtros": [
+      { "campo": "BAIRRO", "operador": "igual", "valor": "Centro" },
+      { "campo": "VALOR TOTAL DA OBRA", "operador": "maior_que", "valor": 500000 }
+    ],
+    "agregacao": { "tipo": "somar", "campo": "VALOR TOTAL DA OBRA" }
+  }
+Operadores validos: igual, diferente, contem, maior_que, menor_que, entre.
+Tipos de agregacao: contar, somar, media, maior, menor, listar.
+Use nomes de coluna reais da planilha (BAIRRO, STATUS, EMPRESA, ENGENHEIRO,
+VALOR TOTAL DA OBRA, OBJETO DA OBRA...). Prefira a "receita" quando a pergunta
+combina condicoes (ex.: "obras da Construtora Ativa acima de 500 mil", "qual
+engenheiro tem mais obras concluidas", "media das escolas do centro").
+Quando usar "receita", ainda coloque "tipo":"agregacao".
 Se a agregacao for limitada a um RECORTE (ex: "quanto foi investido no Centro",
 "media das escolas", "total gasto em pavimentacao"), coloque o recorte em
 "termos" (ex: ["centro"], ["escola"], ["pavimentacao"]). O sistema filtra por
@@ -190,7 +208,7 @@ Decida o NIVEL DE DETALHE:
   engenheiro, percentual executado) ou pergunta sobre uma obra so.
 
 Responda SOMENTE com um JSON valido, sem texto antes ou depois:
-{"tipo":"busca"|"saudacao"|"listagem"|"agregacao"|"engenheiro","termos":["termo1"],"detalhe":"resumido"|"completo","operacao":"","filtro_status":"","pista_valor":""}
+{"tipo":"busca"|"saudacao"|"listagem"|"agregacao"|"engenheiro","termos":["termo1"],"detalhe":"resumido"|"completo","operacao":"","filtro_status":"","pista_valor":"","receita":null}
 
 Deixe "operacao", "filtro_status" e "pista_valor" vazios quando nao se aplicarem.
 
@@ -258,6 +276,7 @@ export async function interpretarPergunta(pergunta, historico = []) {
       operacao,
       filtro_status: typeof it.filtro_status === "string" ? it.filtro_status.trim() : "",
       pista_valor: typeof it.pista_valor === "string" ? it.pista_valor.trim() : "",
+      receita: it.receita && typeof it.receita === "object" ? it.receita : null,
       falhou: false,
     };
   } catch {
@@ -269,6 +288,7 @@ export async function interpretarPergunta(pergunta, historico = []) {
       operacao: "",
       filtro_status: "",
       pista_valor: "",
+      receita: null,
       falhou: true,
     };
   }
@@ -438,4 +458,79 @@ export async function redigirResposta(pergunta, obras, detalhe, historico = [], 
     throw new Error("IA de redacao retornou vazio");
   }
   return final;
+}
+
+
+// ============================================================
+//  PLANO B - CODE EXECUTION DO GEMINI (Opcao B do guia)
+//  So e usado quando o DSL generico (Opcao A) nao deu conta.
+//  O Gemini escreve e roda Python no SANDBOX ISOLADO do Google
+//  (nao no nosso servidor), calcula e devolve a resposta pronta.
+//  Requer GEMINI_API_KEY. Enviamos SO as obras ja filtradas por
+//  termos, nunca a planilha inteira, para nao estourar tokens.
+// ============================================================
+
+const GEMINI_KEY_CE = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL_CE = process.env.GEMINI_MODEL || "gemini-flash-latest";
+
+const SYSTEM_PROMPT_CODE_EXEC = `Voce e o assistente de obras publicas da Prefeitura de
+Mamanguape. Voce recebe a pergunta do cidadao e uma lista de obras em JSON.
+Use a ferramenta de execucao de codigo (Python/pandas) para CALCULAR a resposta
+a partir SOMENTE desses dados. Regras:
+- Baseie-se apenas nos dados recebidos. Nunca invente valores.
+- Valores estao em formato brasileiro (ex.: "1.408.500,00" = 1408500.00).
+  Converta corretamente antes de somar/comparar.
+- Se os dados nao permitirem responder, diga que a informacao nao consta.
+- Responda de forma curta, clara e cordial, em portugues do Brasil, pronta para
+  enviar no WhatsApp. Use *asteriscos* para negrito. Nao mostre o codigo.`;
+
+// Retorna o texto final ja redigido, ou lanca erro se nao for possivel.
+export async function calcularComCodeExecution(pergunta, obras) {
+  if (!GEMINI_KEY_CE) throw new Error("Code Execution requer GEMINI_API_KEY");
+
+  // Limita e enxuga os dados enviados (economia de tokens).
+  const dados = prepararObrasParaIA(obras).slice(0, 60);
+
+  const url =
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    `${GEMINI_MODEL_CE}:generateContent?key=${GEMINI_KEY_CE}`;
+
+  const body = {
+    system_instruction: { parts: [{ text: SYSTEM_PROMPT_CODE_EXEC }] },
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text:
+              "Pergunta do cidadao: " + pergunta +
+              "\n\nObras (JSON):\n" + JSON.stringify(dados),
+          },
+        ],
+      },
+    ],
+    tools: [{ code_execution: {} }], // ativa o sandbox do Google
+  };
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const erro = await resp.text();
+    throw new Error(`Gemini code_execution ${resp.status}: ${erro.slice(0, 300)}`);
+  }
+
+  const data = await resp.json();
+  // Junta os pedacos de texto da resposta (ignora blocos de codigo/execucao).
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const texto = parts
+    .map((p) => (typeof p.text === "string" ? p.text : ""))
+    .join("")
+    .trim();
+
+  if (!texto) throw new Error("Code Execution devolveu resposta vazia");
+  return texto;
 }

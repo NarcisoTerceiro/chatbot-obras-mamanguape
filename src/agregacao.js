@@ -325,3 +325,154 @@ export function executarAgregacao(operacao, obras, opcoes = {}) {
       return null;
   }
 }
+
+
+// ============================================================
+//  DSL GENERICO (Opcao A do guia)
+//  A IA descreve uma "receita": { filtros: [...], agregacao: {...} }.
+//  Aqui o SISTEMA executa essa receita sobre qualquer coluna, de forma
+//  determinista. A IA nunca calcula - so descreve o que quer.
+// ============================================================
+
+// Acha o nome REAL da coluna na obra a partir de um nome aproximado que a IA
+// mandou (tolera acento, maiuscula, e nome parcial). Ex.: "bairro" -> "BAIRRO";
+// "valor" -> "VALOR TOTAL DA OBRA".
+function acharColuna(obra, nomeAprox) {
+  const alvo = normalize(nomeAprox);
+  if (!alvo) return null;
+  const chaves = Object.keys(obra).filter((k) => k !== "_aba");
+  // 1) match exato normalizado
+  let c = chaves.find((k) => normalize(k) === alvo);
+  if (c) return c;
+  // 2) a coluna contem o alvo (ou vice-versa)
+  c = chaves.find((k) => {
+    const n = normalize(k);
+    return n.includes(alvo) || alvo.includes(n);
+  });
+  if (c) return c;
+  // 3) apelidos comuns
+  const apelidos = {
+    valor: ["valor total da obra", "valor"],
+    bairro: ["bairro"],
+    status: ["status", "situacao"],
+    empresa: ["empresa"],
+    engenheiro: ["engenheiro", "arquiteto", "responsavel"],
+    nome: ["objeto da obra", "objeto", "rua"],
+  };
+  for (const [ap, nomes] of Object.entries(apelidos)) {
+    if (alvo.includes(ap)) {
+      for (const nm of nomes) {
+        c = chaves.find((k) => normalize(k).includes(nm));
+        if (c) return c;
+      }
+    }
+  }
+  return null;
+}
+
+// Aplica UM filtro a uma obra. Retorna true se a obra passa.
+function passaFiltro(obra, filtro) {
+  const col = acharColuna(obra, filtro.campo);
+  if (!col) return true; // campo inexistente -> filtro ignorado (nao quebra)
+  const bruto = (obra[col] || "").toString();
+  const op = normalize(filtro.operador || "igual");
+
+  // Comparacoes numericas
+  const nums = ["maior_que", "menor_que", "entre", "maior que", "menor que"];
+  if (nums.some((x) => op.includes(x.replace(" ", "_")) || op.includes(x))) {
+    const nObra = parseNumero(bruto);
+    if (nObra == null) return false;
+    if (op.includes("maior")) return nObra > parseNumero(filtro.valor);
+    if (op.includes("menor")) return nObra < parseNumero(filtro.valor);
+    if (op.includes("entre") && Array.isArray(filtro.valor)) {
+      return nObra >= parseNumero(filtro.valor[0]) && nObra <= parseNumero(filtro.valor[1]);
+    }
+    return false;
+  }
+
+  // Comparacoes de texto
+  const vObra = normalize(bruto);
+  const vAlvo = normalize(Array.isArray(filtro.valor) ? filtro.valor[0] : filtro.valor);
+  if (op.includes("diferente")) return vObra !== vAlvo && !vObra.includes(vAlvo);
+  if (op.includes("contem")) return vObra.includes(vAlvo);
+  // "igual" (padrao): tolera conter, para bairro/status escritos com variacao
+  return vObra === vAlvo || vObra.includes(vAlvo) || vAlvo.includes(vObra);
+}
+
+// Executa uma RECEITA { filtros, agregacao } sobre a lista de obras.
+// Retorna { fatos, obras, listaCompleta } ou null se nao der para calcular.
+export function executarReceita(receita, obras) {
+  if (!receita || !Array.isArray(obras) || obras.length === 0) return null;
+
+  // 1) aplica todos os filtros
+  const filtros = Array.isArray(receita.filtros) ? receita.filtros : [];
+  let filtradas = obras.filter((o) => filtros.every((f) => passaFiltro(o, f)));
+
+  const ag = receita.agregacao || { tipo: "listar" };
+  const tipo = normalize(ag.tipo || "listar");
+  const campo = ag.campo || "VALOR TOTAL DA OBRA";
+
+  // helper: valores numericos de um campo
+  const valoresNum = () => {
+    const out = [];
+    for (const o of filtradas) {
+      const col = acharColuna(o, campo);
+      const n = col ? parseNumero(o[col]) : null;
+      if (n != null) out.push({ obra: o, valor: n });
+    }
+    return out;
+  };
+
+  // 2) aplica a agregacao pedida
+  if (tipo.includes("contar")) {
+    return {
+      fatos: `Encontrei ${filtradas.length} obra(s) com esse criterio.`,
+      obras: filtradas,
+      listaCompleta: true,
+    };
+  }
+  if (tipo.includes("somar") || tipo.includes("soma")) {
+    const lista = valoresNum();
+    if (lista.length === 0) return null;
+    const total = lista.reduce((a, x) => a + x.valor, 0);
+    return {
+      fatos: `A soma e ${formatarMoeda(total)}, considerando ${lista.length} obra(s) com valor informado.`,
+      obras: lista.sort((a, b) => b.valor - a.valor).map((x) => x.obra),
+      listaCompleta: true,
+    };
+  }
+  if (tipo.includes("media")) {
+    const lista = valoresNum();
+    if (lista.length === 0) return null;
+    const total = lista.reduce((a, x) => a + x.valor, 0);
+    return {
+      fatos: `A media e ${formatarMoeda(total / lista.length)}, sobre ${lista.length} obra(s) com valor informado.`,
+      obras: lista.sort((a, b) => b.valor - a.valor).map((x) => x.obra),
+      listaCompleta: true,
+    };
+  }
+  if (tipo.includes("maior")) {
+    const lista = valoresNum().sort((a, b) => b.valor - a.valor);
+    if (lista.length === 0) return null;
+    return {
+      fatos: `A de maior valor e "${lista[0].obra[acharColuna(lista[0].obra, "nome")] || "obra"}", com ${formatarMoeda(lista[0].valor)}.`,
+      obras: lista.map((x) => x.obra),
+      listaCompleta: true,
+    };
+  }
+  if (tipo.includes("menor")) {
+    const lista = valoresNum().sort((a, b) => a.valor - b.valor);
+    if (lista.length === 0) return null;
+    return {
+      fatos: `A de menor valor e "${lista[0].obra[acharColuna(lista[0].obra, "nome")] || "obra"}", com ${formatarMoeda(lista[0].valor)}.`,
+      obras: lista.map((x) => x.obra),
+      listaCompleta: true,
+    };
+  }
+  // "listar" (padrao): so devolve as obras filtradas
+  return {
+    fatos: `Encontrei ${filtradas.length} obra(s) com esse criterio.`,
+    obras: filtradas,
+    listaCompleta: true,
+  };
+}

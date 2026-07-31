@@ -21,8 +21,8 @@ import express from "express";
 
 import { getObras, getDiagnostico } from "./sheets.js";
 import { buscarObrasPorTermos, buscarObras, buscarPorEngenheiro } from "./search.js";
-import { interpretarPergunta, redigirResposta } from "./groq.js";
-import { executarAgregacao } from "./agregacao.js";
+import { interpretarPergunta, redigirResposta, calcularComCodeExecution } from "./groq.js";
+import { executarAgregacao, executarReceita } from "./agregacao.js";
 import { enviarTexto } from "./whatsapp.js";
 
 const app = express();
@@ -707,10 +707,28 @@ async function processarWebhook(payload) {
           if (filtradas.length > 0) base = filtradas;
         }
 
-        const resultado = executarAgregacao(interpretacao.operacao, base, {
-          filtro_status: interpretacao.filtro_status,
-          pista_valor: interpretacao.pista_valor || "",
-        });
+        // Se a IA montou uma RECEITA (DSL generico), o sistema a executa sobre a
+        // planilha inteira (a receita ja carrega seus proprios filtros). Senao,
+        // usa as operacoes fixas de sempre.
+        let resultado;
+        if (interpretacao.receita) {
+          resultado = executarReceita(interpretacao.receita, obras);
+          console.log(
+            `DEBUG receita DSL: ${resultado ? resultado.obras.length + " obra(s)" : "nao calculado"}`
+          );
+          // Se a receita nao deu certo, tenta as operacoes fixas como reserva.
+          if (!resultado && interpretacao.operacao) {
+            resultado = executarAgregacao(interpretacao.operacao, base, {
+              filtro_status: interpretacao.filtro_status,
+              pista_valor: interpretacao.pista_valor || "",
+            });
+          }
+        } else {
+          resultado = executarAgregacao(interpretacao.operacao, base, {
+            filtro_status: interpretacao.filtro_status,
+            pista_valor: interpretacao.pista_valor || "",
+          });
+        }
 
         console.log(
           `DEBUG agregacao: operacao=${interpretacao.operacao} base=${base.length} ` +
@@ -718,12 +736,28 @@ async function processarWebhook(payload) {
         );
 
         if (!resultado) {
-          logPerguntaSemResultado(pergunta, interpretacao.termos, "agregacao_sem_dados");
-          texto =
-            "Não consegui fazer esse cálculo porque a base não tem esse dado preenchido " +
-            "para as obras. Posso te informar a situação, o valor ou o prazo de uma obra " +
-            "específica — é só dizer o bairro ou o nome.";
-          falhasParaGuardar = memoria.falhas + 1;
+          // PLANO B: o DSL nao deu conta. Tenta o Code Execution do Gemini
+          // (calculo no sandbox isolado do Google) sobre as obras filtradas.
+          let respostaCE = null;
+          try {
+            respostaCE = await calcularComCodeExecution(pergunta, base);
+            console.log("DEBUG code_execution: resposta obtida");
+          } catch (e) {
+            console.error("Code Execution (plano B) falhou:", e.message);
+          }
+
+          if (respostaCE) {
+            texto = respostaCE;
+            obrasParaGuardar = base.slice(0, 10);
+            falhasParaGuardar = 0;
+          } else {
+            logPerguntaSemResultado(pergunta, interpretacao.termos, "agregacao_sem_dados");
+            texto =
+              "Não consegui fazer esse cálculo porque a base não tem esse dado preenchido " +
+              "para as obras. Posso te informar a situação, o valor ou o prazo de uma obra " +
+              "específica — é só dizer o bairro ou o nome.";
+            falhasParaGuardar = memoria.falhas + 1;
+          }
         } else if (resultado.listaCompleta && resultado.obras.length > 0) {
           // Contagem por status com a lista COMPLETA em maos. Guardamos todas as
           // obras como opcoes paginaveis: o cidadao pode ver todas (MAIS),
