@@ -20,34 +20,60 @@ export function sandboxDisponivel() {
 }
 
 // Envia o codigo + as obras ao sandbox e devolve o resultado calculado.
-// Lanca erro se o sandbox recusar, falhar, ou nao estiver configurado.
+// Se o servico estiver "dormindo" (comum no plano gratuito do Render), a
+// primeira chamada pode dar 502/503 enquanto ele acorda - entao tentamos
+// algumas vezes, esperando um pouco entre as tentativas.
 export async function executarNoSandbox(codigo, obras) {
   if (!SANDBOX_URL) throw new Error("SANDBOX_URL nao configurada");
 
-  // Timeout de rede: nao deixa o bot travar esperando o sandbox.
-  const controle = new AbortController();
-  const t = setTimeout(() => controle.abort(), 12000);
+  const url = `${SANDBOX_URL.replace(/\/$/, "")}/run`;
+  const MAX_TENTATIVAS = 3;
+  let ultimoErro = null;
 
-  try {
-    const resp = await fetch(`${SANDBOX_URL.replace(/\/$/, "")}/run`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(SANDBOX_TOKEN ? { "X-Sandbox-Token": SANDBOX_TOKEN } : {}),
-      },
-      body: JSON.stringify({ codigo, obras }),
-      signal: controle.signal,
-    });
+  for (let tentativa = 1; tentativa <= MAX_TENTATIVAS; tentativa++) {
+    // Timeout maior na 1a tentativa: pode estar acordando o servico.
+    const limite = tentativa === 1 ? 45000 : 20000;
+    const controle = new AbortController();
+    const t = setTimeout(() => controle.abort(), limite);
 
-    if (!resp.ok) {
-      const txt = await resp.text();
-      throw new Error(`sandbox HTTP ${resp.status}: ${txt.slice(0, 200)}`);
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(SANDBOX_TOKEN ? { "X-Sandbox-Token": SANDBOX_TOKEN } : {}),
+        },
+        body: JSON.stringify({ codigo, obras }),
+        signal: controle.signal,
+      });
+
+      // 502/503 = servico ainda acordando: espera e tenta de novo.
+      if (resp.status === 502 || resp.status === 503) {
+        ultimoErro = new Error(`sandbox acordando (HTTP ${resp.status})`);
+        console.log(`DEBUG sandbox dormindo, tentativa ${tentativa}/${MAX_TENTATIVAS}...`);
+        await new Promise((r) => setTimeout(r, 4000));
+        continue;
+      }
+
+      if (!resp.ok) {
+        const txt = await resp.text();
+        throw new Error(`sandbox HTTP ${resp.status}: ${txt.slice(0, 150)}`);
+      }
+
+      const data = await resp.json();
+      if (!data.ok) throw new Error(`sandbox recusou: ${data.erro}`);
+      return data.resultado;
+    } catch (e) {
+      ultimoErro = e;
+      // Se foi timeout/abort na 1a tentativa, tenta de novo (estava acordando).
+      if (tentativa < MAX_TENTATIVAS) {
+        await new Promise((r) => setTimeout(r, 3000));
+        continue;
+      }
+    } finally {
+      clearTimeout(t);
     }
-
-    const data = await resp.json();
-    if (!data.ok) throw new Error(`sandbox recusou: ${data.erro}`);
-    return data.resultado;
-  } finally {
-    clearTimeout(t);
   }
+
+  throw ultimoErro || new Error("sandbox nao respondeu");
 }
