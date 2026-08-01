@@ -88,6 +88,9 @@ async function chamarIA(body) {
       const data = await resp.json();
       const texto = data.choices?.[0]?.message?.content?.trim() || "";
       if (!texto) throw new Error(`${prov.nome} devolveu resposta vazia`);
+      // Log explicito: mostra QUAL IA respondeu de fato (util para conferir no
+      // log do Render se o Gemini esta atuando como principal).
+      console.log(`DEBUG IA usada: ${prov.nome} (modelo ${prov.model})`);
       return texto;
     } catch (e) {
       console.error(`IA (${prov.nome}) falhou:`, e.message);
@@ -186,6 +189,16 @@ use tipo "agregacao" com uma receita de listar apontando o campo:
   {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","receita":{"filtros":[],"agregacao":{"tipo":"listar","campo":"ENGENHEIRO"}}}
 Troque "ENGENHEIRO" pela coluna pedida (STATUS, EMPRESA, BAIRRO, etc.). Se houver
 recorte (ex.: "engenheiros das obras do centro"), adicione o filtro do bairro.
+
+MUITO IMPORTANTE - nao confunda os dois casos:
+(a) "campo X de CADA obra" (sem condicao) -> use listar com campo. Ex.: "os
+    engenheiros de cada obra", "o status de todas".
+(b) pergunta com CONDICOES/FILTROS (empresa, valor, status, bairro) -> use
+    filtros e a agregacao adequada (contar/somar/listar), NUNCA listar-campo com
+    o nome da obra. Ex.: "obras da Construtora Ativa acima de 500 mil" ->
+    {"tipo":"agregacao","termos":[],...,"receita":{"filtros":[{"campo":"EMPRESA","operador":"contem","valor":"Ativa"},{"campo":"VALOR TOTAL DA OBRA","operador":"maior_que","valor":500000}],"agregacao":{"tipo":"listar"}}}
+    (sem "campo" na agregacao: assim ele lista as obras que passam no filtro).
+Nunca use "campo":"OBJETO DA OBRA" numa agregacao listar - isso repete o nome.
 Se a agregacao for limitada a um RECORTE (ex: "quanto foi investido no Centro",
 "media das escolas", "total gasto em pavimentacao"), coloque o recorte em
 "termos" (ex: ["centro"], ["escola"], ["pavimentacao"]). O sistema filtra por

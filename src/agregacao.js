@@ -472,18 +472,29 @@ export function executarReceita(receita, obras) {
   // "listar" com um CAMPO especifico: mostra o valor desse campo por obra.
   // Ex.: "nome dos engenheiros de cada obra" -> obra + engenheiro.
   if (tipo.includes("listar") && ag.campo) {
+    const colCampoRef = filtradas.length ? acharColuna(filtradas[0], ag.campo) : null;
+    const colNomeRef = filtradas.length ? acharColuna(filtradas[0], "nome") : null;
+
+    // Se o campo pedido E o proprio nome da obra, nao faz sentido "obra: nome"
+    // (ficaria repetido). Nesse caso, so lista os nomes das obras.
+    const campoEhNome = colCampoRef && colCampoRef === colNomeRef;
+
     const linhas = [];
     for (const o of filtradas) {
       const colNome = acharColuna(o, "nome");
       const colCampo = acharColuna(o, ag.campo);
       const nomeObra = (colNome && o[colNome]) || "Obra";
-      const valorCampo = (colCampo && o[colCampo]) || "nao informado";
-      linhas.push(`• *${nomeObra}*: ${valorCampo}`);
+      if (campoEhNome) {
+        linhas.push(`• ${nomeObra}`);
+      } else {
+        const valorCampo = (colCampo && o[colCampo]) || "não informado";
+        linhas.push(`• *${nomeObra}*: ${valorCampo}`);
+      }
     }
     return {
-      fatos: `Aqui esta o que voce pediu, para ${filtradas.length} obra(s):`,
+      fatos: `Encontrei ${filtradas.length} obra(s):`,
       obras: filtradas,
-      listaCampo: linhas, // linhas ja formatadas (obra: valor do campo)
+      listaCampo: linhas,
       listaCompleta: true,
     };
   }
