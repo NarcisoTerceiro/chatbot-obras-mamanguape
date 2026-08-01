@@ -332,6 +332,19 @@ function detectarEscolha(pergunta, obrasContexto) {
 }
 
 // Detecta o comando de SAIR da obra em foco: "x", "sair", "voltar", "menu".
+// Verifica se a receita (DSL) tem conteudo util: pelo menos um filtro ou uma
+// agregacao que nao seja apenas "listar" sem campo (que e a listagem geral).
+function temReceitaUtil(receita) {
+  if (!receita || typeof receita !== "object") return false;
+  const temFiltro = Array.isArray(receita.filtros) && receita.filtros.length > 0;
+  const ag = receita.agregacao || {};
+  const tipoAg = (ag.tipo || "").toLowerCase();
+  const agUtil =
+    (tipoAg && tipoAg !== "listar") || // somar, media, contar, maior, menor
+    (tipoAg === "listar" && ag.campo); // listar um campo especifico
+  return temFiltro || agUtil;
+}
+
 function ehSaidaFoco(msg) {
   return /^\s*(x|sair|voltar|menu|inicio|in[ií]cio|outra|outras|outra obra)\s*[.!]*\s*$/i.test(
     msg || ""
@@ -657,6 +670,64 @@ async function processarWebhook(payload) {
         // ("oi", "bom dia"): cada um recebe um fecho adequado.
         texto = ehDespedida(pergunta) ? despedidaAleatoria() : saudacaoAleatoria();
         falhasParaGuardar = 0;
+      }
+
+      // ------------------------------------------------------
+      //  RECEITA (DSL): se a IA montou uma receita valida, o sistema a executa
+      //  AQUI, independente do "tipo" que ela classificou. Isso conserta o caso
+      //  em que a IA gera a receita certa mas rotula o tipo como "busca".
+      // ------------------------------------------------------
+      else if (interpretacao.receita && temReceitaUtil(interpretacao.receita)) {
+        console.log("DEBUG executando receita DSL (independente do tipo)");
+        let resultado = executarReceita(interpretacao.receita, obras);
+
+        if (!resultado) {
+          // Receita nao deu resultado -> tenta Code Execution (plano B).
+          let respostaCE = null;
+          try {
+            respostaCE = await calcularComCodeExecution(pergunta, obras);
+          } catch (e) {
+            console.error("Code Execution (plano B) falhou:", e.message);
+          }
+          if (respostaCE) {
+            texto = respostaCE;
+            falhasParaGuardar = 0;
+          } else {
+            texto =
+              "Não consegui montar esse cálculo com os dados da base. Pode tentar " +
+              "reformular, ou perguntar por bairro, status, empresa ou tipo de obra.";
+            falhasParaGuardar = memoria.falhas + 1;
+          }
+        } else if (resultado.listaCampo && resultado.listaCampo.length > 0) {
+          const BLOCO = 20;
+          const primeiras = resultado.listaCampo.slice(0, BLOCO);
+          const resto = resultado.listaCampo.length - primeiras.length;
+          texto = `${resultado.fatos}\n\n` + primeiras.join("\n");
+          if (resto > 0) {
+            texto += `\n\n...e mais ${resto}. Refine por bairro, status ou tipo para ver menos de cada vez.`;
+          }
+          obrasParaGuardar = resultado.obras.slice(0, 10);
+          falhasParaGuardar = 0;
+        } else if (resultado.obras && resultado.obras.length > 1) {
+          // Resultado com varias obras: mostra o fato + lista paginavel.
+          obrasParaGuardar = resultado.obras;
+          tipoParaGuardar = "aguardando_escolha";
+          falhasParaGuardar = 0;
+          const pagina = montarPerguntaDeEscolha(resultado.obras, 0);
+          mostradasParaGuardar = pagina.mostradas;
+          texto = `${resultado.fatos}\n\n${pagina.texto}`;
+        } else {
+          // Resultado com fato (soma/media/etc.) e poucas ou nenhuma obra: a IA redige.
+          obrasParaGuardar = resultado.obras || [];
+          falhasParaGuardar = 0;
+          try {
+            texto = await redigirResposta(
+              pergunta, resultado.obras || [], "resumido", historico, resultado.fatos
+            );
+          } catch (e) {
+            texto = resultado.fatos;
+          }
+        }
       }
 
       // ------------------------------------------------------
