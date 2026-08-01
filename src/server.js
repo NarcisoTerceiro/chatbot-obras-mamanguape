@@ -722,49 +722,56 @@ async function processarWebhook(payload) {
       //  em que a IA gera a receita certa mas rotula o tipo como "busca".
       // ------------------------------------------------------
       else if (interpretacao.receita && temReceitaUtil(interpretacao.receita)) {
-        console.log("DEBUG executando receita DSL (independente do tipo)");
-        let resultado = executarReceita(interpretacao.receita, obras);
+        console.log("DEBUG calculo: tentando sandbox primeiro");
 
-        if (!resultado) {
-          // Receita nao deu resultado -> calculo avancado (sandbox + Gemini).
-          const avancado = await tentarCalculoAvancado(pergunta, obras);
-          if (avancado) {
-            texto = avancado;
-            falhasParaGuardar = 0;
-          } else {
+        // NOVA ORDEM: primeiro o calculo avancado (sandbox proprio -> Gemini),
+        // que resolve qualquer pergunta (inclusive "segunda maior", "top 3").
+        // Se o sandbox nao estiver disponivel ou falhar, cai no DSL como reserva.
+        let texto_avancado = null;
+        if (sandboxDisponivel()) {
+          texto_avancado = await tentarCalculoAvancado(pergunta, obras);
+        }
+
+        if (texto_avancado) {
+          texto = texto_avancado;
+          falhasParaGuardar = 0;
+        } else {
+          // Reserva: o DSL deterministico (rapido, sem gastar IA).
+          console.log("DEBUG calculo: sandbox nao resolveu, usando DSL");
+          let resultado = executarReceita(interpretacao.receita, obras);
+
+          if (!resultado) {
             texto =
               "Não consegui montar esse cálculo com os dados da base. Pode tentar " +
               "reformular, ou perguntar por bairro, status, empresa ou tipo de obra.";
             falhasParaGuardar = memoria.falhas + 1;
-          }
-        } else if (resultado.listaCampo && resultado.listaCampo.length > 0) {
-          const BLOCO = 20;
-          const primeiras = resultado.listaCampo.slice(0, BLOCO);
-          const resto = resultado.listaCampo.length - primeiras.length;
-          texto = `${resultado.fatos}\n\n` + primeiras.join("\n");
-          if (resto > 0) {
-            texto += `\n\n...e mais ${resto}. Refine por bairro, status ou tipo para ver menos de cada vez.`;
-          }
-          obrasParaGuardar = resultado.obras.slice(0, 10);
-          falhasParaGuardar = 0;
-        } else if (resultado.obras && resultado.obras.length > 1) {
-          // Resultado com varias obras: mostra o fato + lista paginavel.
-          obrasParaGuardar = resultado.obras;
-          tipoParaGuardar = "aguardando_escolha";
-          falhasParaGuardar = 0;
-          const pagina = montarPerguntaDeEscolha(resultado.obras, 0);
-          mostradasParaGuardar = pagina.mostradas;
-          texto = `${resultado.fatos}\n\n${pagina.texto}`;
-        } else {
-          // Resultado com fato (soma/media/etc.) e poucas ou nenhuma obra: a IA redige.
-          obrasParaGuardar = resultado.obras || [];
-          falhasParaGuardar = 0;
-          try {
-            texto = await redigirResposta(
-              pergunta, resultado.obras || [], "resumido", historico, resultado.fatos
-            );
-          } catch (e) {
-            texto = resultado.fatos;
+          } else if (resultado.listaCampo && resultado.listaCampo.length > 0) {
+            const BLOCO = 20;
+            const primeiras = resultado.listaCampo.slice(0, BLOCO);
+            const resto = resultado.listaCampo.length - primeiras.length;
+            texto = `${resultado.fatos}\n\n` + primeiras.join("\n");
+            if (resto > 0) {
+              texto += `\n\n...e mais ${resto}. Refine por bairro, status ou tipo para ver menos de cada vez.`;
+            }
+            obrasParaGuardar = resultado.obras.slice(0, 10);
+            falhasParaGuardar = 0;
+          } else if (resultado.obras && resultado.obras.length > 1) {
+            obrasParaGuardar = resultado.obras;
+            tipoParaGuardar = "aguardando_escolha";
+            falhasParaGuardar = 0;
+            const pagina = montarPerguntaDeEscolha(resultado.obras, 0);
+            mostradasParaGuardar = pagina.mostradas;
+            texto = `${resultado.fatos}\n\n${pagina.texto}`;
+          } else {
+            obrasParaGuardar = resultado.obras || [];
+            falhasParaGuardar = 0;
+            try {
+              texto = await redigirResposta(
+                pergunta, resultado.obras || [], "resumido", historico, resultado.fatos
+              );
+            } catch (e) {
+              texto = resultado.fatos;
+            }
           }
         }
       }
