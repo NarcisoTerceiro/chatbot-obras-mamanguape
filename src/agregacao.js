@@ -373,8 +373,12 @@ function acharColuna(obra, nomeAprox) {
 // Aplica UM filtro a uma obra. Retorna true se a obra passa.
 function passaFiltro(obra, filtro) {
   const col = acharColuna(obra, filtro.campo);
-  if (!col) return true; // campo inexistente -> filtro ignorado (nao quebra)
+  // Se a obra NAO tem essa coluna, ela nao pode satisfazer o filtro: nao passa.
+  // (Ex.: filtrar por EMPRESA - obras de abas sem coluna de empresa ficam fora.)
+  if (!col) return false;
   const bruto = (obra[col] || "").toString();
+  // Celula vazia tambem nao satisfaz um filtro sobre aquele campo.
+  if (!bruto.trim()) return false;
   const op = normalize(filtro.operador || "igual");
 
   // Comparacoes numericas
