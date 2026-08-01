@@ -553,3 +553,51 @@ export async function calcularComCodeExecution(pergunta, obras) {
   if (!texto) throw new Error("Code Execution devolveu resposta vazia");
   return texto;
 }
+
+
+// ============================================================
+//  GERACAO DE CODIGO PARA O SANDBOX PROPRIO
+//  A IA escreve um trecho de Python/pandas que responde a pergunta,
+//  terminando na variavel `resultado`. Quem EXECUTA e o microsservico
+//  sandbox (isolado) - aqui so pedimos o codigo a IA.
+// ============================================================
+
+const SYSTEM_PROMPT_GERAR_CODIGO = `Voce escreve um trecho curto de codigo Python (pandas)
+para responder a pergunta do cidadao sobre uma tabela de obras publicas.
+
+CONTEXTO DE EXECUCAO:
+- Existe um DataFrame chamado df, ja carregado com as obras (uma linha por obra).
+- As colunas sao exatamente as chaves dos objetos recebidos.
+- Valores monetarios estao em texto no formato brasileiro (ex.: "1.408.500,00").
+  Para calcular, converta: df["X"].str.replace(".","",regex=False)
+  .str.replace(",",".",regex=False).astype(float).
+- pandas ja esta importado como pd. NAO escreva 'import'.
+
+REGRAS OBRIGATORIAS:
+- Seu codigo DEVE terminar definindo a variavel resultado (o valor final).
+- NAO use import, open, exec, eval, os, sys, requests, arquivos ou rede.
+- Baseie-se SO nas colunas que existem. Se a pergunta nao puder ser respondida
+  com os dados, faca resultado = "NAO_TEM_DADO".
+- Responda APENAS com o codigo Python. Sem explicacao, sem crases, sem texto.`;
+
+// Pede a IA o codigo Python. Retorna a string de codigo (sem crases).
+export async function gerarCodigoPython(pergunta, colunas) {
+  const carga = {
+    pergunta,
+    colunas_disponiveis: colunas,
+  };
+  const codigo = await chamarIA({
+    temperature: 0,
+    max_tokens: 800,
+    reasoning_effort: "low",
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT_GERAR_CODIGO },
+      { role: "user", content: JSON.stringify(carga) },
+    ],
+  });
+  // Remove crases/blocos markdown que a IA as vezes coloca.
+  return codigo
+    .replace(/```python/gi, "")
+    .replace(/```/g, "")
+    .trim();
+}

@@ -21,8 +21,9 @@ import express from "express";
 
 import { getObras, getDiagnostico } from "./sheets.js";
 import { buscarObrasPorTermos, buscarObras, buscarPorEngenheiro } from "./search.js";
-import { interpretarPergunta, redigirResposta, calcularComCodeExecution } from "./groq.js";
+import { interpretarPergunta, redigirResposta, calcularComCodeExecution, gerarCodigoPython } from "./groq.js";
 import { executarAgregacao, executarReceita } from "./agregacao.js";
+import { sandboxDisponivel, executarNoSandbox } from "./sandboxClient.js";
 import { enviarTexto } from "./whatsapp.js";
 
 const app = express();
@@ -343,6 +344,49 @@ function temReceitaUtil(receita) {
     (tipoAg && tipoAg !== "listar") || // somar, media, contar, maior, menor
     (tipoAg === "listar" && ag.campo); // listar um campo especifico
   return temFiltro || agUtil;
+}
+
+// Calculo AVANCADO para perguntas que o DSL nao cobriu. Tenta, em ordem:
+//  1) o SANDBOX PROPRIO (IA gera codigo Python -> executa isolado no sandbox);
+//  2) o Code Execution do Gemini (sandbox do Google) como reserva.
+// Retorna um texto pronto, ou null se nada funcionou.
+async function tentarCalculoAvancado(pergunta, obras) {
+  // 1) Sandbox proprio, se estiver configurado (SANDBOX_URL).
+  if (sandboxDisponivel() && obras.length > 0) {
+    try {
+      const colunas = Object.keys(obras[0]).filter((k) => k !== "_aba");
+      const codigo = await gerarCodigoPython(pergunta, colunas);
+      const resultado = await executarNoSandbox(codigo, obras);
+
+      if (resultado != null && resultado !== "NAO_TEM_DADO") {
+        console.log("DEBUG sandbox proprio: resultado obtido");
+        // A IA redige o resultado calculado em portugues natural.
+        const fatos =
+          "Resultado ja calculado pelo sistema: " + JSON.stringify(resultado);
+        try {
+          return await redigirResposta(pergunta, [], "resumido", [], fatos);
+        } catch {
+          return `Resultado: ${JSON.stringify(resultado)}`;
+        }
+      }
+      console.log("DEBUG sandbox proprio: sem dado para a pergunta");
+    } catch (e) {
+      console.error("Sandbox proprio falhou:", e.message);
+    }
+  }
+
+  // 2) Code Execution do Gemini (reserva).
+  try {
+    const resp = await calcularComCodeExecution(pergunta, obras);
+    if (resp) {
+      console.log("DEBUG code_execution (Gemini): resultado obtido");
+      return resp;
+    }
+  } catch (e) {
+    console.error("Code Execution (Gemini) falhou:", e.message);
+  }
+
+  return null;
 }
 
 function ehSaidaFoco(msg) {
@@ -682,15 +726,10 @@ async function processarWebhook(payload) {
         let resultado = executarReceita(interpretacao.receita, obras);
 
         if (!resultado) {
-          // Receita nao deu resultado -> tenta Code Execution (plano B).
-          let respostaCE = null;
-          try {
-            respostaCE = await calcularComCodeExecution(pergunta, obras);
-          } catch (e) {
-            console.error("Code Execution (plano B) falhou:", e.message);
-          }
-          if (respostaCE) {
-            texto = respostaCE;
+          // Receita nao deu resultado -> calculo avancado (sandbox + Gemini).
+          const avancado = await tentarCalculoAvancado(pergunta, obras);
+          if (avancado) {
+            texto = avancado;
             falhasParaGuardar = 0;
           } else {
             texto =
@@ -807,18 +846,12 @@ async function processarWebhook(payload) {
         );
 
         if (!resultado) {
-          // PLANO B: o DSL nao deu conta. Tenta o Code Execution do Gemini
-          // (calculo no sandbox isolado do Google) sobre as obras filtradas.
-          let respostaCE = null;
-          try {
-            respostaCE = await calcularComCodeExecution(pergunta, base);
-            console.log("DEBUG code_execution: resposta obtida");
-          } catch (e) {
-            console.error("Code Execution (plano B) falhou:", e.message);
-          }
+          // PLANO B: o DSL nao deu conta. Tenta o calculo avancado
+          // (sandbox proprio -> Code Execution do Gemini) sobre as obras da base.
+          const avancado = await tentarCalculoAvancado(pergunta, base);
 
-          if (respostaCE) {
-            texto = respostaCE;
+          if (avancado) {
+            texto = avancado;
             obrasParaGuardar = base.slice(0, 10);
             falhasParaGuardar = 0;
           } else {
