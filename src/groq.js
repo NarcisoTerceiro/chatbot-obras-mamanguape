@@ -123,6 +123,14 @@ de uma prefeitura, enviadas por WhatsApp de forma informal, formal, com girias,
 abreviacoes ou erros de digitacao.
 
 PRINCIPIOS (siga sempre):
+0. ACOMPANHAMENTO: a pessoa pode se referir ao RESULTADO ANTERIOR com palavras
+   como "essas", "dessas", "delas", "as de cima", "as que voce listou". Nesse
+   caso, monte a operacao para ser aplicada sobre essas mesmas obras. Ex.: apos
+   listar obras em licitacao, "liste com o nome do engenheiro" ->
+   {"tipo":"agregacao","termos":[],"receita":{"filtros":[],"agregacao":{"tipo":"listar","campo":"ENGENHEIRO"}}}
+   (o sistema ja aplica nas obras do contexto). "e o valor de cada uma?" ->
+   listar com campo do valor. "quantas dessas estao paradas?" -> contar com
+   filtro de status.
 1. Foque no que a pessoa REALMENTE quer, nao nas palavras exatas. "ta pronta a
    creche?", "a creche ja acabou?" e "situacao da creche" pedem a mesma coisa.
 2. Entenda a mesma pergunta escrita de varios jeitos (formal, informal, com erro).
@@ -177,7 +185,16 @@ voce PODE montar uma RECEITA generica no campo "receita", assim:
     "agregacao": { "tipo": "somar", "campo": "VALOR TOTAL DA OBRA" }
   }
 Operadores validos: igual, diferente, contem, maior_que, menor_que, entre.
-Tipos de agregacao: contar, somar, media, maior, menor, listar.
+Tipos de agregacao: contar, somar, media, maior, menor, listar, top, ordinal,
+contar_por.
+- "top": as N obras de maior valor. Use "n": 3 (ou o numero pedido). Para as
+  menores, use tipo "menores". Ex.: "top 3 obras mais caras" ->
+  {"agregacao":{"tipo":"top","n":3,"campo":"VALOR TOTAL DA OBRA"}}
+- "ordinal": a N-esima obra por valor. Use "posicao": 2 para "segunda", 3 para
+  "terceira". Para menor, use tipo "ordinal_menor". Ex.: "segunda obra mais
+  cara" -> {"agregacao":{"tipo":"ordinal","posicao":2,"campo":"VALOR TOTAL DA OBRA"}}
+- "contar_por": quantas obras em cada grupo. Ex.: "quantas obras por bairro" ->
+  {"agregacao":{"tipo":"contar_por","campo":"BAIRRO"}}
 Use nomes de coluna reais da planilha (BAIRRO, STATUS, EMPRESA, ENGENHEIRO,
 VALOR TOTAL DA OBRA, OBJETO DA OBRA...). Prefira a "receita" quando a pergunta
 combina condicoes (ex.: "obras da Construtora Ativa acima de 500 mil", "qual

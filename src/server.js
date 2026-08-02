@@ -351,7 +351,22 @@ function temReceitaUtil(receita) {
 //  2) o Code Execution do Gemini (sandbox do Google) como reserva.
 // Retorna um texto pronto, ou null se nada funcionou.
 async function tentarCalculoAvancado(pergunta, obras) {
-  // 1) Sandbox proprio, se estiver configurado (SANDBOX_URL).
+  // ORDEM: o DSL ja foi tentado antes de chamar esta funcao. Aqui:
+  //   1) Code Execution do Gemini (sandbox do Google, sem manutencao);
+  //   2) Sandbox proprio (Render) como ULTIMO recurso.
+
+  // 1) Code Execution do Gemini.
+  try {
+    const resp = await calcularComCodeExecution(pergunta, obras);
+    if (resp) {
+      console.log("DEBUG code_execution (Gemini): resultado obtido");
+      return resp;
+    }
+  } catch (e) {
+    console.error("Code Execution (Gemini) falhou:", e.message);
+  }
+
+  // 2) Sandbox proprio (ultimo recurso), se estiver configurado.
   if (sandboxDisponivel() && obras.length > 0) {
     try {
       const colunas = Object.keys(obras[0]).filter((k) => k !== "_aba");
@@ -360,7 +375,6 @@ async function tentarCalculoAvancado(pergunta, obras) {
 
       if (resultado != null && resultado !== "NAO_TEM_DADO") {
         console.log("DEBUG sandbox proprio: resultado obtido");
-        // A IA redige o resultado calculado em portugues natural.
         const fatos =
           "Resultado ja calculado pelo sistema: " + JSON.stringify(resultado);
         try {
@@ -373,17 +387,6 @@ async function tentarCalculoAvancado(pergunta, obras) {
     } catch (e) {
       console.error("Sandbox proprio falhou:", e.message);
     }
-  }
-
-  // 2) Code Execution do Gemini (reserva).
-  try {
-    const resp = await calcularComCodeExecution(pergunta, obras);
-    if (resp) {
-      console.log("DEBUG code_execution (Gemini): resultado obtido");
-      return resp;
-    }
-  } catch (e) {
-    console.error("Code Execution (Gemini) falhou:", e.message);
   }
 
   return null;
@@ -722,30 +725,40 @@ async function processarWebhook(payload) {
       //  em que a IA gera a receita certa mas rotula o tipo como "busca".
       // ------------------------------------------------------
       else if (interpretacao.receita && temReceitaUtil(interpretacao.receita)) {
-        console.log("DEBUG calculo: tentando sandbox primeiro");
+        console.log("DEBUG executando receita DSL (rapido, exato)");
 
-        // NOVA ORDEM: primeiro o calculo avancado (sandbox proprio -> Gemini),
-        // que resolve qualquer pergunta (inclusive "segunda maior", "top 3").
-        // Se o sandbox nao estiver disponivel ou falhar, cai no DSL como reserva.
-        let texto_avancado = null;
-        if (sandboxDisponivel()) {
-          texto_avancado = await tentarCalculoAvancado(pergunta, obras);
+        // ACOMPANHAMENTO: se a pergunta se refere ao resultado anterior
+        // ("essas", "dessas", "delas", "as de cima") e ha obras no contexto,
+        // aplicamos a receita sobre ESSAS obras, nao sobre a base inteira.
+        const refereAnterior = /\b(essas|dessas|delas|desses|deles|as de cima|as que voce|as listadas|acima)\b/i.test(
+          pergunta || ""
+        );
+        const baseCalc =
+          refereAnterior && obrasContexto.length > 1 ? obrasContexto : obras;
+        if (baseCalc !== obras) {
+          console.log(`DEBUG acompanhamento: aplicando sobre ${baseCalc.length} obras do contexto`);
         }
 
-        if (texto_avancado) {
-          texto = texto_avancado;
-          falhasParaGuardar = 0;
-        } else {
-          // Reserva: o DSL deterministico (rapido, sem gastar IA).
-          console.log("DEBUG calculo: sandbox nao resolveu, usando DSL");
-          let resultado = executarReceita(interpretacao.receita, obras);
+        // ORDEM CERTA: o DSL primeiro - resolve a maioria (soma, contagem,
+        // media, filtros) na hora, de graca e exato. O sandbox so entra se o
+        // DSL nao conseguir E estiver ativado (SANDBOX_URL) - ex.: "segunda
+        // maior", "top 3". Assim perguntas simples nao esperam o sandbox.
+        let resultado = executarReceita(interpretacao.receita, baseCalc);
 
-          if (!resultado) {
+        if (!resultado) {
+          // DSL nao resolveu: SO agora tentamos o calculo avancado, se ativo.
+          let avancado = null;
+          avancado = await tentarCalculoAvancado(pergunta, baseCalc);
+          if (avancado) {
+            texto = avancado;
+            falhasParaGuardar = 0;
+          } else {
             texto =
               "Não consegui montar esse cálculo com os dados da base. Pode tentar " +
               "reformular, ou perguntar por bairro, status, empresa ou tipo de obra.";
             falhasParaGuardar = memoria.falhas + 1;
-          } else if (resultado.listaCampo && resultado.listaCampo.length > 0) {
+          }
+        } else if (resultado.listaCampo && resultado.listaCampo.length > 0) {
             const BLOCO = 20;
             const primeiras = resultado.listaCampo.slice(0, BLOCO);
             const resto = resultado.listaCampo.length - primeiras.length;
@@ -773,7 +786,6 @@ async function processarWebhook(payload) {
               texto = resultado.fatos;
             }
           }
-        }
       }
 
       // ------------------------------------------------------

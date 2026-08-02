@@ -428,7 +428,7 @@ export function executarReceita(receita, obras) {
   };
 
   // 2) aplica a agregacao pedida
-  if (tipo.includes("contar")) {
+  if (tipo.includes("contar") && !tipo.includes("contar_por") && !ag.campo) {
     return {
       fatos: `Encontrei ${filtradas.length} obra(s) com esse criterio.`,
       obras: filtradas,
@@ -470,6 +470,55 @@ export function executarReceita(receita, obras) {
     return {
       fatos: `A de menor valor e "${lista[0].obra[acharColuna(lista[0].obra, "nome")] || "obra"}", com ${formatarMoeda(lista[0].valor)}.`,
       obras: lista.map((x) => x.obra),
+      listaCompleta: true,
+    };
+  }
+  // "top N" / ranking: as N obras de maior (ou menor) valor. O N vem em ag.n.
+  if (tipo.includes("top") || tipo.includes("ranking") || tipo.includes("maiores") || tipo.includes("menores")) {
+    const n = Math.max(1, parseInt(ag.n, 10) || 3);
+    const desc = !tipo.includes("menores");
+    const lista = valoresNum().sort((a, b) => (desc ? b.valor - a.valor : a.valor - b.valor));
+    if (lista.length === 0) return null;
+    const topo = lista.slice(0, n);
+    const linhas = topo.map((x, i) => {
+      const nome = x.obra[acharColuna(x.obra, "nome")] || "Obra";
+      return `${i + 1}. *${nome}* — ${formatarMoeda(x.valor)}`;
+    });
+    return {
+      fatos: `As ${topo.length} obras de ${desc ? "maior" : "menor"} valor:`,
+      obras: topo.map((x) => x.obra),
+      listaCampo: linhas,
+      listaCompleta: true,
+    };
+  }
+  // Ordinal: "segunda maior", "terceira menor" - ag.posicao = 2, 3...
+  if (tipo.includes("ordinal")) {
+    const pos = Math.max(1, parseInt(ag.posicao, 10) || 2);
+    const desc = !tipo.includes("menor");
+    const lista = valoresNum().sort((a, b) => (desc ? b.valor - a.valor : a.valor - b.valor));
+    if (lista.length < pos) return null;
+    const alvo = lista[pos - 1];
+    const nome = alvo.obra[acharColuna(alvo.obra, "nome")] || "Obra";
+    return {
+      fatos: `A ${pos}ª obra de ${desc ? "maior" : "menor"} valor e "${nome}", com ${formatarMoeda(alvo.valor)}.`,
+      obras: [alvo.obra],
+      listaCompleta: true,
+    };
+  }
+  // Contar por GRUPO: "quantas obras por bairro", "por status". ag.campo = grupo.
+  if ((tipo.includes("contar_por") || tipo.includes("agrupar")) && ag.campo) {
+    const grupos = new Map();
+    for (const o of filtradas) {
+      const col = acharColuna(o, ag.campo);
+      const chave = (col && o[col] && o[col].toString().trim()) || "(não informado)";
+      grupos.set(chave, (grupos.get(chave) || 0) + 1);
+    }
+    const ordenado = [...grupos.entries()].sort((a, b) => b[1] - a[1]);
+    const linhas = ordenado.map(([k, v]) => `• *${k}*: ${v} obra(s)`);
+    return {
+      fatos: `Distribuicao por ${ag.campo}:`,
+      obras: filtradas,
+      listaCampo: linhas,
       listaCompleta: true,
     };
   }
