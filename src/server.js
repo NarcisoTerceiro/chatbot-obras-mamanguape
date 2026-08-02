@@ -238,7 +238,7 @@ const PAGINA_ESCOLHA = 5;
 // Monta uma "pagina" da lista de opcoes, comecando de 'jaMostradas'. Mantem a
 // numeracao global (se ja mostrou 3, a proxima comeca no 4). Retorna o texto e
 // quantas opcoes ficam mostradas no total ate aqui.
-function montarPerguntaDeEscolha(lista, jaMostradas = 0) {
+function montarPerguntaDeEscolha(lista, jaMostradas = 0, cabecalhoCustom = null) {
   const fim = Math.min(jaMostradas + PAGINA_ESCOLHA, lista.length);
   const slice = lista.slice(jaMostradas, fim);
 
@@ -252,15 +252,17 @@ function montarPerguntaDeEscolha(lista, jaMostradas = 0) {
 
   const restante = lista.length - fim;
   const cabecalho =
-    jaMostradas === 0
-      ? `Encontrei ${lista.length} obras relacionadas. Sobre qual você quer saber?`
-      : `Mais ${slice.length} obra(s):`;
+    jaMostradas > 0
+      ? `Mais ${slice.length} obra(s):`
+      : cabecalhoCustom
+      ? cabecalhoCustom // usa o cabecalho que veio de fora (evita duplicar)
+      : `Encontrei ${lista.length} obras relacionadas. Sobre qual você quer saber?`;
 
   const rodape =
     restante > 0
       ? `\n\nResponda o número (ex.: "${jaMostradas + 1}") ou o nome. Digite ` +
         `*MAIS* para ver as próximas ${Math.min(PAGINA_ESCOLHA, restante)} ou *TODAS* para a lista completa.`
-      : `\n\nÉ só responder o número ou o nome.`;
+      : `\n\nÉ só responder o número para ver os detalhes de uma delas.`;
 
   return { texto: cabecalho + "\n\n" + linhas.join("\n") + rodape, mostradas: fim };
 }
@@ -772,9 +774,12 @@ async function processarWebhook(payload) {
             obrasParaGuardar = resultado.obras;
             tipoParaGuardar = "aguardando_escolha";
             falhasParaGuardar = 0;
-            const pagina = montarPerguntaDeEscolha(resultado.obras, 0);
+            // Cabecalho unico: usa o fato do filtro (ex.: "Encontrei 5 obras com
+            // esse criterio.") em vez de duplicar com "obras relacionadas".
+            const cab = `${resultado.fatos} Veja a lista:`;
+            const pagina = montarPerguntaDeEscolha(resultado.obras, 0, cab);
             mostradasParaGuardar = pagina.mostradas;
-            texto = `${resultado.fatos}\n\n${pagina.texto}`;
+            texto = pagina.texto;
           } else {
             obrasParaGuardar = resultado.obras || [];
             falhasParaGuardar = 0;

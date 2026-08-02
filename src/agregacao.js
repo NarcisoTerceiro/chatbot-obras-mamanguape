@@ -430,7 +430,7 @@ export function executarReceita(receita, obras) {
   // 2) aplica a agregacao pedida
   if (tipo.includes("contar") && !tipo.includes("contar_por") && !ag.campo) {
     return {
-      fatos: `Encontrei ${filtradas.length} obra(s) com esse criterio.`,
+      fatos: `Encontrei ${filtradas.length} obra(s) que atendem ao que voce pediu.`,
       obras: filtradas,
       listaCompleta: true,
     };
@@ -554,7 +554,7 @@ export function executarReceita(receita, obras) {
 
   // "listar" (padrao): so devolve as obras filtradas
   return {
-    fatos: `Encontrei ${filtradas.length} obra(s) com esse criterio.`,
+    fatos: `Encontrei ${filtradas.length} obra(s) que atendem ao que voce pediu.`,
     obras: filtradas,
     listaCompleta: true,
   };
