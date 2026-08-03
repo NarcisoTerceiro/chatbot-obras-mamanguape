@@ -288,6 +288,17 @@ function detectarEscolha(pergunta, obrasContexto) {
 
   const bruto = (pergunta || "").toLowerCase().trim();
 
+  // RELEITURA DE SEGURANCA: antes de tratar um numero como "escolheu o item
+  // N", confere se a frase não está falando de VARIAS obras ao mesmo tempo
+  // (ex.: "essas 5 obras", "todas as 5", "as 5 de cima"). Nesses casos, a
+  // pessoa esta se referindo ao GRUPO INTEIRO, nao escolhendo uma so - isso
+  // evita o bug de "quero os engenheiros dessas 5 obras" virar "obra numero 5".
+  const falaDoGrupoTodo =
+    /\b(essas|dessas|todas|essas\s+\d|as\s+\d+\s+(obras|de cima)|cada\s+uma|cada\s+obra)\b/.test(
+      bruto
+    );
+  if (falaDoGrupoTodo) return null;
+
   // 1) Numero: "2", "a 2", "op 3", "numero 1".
   const mNum = bruto.match(/\b(\d{1,2})\b/);
   if (mNum) {

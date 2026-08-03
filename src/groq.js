@@ -60,14 +60,31 @@ const OPERACOES_VALIDAS = new Set([
 // deve conter "model": ele e definido aqui conforme o provedor da vez.
 // Observacao sobre parametros: usamos max_tokens (aceito por ambos) e
 // reasoning_effort (Groq: gpt-oss; Gemini: mapeia para o "thinking").
+// Quando um provedor bate o limite (429), ele fica de "descanso" por um
+// tempo: nas proximas mensagens o sistema PULA ele direto e usa o proximo
+// da fila como principal - sem perder tempo tentando de novo a cada mensagem.
+// Depois do descanso, volta a tentar normalmente (o provedor "retorna").
+const DESCANSO_MS = 5 * 60 * 1000; // 5 minutos
+const provedorDescansando = new Map(); // nome -> timestamp de quando pode voltar
+
 async function chamarIA(body) {
   if (PROVEDORES.length === 0) {
     throw new Error("Nenhuma chave de IA configurada (GEMINI_API_KEY ou GROQ_API_KEY).");
   }
 
   let ultimoErro = null;
+  const agora = Date.now();
 
   for (const prov of PROVEDORES) {
+    // Pula provedores em descanso (bateram limite recentemente).
+    const voltaEm = provedorDescansando.get(prov.nome);
+    if (voltaEm && agora < voltaEm) {
+      console.log(
+        `DEBUG ${prov.nome} em descanso ainda por ${Math.ceil((voltaEm - agora) / 1000)}s - pulando`
+      );
+      continue;
+    }
+
     try {
       const resp = await fetch(prov.url, {
         method: "POST",
@@ -88,13 +105,19 @@ async function chamarIA(body) {
       const data = await resp.json();
       const texto = data.choices?.[0]?.message?.content?.trim() || "";
       if (!texto) throw new Error(`${prov.nome} devolveu resposta vazia`);
-      // Log explicito: mostra QUAL IA respondeu de fato (util para conferir no
-      // log do Render se o Gemini esta atuando como principal).
+      // Respondeu com sucesso: se estava de descanso, tira do descanso.
+      provedorDescansando.delete(prov.nome);
       console.log(`DEBUG IA usada: ${prov.nome} (modelo ${prov.model})`);
       return texto;
     } catch (e) {
       console.error(`IA (${prov.nome}) falhou:`, e.message);
       ultimoErro = e;
+      // 429 = limite de cota: poe esse provedor de descanso, evitando
+      // tentar ele de novo nas proximas mensagens ate o tempo passar.
+      if (e.status === 429) {
+        provedorDescansando.set(prov.nome, Date.now() + DESCANSO_MS);
+        console.log(`DEBUG ${prov.nome} atingiu limite - descansando ${DESCANSO_MS / 60000} min`);
+      }
       // tenta o proximo provedor da lista
     }
   }
@@ -391,6 +414,18 @@ REGRAS QUE NAO PODEM SER QUEBRADAS
 
 3) Nunca diga que voce e uma IA, nem cite "os dados fornecidos", "a planilha",
    "o sistema" ou "o JSON". Fale como a propria prefeitura falaria.
+
+RELEITURA ANTES DE RESPONDER (faca isso sempre, em silencio, antes de escrever)
+Antes de redigir, releia a "pergunta" com atencao e confira:
+- Ela fala de UMA obra ou de VARIAS ("essas", "todas", "cada uma", um numero
+  de itens)? Se falar de varias, sua resposta PRECISA cobrir cada uma delas -
+  nunca responda so a primeira ou a ultima como se fosse a unica.
+- Ela pede um campo especifico (nome, engenheiro, valor, prazo) ou pede tudo?
+  Responda so o que foi pedido.
+- O que veio em "obras"/"fatos" realmente responde essa pergunta especifica?
+  Se os dados nao cobrem o que foi pedido, diga que nao encontrou - nao
+  responda algo parecido como se fosse a resposta certa.
+Esse passo evita perder o fio da pergunta original no meio da conversa.
 
 COMO CONVERSAR
 
