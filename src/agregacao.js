@@ -158,9 +158,10 @@ function agregarSoma(obras, pista = "") {
 
   return {
     fatos:
-      `A soma dos valores e ${formatarMoeda(total)}, ` +
-      `considerando ${lista.length} obra(s) com valor informado` +
-      (semValor > 0 ? ` (${semValor} obra(s) estao sem valor na base).` : ".") ,
+      `O valor total é ${formatarMoeda(total)}` +
+      (semValor > 0
+        ? `, somando ${lista.length} obra(s) com valor informado (${semValor} sem valor cadastrado).`
+        : `, somando ${lista.length} obra(s).`),
     // devolve TODAS as obras somadas (ordenadas por valor), para listar completo
     obras: lista.sort((a, b) => b.valor - a.valor).map((x) => x.obra),
     listaCompleta: true,
@@ -440,7 +441,7 @@ export function executarReceita(receita, obras) {
     if (lista.length === 0) return null;
     const total = lista.reduce((a, x) => a + x.valor, 0);
     return {
-      fatos: `A soma e ${formatarMoeda(total)}, considerando ${lista.length} obra(s) com valor informado.`,
+      fatos: `O valor total é ${formatarMoeda(total)}, somando ${lista.length} obra(s).`,
       obras: lista.sort((a, b) => b.valor - a.valor).map((x) => x.obra),
       listaCompleta: true,
     };

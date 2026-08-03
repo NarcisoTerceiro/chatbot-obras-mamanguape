@@ -908,18 +908,33 @@ async function processarWebhook(payload) {
           obrasParaGuardar = resultado.obras.slice(0, 10);
           falhasParaGuardar = 0;
         } else if (resultado.listaCompleta && resultado.obras.length > 0) {
-          // Contagem por status com a lista COMPLETA em maos. Guardamos todas as
-          // obras como opcoes paginaveis: o cidadao pode ver todas (MAIS),
-          // escolher um numero, ou pedir uma obra especifica.
-          obrasParaGuardar = resultado.obras;
-          tipoParaGuardar = "aguardando_escolha";
-          falhasParaGuardar = 0;
+          const ehSomaOuMedia = /^(o valor total|a média)/i.test(resultado.fatos || "");
 
-          const pagina = montarPerguntaDeEscolha(resultado.obras, 0);
-          mostradasParaGuardar = pagina.mostradas;
-          // Junta o fato (ex.: "Existem 10 obras com status Paralisada") com a
-          // primeira pagina de opcoes.
-          texto = `${resultado.fatos}\n\n${pagina.texto}`;
+          if (ehSomaOuMedia) {
+            // Soma/media: mostra o valor + as obras que entraram na conta,
+            // como LISTA INFORMATIVA (nao pede pra "escolher uma").
+            const BLOCO = 15;
+            const nomes = resultado.obras.slice(0, BLOCO).map(
+              (o) => `• ${campoNome(o)}`
+            );
+            const resto = resultado.obras.length - nomes.length;
+            texto = `${resultado.fatos}\n\nObras consideradas:\n${nomes.join("\n")}`;
+            if (resto > 0) texto += `\n_...e mais ${resto}._`;
+            obrasParaGuardar = resultado.obras.slice(0, 10);
+            falhasParaGuardar = 0;
+          } else {
+            // Contagem por status com a lista COMPLETA em maos. Guardamos todas as
+            // obras como opcoes paginaveis: o cidadao pode ver todas (MAIS),
+            // escolher um numero, ou pedir uma obra especifica.
+            obrasParaGuardar = resultado.obras;
+            tipoParaGuardar = "aguardando_escolha";
+            falhasParaGuardar = 0;
+
+            const cab = `${resultado.fatos} Veja a lista:`;
+            const pagina = montarPerguntaDeEscolha(resultado.obras, 0, cab);
+            mostradasParaGuardar = pagina.mostradas;
+            texto = pagina.texto;
+          }
         } else {
           // Agregacao normal (obra mais cara, soma, contagem geral): a IA redige
           // o resultado JA calculado pelo sistema, sem refazer conta.
