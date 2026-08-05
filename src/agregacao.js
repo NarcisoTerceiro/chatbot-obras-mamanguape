@@ -22,6 +22,61 @@ function normalize(s) {
 }
 
 // ------------------------------------------------------------
+//  Tolerancia a erro de digitacao (ex.: cidadao escreve "Mariana
+//  Costa" mas a base tem "Marina Costa"). Sem isso, um pequeno erro
+//  de digitacao faz o sistema dizer "nao encontrei", quando na
+//  verdade a obra existe.
+// ------------------------------------------------------------
+function distanciaEdicao(a, b) {
+  const m = a.length, n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let anterior = Array.from({ length: n + 1 }, (_, i) => i);
+  for (let i = 1; i <= m; i++) {
+    const atual = [i];
+    for (let j = 1; j <= n; j++) {
+      const custo = a[i - 1] === b[j - 1] ? 0 : 1;
+      atual[j] = Math.min(
+        atual[j - 1] + 1,      // insercao
+        anterior[j] + 1,       // remocao
+        anterior[j - 1] + custo // substituicao
+      );
+    }
+    anterior = atual;
+  }
+  return anterior[n];
+}
+
+// Compara duas strings JA NORMALIZADAS tolerando pequenos erros de
+// digitacao. Quanto maior o texto, mais erros tolera (2 letras erradas
+// em "Mariana Costa" ainda deve casar com "Marina Costa").
+function pareceMesmoTexto(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const maiorLen = Math.max(a.length, b.length);
+  if (maiorLen < 4) return false; // texto curto demais: erro de 1 letra muda o sentido
+  const tolerancia = maiorLen <= 8 ? 1 : maiorLen <= 14 ? 2 : 3;
+  return distanciaEdicao(a, b) <= tolerancia;
+}
+
+// Compara nomes de PESSOA/EMPRESA que podem ter varias palavras (ex.:
+// "Marina Costa" vs "Mariana Costa"): compara palavra a palavra, pois
+// e mais preciso do que comparar a frase inteira.
+function pareceMesmoNome(a, b) {
+  if (!a || !b) return false;
+  if (a === b || a.includes(b) || b.includes(a)) return true;
+  const palavrasA = a.split(/\s+/).filter(Boolean);
+  const palavrasB = b.split(/\s+/).filter(Boolean);
+  if (palavrasA.length === 0 || palavrasB.length === 0) return false;
+  // Toda palavra do lado menor precisa achar uma correspondente proxima
+  // do outro lado (tolera "Mariana"~"Marina", mas nao "Carlos"~"Ricardo").
+  const [menor, maior] = palavrasA.length <= palavrasB.length
+    ? [palavrasA, palavrasB]
+    : [palavrasB, palavrasA];
+  return menor.every((p) => maior.some((q) => pareceMesmoTexto(p, q)));
+}
+
+// ------------------------------------------------------------
 //  Leitura de numeros no formato brasileiro
 //  Ex.: "R$ 1.234.567,89" -> 1234567.89
 // ------------------------------------------------------------
@@ -399,9 +454,11 @@ function passaFiltro(obra, filtro) {
   const vObra = normalize(bruto);
   const vAlvo = normalize(Array.isArray(filtro.valor) ? filtro.valor[0] : filtro.valor);
   if (op.includes("diferente")) return vObra !== vAlvo && !vObra.includes(vAlvo);
-  if (op.includes("contem")) return vObra.includes(vAlvo);
-  // "igual" (padrao): tolera conter, para bairro/status escritos com variacao
-  return vObra === vAlvo || vObra.includes(vAlvo) || vAlvo.includes(vObra);
+  if (op.includes("contem")) return vObra.includes(vAlvo) || pareceMesmoNome(vObra, vAlvo);
+  // "igual" (padrao): tolera conter (bairro/status escritos com variacao) e
+  // tolera pequeno erro de digitacao no nome (ex.: engenheiro, empresa).
+  return vObra === vAlvo || vObra.includes(vAlvo) || vAlvo.includes(vObra) ||
+    pareceMesmoNome(vObra, vAlvo);
 }
 
 // Executa uma RECEITA { filtros, agregacao } sobre a lista de obras.
@@ -507,6 +564,10 @@ export function executarReceita(receita, obras) {
     };
   }
   // Contar por GRUPO: "quantas obras por bairro", "por status". ag.campo = grupo.
+  // Tambem cobre "qual X tem MAIS/MENOS obras" (ex.: "qual engenheiro tem mais
+  // obras?") atraves de ag.top: como ENGENHEIRO/BAIRRO/EMPRESA nao sao numeros,
+  // essa pergunta NAO e um "top" de valor - e uma contagem por grupo onde so
+  // queremos o(s) primeiro(s) do ranking.
   if ((tipo.includes("contar_por") || tipo.includes("agrupar")) && ag.campo) {
     const grupos = new Map();
     for (const o of filtradas) {
@@ -514,7 +575,33 @@ export function executarReceita(receita, obras) {
       const chave = (col && o[col] && o[col].toString().trim()) || "(não informado)";
       grupos.set(chave, (grupos.get(chave) || 0) + 1);
     }
-    const ordenado = [...grupos.entries()].sort((a, b) => b[1] - a[1]);
+    const desc = normalize(ag.ordem || "desc") !== "asc";
+    const ordenado = [...grupos.entries()].sort((a, b) => (desc ? b[1] - a[1] : a[1] - b[1]));
+
+    const topN = parseInt(ag.top, 10);
+    if (topN > 0) {
+      const topo = ordenado.slice(0, topN);
+      const rotulo = desc ? "mais" : "menos";
+      if (topo.length === 1) {
+        const [nome, qtd] = topo[0];
+        return {
+          fatos: `Quem ${rotulo} aparece em *${ag.campo}* e "${nome}", com ${qtd} obra(s).`,
+          obras: filtradas.filter((o) => {
+            const col = acharColuna(o, ag.campo);
+            return col && (o[col] || "").toString().trim() === nome;
+          }),
+          listaCompleta: true,
+        };
+      }
+      const linhas = topo.map(([k, v], i) => `${i + 1}. *${k}* — ${v} obra(s)`);
+      return {
+        fatos: `Ranking (${rotulo} obras) por ${ag.campo}:`,
+        obras: filtradas,
+        listaCampo: linhas,
+        listaCompleta: true,
+      };
+    }
+
     const linhas = ordenado.map(([k, v]) => `• *${k}*: ${v} obra(s)`);
     return {
       fatos: `Distribuicao por ${ag.campo}:`,
