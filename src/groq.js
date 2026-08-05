@@ -1,38 +1,70 @@
 // ============================================================
 //  groq.js  (nome mantido por compatibilidade - hoje e o modulo de IA)
 //
-//  MULTI-PROVEDOR: a IA principal e o GEMINI e o GROQ fica como reserva
-//  automatica. Se um falhar (limite, erro, fora do ar), o outro assume na
-//  hora - o cidadao nem percebe.
+//  ESTRATEGIA DE PROVEDORES:
+//    1. GEMINI (principal) - chamado diretamente pela API do Google.
+//       Gratis, rapido e de alta qualidade.
+//    2. OMNIROUTE (fallback) - gateway open-source que roteia para
+//       270+ provedores automaticamente (Groq, OpenRouter, DeepSeek,
+//       Kimi, etc.). Assume quando o Gemini bate o limite de cota (429)
+//       ou retorna erro. O cidadao nunca percebe a troca.
 //
 //  Configuracao (variaveis de ambiente no Render / .env):
-//    GEMINI_API_KEY  -> chave do Google AI Studio (aistudio.google.com/apikey) - PRINCIPAL
-//    GEMINI_MODEL    -> opcional (padrao: gemini-2.5-flash)
-//    GROQ_API_KEY    -> chave do Groq (reserva)
-//    GROQ_MODEL      -> opcional (padrao: openai/gpt-oss-120b)
+//    GEMINI_API_KEY   -> chave do Google AI Studio (OBRIGATORIO)
+//    GEMINI_MODEL     -> opcional (padrao: gemini-2.5-flash)
+//    OMNIROUTE_URL    -> URL do OmniRoute (ex: http://localhost:4000/v1
+//                        ou https://SEU-OMNIROUTE.onrender.com/v1)
+//    OMNIROUTE_KEY    -> chave do OmniRoute (opcional, se configurou auth)
+//    OMNIROUTE_MODEL  -> modelo preferido no OmniRoute (padrao: gemini-2.5-flash)
+//                        O OmniRoute faz fallback automatico se esse modelo
+//                        tambem estiver sem cota.
 //
-//  A ORDEM e: Gemini -> Groq (usa o primeiro que tiver chave).
-//  Se so houver a chave do Groq, funciona 100% no Groq como antes.
+//  Como instalar o OmniRoute (uma vez):
+//    npx omniroute   (requer Node >= 22)
+//  Ou via Docker:
+//    docker run -p 4000:4000 diegosouzapw/omniroute
+//  Repositorio: https://github.com/diegosouzapw/OmniRoute
 // ============================================================
 
+// --- Provedor 1: Gemini direto ---
+const GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+const GEMINI_KEY  = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+
+// --- Provedor 2: OmniRoute (fallback) ---
+const OMNIROUTE_URL   = process.env.OMNIROUTE_URL
+  ? process.env.OMNIROUTE_URL.replace(/\/$/, "") + "/chat/completions"
+  : null;
+const OMNIROUTE_KEY   = process.env.OMNIROUTE_KEY || "omniroute"; // valor padrao se sem auth
+const OMNIROUTE_MODEL = process.env.OMNIROUTE_MODEL || "gemini-2.5-flash";
+
+// Lista de provedores na ordem de tentativa.
+// O sistema tenta cada um em sequencia; se um bater limite ou falhar, passa pro proximo.
 const PROVEDORES = [];
 
-if (process.env.GEMINI_API_KEY) {
+if (GEMINI_KEY) {
   PROVEDORES.push({
     nome: "gemini",
-    url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-    key: process.env.GEMINI_API_KEY,
-    model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+    url: GEMINI_URL,
+    key: GEMINI_KEY,
+    model: GEMINI_MODEL,
   });
 }
 
-if (process.env.GROQ_API_KEY) {
+if (OMNIROUTE_URL) {
   PROVEDORES.push({
-    nome: "groq",
-    url: "https://api.groq.com/openai/v1/chat/completions",
-    key: process.env.GROQ_API_KEY,
-    model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
+    nome: "omniroute",
+    url: OMNIROUTE_URL,
+    key: OMNIROUTE_KEY,
+    model: OMNIROUTE_MODEL,
   });
+}
+
+if (PROVEDORES.length === 0) {
+  console.warn(
+    "AVISO: Nenhum provedor de IA configurado. " +
+    "Defina GEMINI_API_KEY e/ou OMNIROUTE_URL no .env."
+  );
 }
 
 // Contato para escalar quando o bot nao resolve (opcional, via .env).
@@ -54,16 +86,13 @@ const OPERACOES_VALIDAS = new Set([
 ]);
 
 // ------------------------------------------------------------
-//  Funcao auxiliar generica pra chamar a API do Groq.
+//  Funcao auxiliar generica pra chamar a IA.
 // ------------------------------------------------------------
-// Chama a IA tentando cada provedor na ordem (Gemini -> Groq). O "body" NAO
-// deve conter "model": ele e definido aqui conforme o provedor da vez.
-// Observacao sobre parametros: usamos max_tokens (aceito por ambos) e
-// reasoning_effort (Groq: gpt-oss; Gemini: mapeia para o "thinking").
-// Quando um provedor bate o limite (429), ele fica de "descanso" por um
-// tempo: nas proximas mensagens o sistema PULA ele direto e usa o proximo
-// da fila como principal - sem perder tempo tentando de novo a cada mensagem.
-// Depois do descanso, volta a tentar normalmente (o provedor "retorna").
+// Tenta cada provedor na ordem: Gemini (principal) -> OmniRoute (fallback).
+// O "body" NAO deve conter "model": ele e definido aqui conforme o provedor.
+// Quando um provedor bate o limite (429) ou falha, entra de "descanso" por
+// 5 minutos: o sistema pula ele e usa o proximo direto - sem tentar de novo
+// a cada mensagem. Apos o descanso, volta a tentar normalmente.
 const DESCANSO_MS = 5 * 60 * 1000; // 5 minutos
 const provedorDescansando = new Map(); // nome -> timestamp de quando pode voltar
 
@@ -107,7 +136,8 @@ async function chamarIA(body) {
       if (!texto) throw new Error(`${prov.nome} devolveu resposta vazia`);
       // Respondeu com sucesso: se estava de descanso, tira do descanso.
       provedorDescansando.delete(prov.nome);
-      console.log(`DEBUG IA usada: ${prov.nome} (modelo ${prov.model})`);
+      const via = prov.nome === "omniroute" ? "OmniRoute (fallback)" : "Gemini (principal)";
+      console.log(`DEBUG IA usada: ${via} | modelo: ${prov.model}`);
       return texto;
     } catch (e) {
       console.error(`IA (${prov.nome}) falhou:`, e.message);
@@ -539,10 +569,15 @@ export async function redigirResposta(pergunta, obras, detalhe, historico = [], 
 //  (nao no nosso servidor), calcula e devolve a resposta pronta.
 //  Requer GEMINI_API_KEY. Enviamos SO as obras ja filtradas por
 //  termos, nunca a planilha inteira, para nao estourar tokens.
+//
+//  NOTA: Code Execution usa o endpoint NATIVO do Gemini (nao o
+//  compativel com OpenAI), entao sempre vai direto ao Google -
+//  sem passar pelo OmniRoute. Se o Gemini estiver sem cota,
+//  esta funcao vai lancar erro e o server.js cai no formatador local.
 // ============================================================
 
 const GEMINI_KEY_CE = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL_CE = process.env.GEMINI_MODEL || "gemini-flash-latest";
+const GEMINI_MODEL_CE = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
 const SYSTEM_PROMPT_CODE_EXEC = `Voce e o assistente de obras publicas da Prefeitura de
 Mamanguape. Voce recebe a pergunta do cidadao e uma lista de obras em JSON.
