@@ -981,17 +981,34 @@ async function processarWebhook(payload) {
       //  Passo F: BUSCA especifica
       // ------------------------------------------------------
       else {
+        // ACOMPANHAMENTO: se a pergunta claramente se refere ao grupo de obras
+        // que ja estava na tela ("usar_contexto" da IA, ou palavras como
+        // "dessas", "cada uma"), usamos ESSAS obras direto - sem rodar busca
+        // por palavra-chave, que pode "achar" obras aleatorias da base inteira
+        // so porque uma palavra generica (ex.: "status") bate em varias linhas.
+        const refereAnteriorBusca =
+          interpretacao.usar_contexto === true ||
+          /\b(essas|dessas|delas|desses|deles|as de cima|as que voce|as listadas|acima|cada uma|cada um)\b/i.test(
+            pergunta || ""
+          );
+
         // Busca TODAS as candidatas relevantes (nao so 3), para poder paginar
         // com "MAIS". O filtro de relevancia do search.js ja faz o nome exato
         // vencer sozinho; aqui so ampliamos o teto para casos com muitas obras.
         const TETO_CANDIDATAS = 30;
 
-        let encontradas = buscarObrasPorTermos(interpretacao.termos, obras, TETO_CANDIDATAS);
-        console.log(`DEBUG busca por termos da IA: ${encontradas.length} resultado(s)`);
+        let encontradas;
+        if (refereAnteriorBusca && obrasContexto.length > 0) {
+          console.log(`DEBUG acompanhamento (busca): usando ${obrasContexto.length} obra(s) do contexto`);
+          encontradas = obrasContexto;
+        } else {
+          encontradas = buscarObrasPorTermos(interpretacao.termos, obras, TETO_CANDIDATAS);
+          console.log(`DEBUG busca por termos da IA: ${encontradas.length} resultado(s)`);
 
-        if (encontradas.length === 0) {
-          encontradas = buscarObras(pergunta, obras, TETO_CANDIDATAS);
-          console.log(`DEBUG busca direta pelo texto: ${encontradas.length} resultado(s)`);
+          if (encontradas.length === 0) {
+            encontradas = buscarObras(pergunta, obras, TETO_CANDIDATAS);
+            console.log(`DEBUG busca direta pelo texto: ${encontradas.length} resultado(s)`);
+          }
         }
 
         // MELHORIA 5: refinamento - combina os termos anteriores com os novos.

@@ -426,6 +426,39 @@ function acharColuna(obra, nomeAprox) {
   return null;
 }
 
+// Descreve os FILTROS aplicados em portugues natural, para o texto fixo
+// ("Encontrei N obra(s)...") citar de fato o que a pessoa perguntou -
+// engenheiro, status, bairro etc. - em vez de um texto generico igual pra
+// qualquer pergunta.
+function descreverFiltros(filtros) {
+  if (!Array.isArray(filtros) || filtros.length === 0) return "";
+  const partes = filtros.map((f) => {
+    const campo = normalize(f.campo || "");
+    const valorBruto = Array.isArray(f.valor) ? f.valor.join(" a ") : f.valor;
+    if (campo.includes("engenheiro") || campo.includes("arquiteto") || campo.includes("responsavel")) {
+      return `do engenheiro ${valorBruto}`;
+    }
+    if (campo.includes("status") || campo.includes("situa")) {
+      return `com status ${valorBruto}`;
+    }
+    if (campo.includes("bairro")) {
+      return `no bairro ${valorBruto}`;
+    }
+    if (campo.includes("empresa")) {
+      return `da empresa ${valorBruto}`;
+    }
+    if (campo.includes("valor") || campo.includes("investimento") || campo.includes("custo")) {
+      const op = normalize(f.operador || "");
+      const n = parseNumero(valorBruto);
+      if (n != null && op.includes("maior")) return `com valor acima de ${formatarMoeda(n)}`;
+      if (n != null && op.includes("menor")) return `com valor abaixo de ${formatarMoeda(n)}`;
+      return `com valor ${valorBruto}`;
+    }
+    return `com ${f.campo} ${valorBruto}`;
+  });
+  return " " + partes.join(" e ");
+}
+
 // Aplica UM filtro a uma obra. Retorna true se a obra passa.
 function passaFiltro(obra, filtro) {
   const col = acharColuna(obra, filtro.campo);
@@ -488,7 +521,7 @@ export function executarReceita(receita, obras) {
   // 2) aplica a agregacao pedida
   if (tipo.includes("contar") && !tipo.includes("contar_por") && !ag.campo) {
     return {
-      fatos: `Encontrei ${filtradas.length} obra(s) que atendem ao que voce pediu.`,
+      fatos: `Encontrei ${filtradas.length} obra(s)${descreverFiltros(filtros)}.`,
       obras: filtradas,
       listaCompleta: true,
     };
@@ -585,7 +618,7 @@ export function executarReceita(receita, obras) {
       if (topo.length === 1) {
         const [nome, qtd] = topo[0];
         return {
-          fatos: `Quem ${rotulo} aparece em *${ag.campo}* e "${nome}", com ${qtd} obra(s).`,
+          fatos: `Quem ${rotulo} aparece em *${ag.campo}* é "${nome}", com ${qtd} obra(s).`,
           obras: filtradas.filter((o) => {
             const col = acharColuna(o, ag.campo);
             return col && (o[col] || "").toString().trim() === nome;
@@ -642,7 +675,7 @@ export function executarReceita(receita, obras) {
 
   // "listar" (padrao): so devolve as obras filtradas
   return {
-    fatos: `Encontrei ${filtradas.length} obra(s) que atendem ao que voce pediu.`,
+    fatos: `Encontrei ${filtradas.length} obra(s)${descreverFiltros(filtros)}.`,
     obras: filtradas,
     listaCompleta: true,
   };
