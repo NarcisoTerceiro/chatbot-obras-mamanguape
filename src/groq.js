@@ -176,14 +176,24 @@ de uma prefeitura, enviadas por WhatsApp de forma informal, formal, com girias,
 abreviacoes ou erros de digitacao.
 
 PRINCIPIOS (siga sempre):
-0. ACOMPANHAMENTO: a pessoa pode se referir ao RESULTADO ANTERIOR com palavras
-   como "essas", "dessas", "delas", "as de cima", "as que voce listou". Nesse
-   caso, monte a operacao para ser aplicada sobre essas mesmas obras. Ex.: apos
-   listar obras em licitacao, "liste com o nome do engenheiro" ->
-   {"tipo":"agregacao","termos":[],"receita":{"filtros":[],"agregacao":{"tipo":"listar","campo":"ENGENHEIRO"}}}
-   (o sistema ja aplica nas obras do contexto). "e o valor de cada uma?" ->
-   listar com campo do valor. "quantas dessas estao paradas?" -> contar com
-   filtro de status.
+0. ACOMPANHAMENTO: a pessoa pode se referir ao RESULTADO ANTERIOR (o grupo de
+   obras que voce acabou de mostrar), com qualquer jeito de falar - nao so as
+   palavras classicas "essas/dessas/delas", mas tambem "cada uma", "a de cima",
+   "todas elas", "o mesmo grupo", ou ate sem nenhum pronome explicito, quando o
+   sentido da frase claramente continua o assunto anterior. Julgue pelo SENTIDO
+   da conversa, nao por uma lista fixa de palavras.
+   Quando a pergunta se referir ao resultado anterior, marque
+   "usar_contexto":true e monte a operacao para ser aplicada sobre essas
+   mesmas obras (o sistema ja aplica automaticamente nas obras do contexto,
+   voce so precisa da receita/operacao, sem repetir os filtros da pergunta
+   anterior). Ex.: apos listar obras em licitacao, "liste com o nome do
+   engenheiro" ->
+   {"tipo":"agregacao","termos":[],"usar_contexto":true,"receita":{"filtros":[],"agregacao":{"tipo":"listar","campo":"ENGENHEIRO"}}}
+   "e o valor de cada uma?" -> listar com campo do valor, "usar_contexto":true.
+   "quantas dessas estao paradas?" -> contar com filtro de status,
+   "usar_contexto":true.
+   Se a pergunta for sobre a base inteira (novo assunto, sem relacao com o que
+   foi mostrado), marque "usar_contexto":false.
 1. Foque no que a pessoa REALMENTE quer, nao nas palavras exatas. "ta pronta a
    creche?", "a creche ja acabou?" e "situacao da creche" pedem a mesma coisa.
 2. Entenda a mesma pergunta escrita de varios jeitos (formal, informal, com erro).
@@ -329,7 +339,7 @@ Decida o NIVEL DE DETALHE:
   engenheiro, percentual executado) ou pergunta sobre uma obra so.
 
 Responda SOMENTE com um JSON valido, sem texto antes ou depois:
-{"tipo":"busca"|"saudacao"|"listagem"|"agregacao"|"engenheiro","termos":["termo1"],"detalhe":"resumido"|"completo","operacao":"","filtro_status":"","pista_valor":"","receita":null}
+{"tipo":"busca"|"saudacao"|"listagem"|"agregacao"|"engenheiro","termos":["termo1"],"detalhe":"resumido"|"completo","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":null}
 
 Deixe "operacao", "filtro_status" e "pista_valor" vazios quando nao se aplicarem.
 
@@ -398,6 +408,10 @@ export async function interpretarPergunta(pergunta, historico = []) {
       filtro_status: typeof it.filtro_status === "string" ? it.filtro_status.trim() : "",
       pista_valor: typeof it.pista_valor === "string" ? it.pista_valor.trim() : "",
       receita: it.receita && typeof it.receita === "object" ? it.receita : null,
+      // A propria IA ja decidiu, lendo o historico, se a pergunta se refere
+      // ao resultado anterior. Isso e mais confiavel que uma lista fixa de
+      // pronomes/expressoes no server.js (que sempre fica incompleta).
+      usar_contexto: it.usar_contexto === true,
       falhou: false,
     };
   } catch {
@@ -410,6 +424,7 @@ export async function interpretarPergunta(pergunta, historico = []) {
       filtro_status: "",
       pista_valor: "",
       receita: null,
+      usar_contexto: false,
       falhou: true,
     };
   }

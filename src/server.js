@@ -740,12 +740,14 @@ async function processarWebhook(payload) {
       else if (interpretacao.receita && temReceitaUtil(interpretacao.receita)) {
         console.log("DEBUG executando receita DSL (rapido, exato)");
 
-        // ACOMPANHAMENTO: se a pergunta se refere ao resultado anterior
-        // ("essas", "dessas", "delas", "as de cima") e ha obras no contexto,
-        // aplicamos a receita sobre ESSAS obras, nao sobre a base inteira.
-        const refereAnterior = /\b(essas|dessas|delas|desses|deles|as de cima|as que voce|as listadas|acima)\b/i.test(
+        // ACOMPANHAMENTO: a IA ja decide isso lendo o historico (campo
+        // "usar_contexto"), o que e mais confiavel do que uma lista fixa de
+        // palavras. O regex de pronomes so entra como rede de seguranca, caso
+        // a IA nao tenha marcado o campo (ou tenha falhado a interpretacao).
+        const refereAnteriorRegex = /\b(essas|dessas|delas|desses|deles|as de cima|as que voce|as listadas|acima|cada uma|cada um)\b/i.test(
           pergunta || ""
         );
+        const refereAnterior = interpretacao.usar_contexto === true || refereAnteriorRegex;
         const baseCalc =
           refereAnterior && obrasContexto.length > 1 ? obrasContexto : obras;
         if (baseCalc !== obras) {
