@@ -299,8 +299,15 @@ function detectarEscolha(pergunta, obrasContexto) {
     );
   if (falaDoGrupoTodo) return null;
 
-  // 1) Numero: "2", "a 2", "op 3", "numero 1".
-  const mNum = bruto.match(/\b(\d{1,2})\b/);
+  // 1) Numero: SO quando a mensagem inteira e (praticamente) so o numero -
+  // "2", "a 2", "opcao 3", "numero 1". Antes o regex pegava QUALQUER numero
+  // de 1-2 digitos em qualquer lugar da frase, entao "moro na rua 4" ou
+  // "prazo de 6 meses" eram lidos como "escolheu a obra 4/6" por engano.
+  // Ancorando no inicio/fim da mensagem, so uma resposta que E a escolha
+  // (sem mais nada de conteudo) casa aqui.
+  const mNum = bruto.match(
+    /^\s*(?:a\s+|op(?:c|ç)[aã]o\s+|op\s+|numero\s+|número\s+)?(\d{1,2})\s*[.!]*\s*$/
+  );
   if (mNum) {
     const idx = parseInt(mNum[1], 10) - 1;
     if (idx >= 0 && idx < obrasContexto.length) return obrasContexto[idx];
@@ -520,20 +527,69 @@ async function processarWebhook(payload) {
     // Passo A: le a planilha (com cache).
     const obras = await getObras();
 
-    // Estamos no modo obra focada? Sim, EXCETO quando a pessoa (sem digitar
-    // "X") escreve algo que bate claramente com OUTRA obra da base - nesse caso
-    // ela quer trocar de obra, entao saimos do foco e tratamos como busca nova.
     const focadaAtual =
       memoria.tipo === "obra_focada" && obrasContexto.length >= 1 ? obrasContexto[0] : null;
+
+    // Passo B: a IA interpreta a pergunta usando o historico da conversa.
+    // IMPORTANTE: isso roda SEMPRE, mesmo com uma obra em foco. Antes, essa
+    // chamada so acontecia fora do modo foco, e o bot ficava "preso"
+    // respondendo qualquer coisa como se fosse sobre a obra em pauta - por
+    // exemplo, se o cidadao perguntasse "quantas obras estao paralisadas?"
+    // enquanto via os detalhes de uma obra especifica, o bot tentava
+    // responder isso usando SO os dados daquela obra, e claro que nao
+    // encontrava a informacao. Rodando a interpretacao sempre, a IA consegue
+    // reconhecer quando o pedido e outra coisa (lista, conta, engenheiro,
+    // outra obra) e o sistema sai do foco automaticamente.
+    let interpretacao;
+    try {
+      interpretacao = await interpretarPergunta(pergunta, historico);
+    } catch (e) {
+      console.error("IA de interpretacao falhou, usando busca direta:", e.message);
+      interpretacao = {
+        tipo: "busca",
+        termos: [],
+        detalhe: "completo",
+        operacao: "",
+        filtro_status: "",
+        pista_valor: "",
+        receita: null,
+        usar_contexto: false,
+        falhou: true,
+      };
+    }
+
+    // LOG TEMPORARIO DE DEBUG - remover depois de confirmar que esta ok
+    console.log("DEBUG interpretacao:", JSON.stringify(interpretacao));
+
+    // Estamos no modo obra focada? Sim, EXCETO quando:
+    //  a) a pessoa escreve algo que bate claramente com OUTRA obra da base, ou
+    //  b) a propria IA classificou o pedido como algo que NAO e sobre a obra
+    //     atual: uma lista geral, uma conta/agregacao, obras de um
+    //     engenheiro, ou uma busca nova que ela mesma marcou como
+    //     "usar_contexto:false" (ou seja, nao e continuacao do assunto).
+    // Em qualquer um desses casos, saimos do foco e tratamos como pedido novo.
+    const pedidoForaDoFoco =
+      focadaAtual != null &&
+      (interpretacao.tipo === "agregacao" ||
+        interpretacao.tipo === "listagem" ||
+        interpretacao.tipo === "engenheiro" ||
+        (interpretacao.tipo === "busca" &&
+          interpretacao.usar_contexto === false &&
+          interpretacao.termos.length > 0));
+
     const trocarDeObra =
       focadaAtual &&
       !ehSaidaFoco(pergunta) &&
-      mensagemApontaOutraObra(pergunta, focadaAtual, obras);
+      (pedidoForaDoFoco || mensagemApontaOutraObra(pergunta, focadaAtual, obras));
     const emFoco = !!focadaAtual && !trocarDeObra;
 
     if (trocarDeObra) {
-      console.log("DEBUG saida automatica do foco: a mensagem aponta outra obra");
-      // Zera o foco; o fluxo normal abaixo trata esta mensagem como busca nova.
+      console.log(
+        pedidoForaDoFoco
+          ? "DEBUG saida automatica do foco: pedido claramente fora do escopo da obra"
+          : "DEBUG saida automatica do foco: a mensagem aponta outra obra"
+      );
+      // Zera o foco; o fluxo normal abaixo trata esta mensagem como pedido novo.
       tipoParaGuardar = "";
       termosParaGuardar = [];
     }
@@ -561,6 +617,19 @@ async function processarWebhook(payload) {
         tipoParaGuardar = "";
         obrasParaGuardar = [];
         termosParaGuardar = [];
+        falhasParaGuardar = 0;
+      }
+
+      // A pergunta e so uma saudacao/agradecimento/despedida (ex.: "obrigado",
+      // "tchau", "bom dia"): responde de forma fixa e cordial, sem gastar a
+      // IA de redacao (que so tem os dados desta obra e nao saberia o que
+      // fazer com um simples "obrigado"). Continua na mesma obra, caso a
+      // pessoa queira seguir perguntando.
+      else if (interpretacao.tipo === "saudacao") {
+        console.log("DEBUG saudacao/despedida dentro da obra focada");
+        texto = ehDespedida(pergunta) ? despedidaAleatoria() : saudacaoAleatoria();
+        obrasParaGuardar = [obraFocada];
+        tipoParaGuardar = "obra_focada";
         falhasParaGuardar = 0;
       }
 
@@ -601,24 +670,9 @@ async function processarWebhook(payload) {
     }
 
     else {
-      // Passo B: a IA interpreta a pergunta usando o historico da conversa.
-      let interpretacao;
-      try {
-        interpretacao = await interpretarPergunta(pergunta, historico);
-      } catch (e) {
-        console.error("IA de interpretacao falhou, usando busca direta:", e.message);
-        interpretacao = {
-          tipo: "busca",
-          termos: [],
-          detalhe: "completo",
-          operacao: "",
-          filtro_status: "",
-          falhou: true,
-        };
-      }
-
-      // LOG TEMPORARIO DE DEBUG - remover depois de confirmar que esta ok
-      console.log("DEBUG interpretacao:", JSON.stringify(interpretacao));
+      // A interpretacao (Passo B) ja foi calculada mais acima - inclusive
+      // quando havia obra em foco, para decidir se saiamos dele. Aqui so
+      // usamos o resultado.
       tipoParaGuardar = interpretacao.tipo;
       if (interpretacao.termos.length > 0) termosParaGuardar = interpretacao.termos;
 
@@ -638,7 +692,7 @@ async function processarWebhook(payload) {
       // pergunta seguir o fluxo normal (interpretacao/busca/agregacao).
       const palavrasUteis = (pergunta || "")
         .split(/\s+/)
-        .filter((w) => w.replace(/[^a-za-u00e0-\u00fc0-9]/gi, "").length >= 3).length;
+        .filter((w) => w.replace(/[^a-z\u00e0-\u00fc0-9]/gi, "").length >= 3).length;
       const pareceNovaPergunta = /\?/.test(pergunta || "") || palavrasUteis >= 3;
 
       // Mensagens curtas de confirmacao/continuacao ("sim", "isso", "pode",
