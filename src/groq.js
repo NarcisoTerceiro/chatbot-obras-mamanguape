@@ -1,69 +1,48 @@
 // ============================================================
-//  groq.js  (nome mantido por compatibilidade - hoje e o modulo de IA)
+//  groq.js  (modulo de IA do chatbot)
 //
-//  ESTRATEGIA DE PROVEDORES:
-//    1. GEMINI (principal) - chamado diretamente pela API do Google.
-//       Gratis, rapido e de alta qualidade.
-//    2. OMNIROUTE (fallback) - gateway open-source que roteia para
-//       270+ provedores automaticamente (Groq, OpenRouter, DeepSeek,
-//       Kimi, etc.). Assume quando o Gemini bate o limite de cota (429)
-//       ou retorna erro. O cidadao nunca percebe a troca.
+//  ESTRATEGIA DE PROVEDORES (com fallback automatico):
+//    1. GEMINI (principal) - API do Google AI Studio. Gratis e de boa
+//       qualidade. Usado primeiro em toda pergunta.
+//    2. GROQ (reserva) - assume automaticamente quando o Gemini bate o
+//       limite de cota (429) ou falha. O cidadao nao percebe a troca.
+//
+//  Quando um provedor bate o limite, ele fica de "descanso" por alguns
+//  minutos: o sistema pula ele e usa o outro como principal, sem perder
+//  tempo tentando o que esta bloqueado. Depois do descanso, volta a tentar.
 //
 //  Configuracao (variaveis de ambiente no Render / .env):
-//    GEMINI_API_KEY   -> chave do Google AI Studio (OBRIGATORIO)
-//    GEMINI_MODEL     -> opcional (padrao: gemini-2.5-flash)
-//    OMNIROUTE_URL    -> URL do OmniRoute (ex: http://localhost:4000/v1
-//                        ou https://SEU-OMNIROUTE.onrender.com/v1)
-//    OMNIROUTE_KEY    -> chave do OmniRoute (opcional, se configurou auth)
-//    OMNIROUTE_MODEL  -> modelo preferido no OmniRoute (padrao: gemini-2.5-flash)
-//                        O OmniRoute faz fallback automatico se esse modelo
-//                        tambem estiver sem cota.
-//
-//  Como instalar o OmniRoute (uma vez):
-//    npx omniroute   (requer Node >= 22)
-//  Ou via Docker:
-//    docker run -p 4000:4000 diegosouzapw/omniroute
-//  Repositorio: https://github.com/diegosouzapw/OmniRoute
+//    GEMINI_API_KEY -> chave do Google AI Studio (aistudio.google.com/apikey)
+//    GEMINI_MODEL   -> opcional (padrao: gemini-flash-latest)
+//    GROQ_API_KEY   -> chave do Groq (console.groq.com/keys)
+//    GROQ_MODEL     -> opcional (padrao: openai/gpt-oss-120b)
 // ============================================================
 
-// --- Provedor 1: Gemini direto ---
-const GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
-const GEMINI_KEY  = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+// --- Provedor 1: Gemini (principal) ---
+const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+const GEMINI_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
 
-// --- Provedor 2: OmniRoute (fallback) ---
-const OMNIROUTE_URL   = process.env.OMNIROUTE_URL
-  ? process.env.OMNIROUTE_URL.replace(/\/$/, "") + "/chat/completions"
-  : null;
-const OMNIROUTE_KEY   = process.env.OMNIROUTE_KEY || "omniroute"; // valor padrao se sem auth
-const OMNIROUTE_MODEL = process.env.OMNIROUTE_MODEL || "gemini-2.5-flash";
+// --- Provedor 2: Groq (reserva) ---
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 
-// Lista de provedores na ordem de tentativa.
-// O sistema tenta cada um em sequencia; se um bater limite ou falhar, passa pro proximo.
+// Lista de provedores, na ordem de tentativa. Se um falhar ou bater limite,
+// o sistema passa para o proximo automaticamente.
 const PROVEDORES = [];
 
 if (GEMINI_KEY) {
-  PROVEDORES.push({
-    nome: "gemini",
-    url: GEMINI_URL,
-    key: GEMINI_KEY,
-    model: GEMINI_MODEL,
-  });
+  PROVEDORES.push({ nome: "gemini", url: GEMINI_URL, key: GEMINI_KEY, model: GEMINI_MODEL });
 }
 
-if (OMNIROUTE_URL) {
-  PROVEDORES.push({
-    nome: "omniroute",
-    url: OMNIROUTE_URL,
-    key: OMNIROUTE_KEY,
-    model: OMNIROUTE_MODEL,
-  });
+if (GROQ_KEY) {
+  PROVEDORES.push({ nome: "groq", url: GROQ_URL, key: GROQ_KEY, model: GROQ_MODEL });
 }
 
 if (PROVEDORES.length === 0) {
   console.warn(
-    "AVISO: Nenhum provedor de IA configurado. " +
-    "Defina GEMINI_API_KEY e/ou OMNIROUTE_URL no .env."
+    "AVISO: Nenhum provedor de IA configurado. Defina GEMINI_API_KEY e/ou GROQ_API_KEY no .env."
   );
 }
 
@@ -88,7 +67,7 @@ const OPERACOES_VALIDAS = new Set([
 // ------------------------------------------------------------
 //  Funcao auxiliar generica pra chamar a IA.
 // ------------------------------------------------------------
-// Tenta cada provedor na ordem: Gemini (principal) -> OmniRoute (fallback).
+// Tenta cada provedor na ordem: Gemini (principal) -> Groq (reserva).
 // O "body" NAO deve conter "model": ele e definido aqui conforme o provedor.
 // Quando um provedor bate o limite (429) ou falha, entra de "descanso" por
 // 5 minutos: o sistema pula ele e usa o proximo direto - sem tentar de novo
@@ -136,8 +115,7 @@ async function chamarIA(body) {
       if (!texto) throw new Error(`${prov.nome} devolveu resposta vazia`);
       // Respondeu com sucesso: se estava de descanso, tira do descanso.
       provedorDescansando.delete(prov.nome);
-      const via = prov.nome === "omniroute" ? "OmniRoute (fallback)" : "Gemini (principal)";
-      console.log(`DEBUG IA usada: ${via} | modelo: ${prov.model}`);
+      console.log(`DEBUG IA usada: ${prov.nome} (modelo ${prov.model})`);
       return texto;
     } catch (e) {
       console.error(`IA (${prov.nome}) falhou:`, e.message);
@@ -171,184 +149,58 @@ function prepararHistorico(historico) {
 //  PARTE 1 - INTERPRETACAO (com memoria da conversa)
 // ============================================================
 
-const SYSTEM_PROMPT_INTERPRETAR = `Voce interpreta perguntas de cidadaos sobre obras publicas
-de uma prefeitura, enviadas por WhatsApp de forma informal, formal, com girias,
-abreviacoes ou erros de digitacao.
+const SYSTEM_PROMPT_INTERPRETAR = `Voce interpreta a pergunta de um cidadao sobre obras
+publicas de uma prefeitura (WhatsApp, linguagem informal, com girias e erros de
+digitacao) e devolve um JSON dizendo o que o sistema deve fazer.
 
-PRINCIPIOS (siga sempre):
-0. ACOMPANHAMENTO: a pessoa pode se referir ao RESULTADO ANTERIOR (o grupo de
-   obras que voce acabou de mostrar), com qualquer jeito de falar - nao so as
-   palavras classicas "essas/dessas/delas", mas tambem "cada uma", "a de cima",
-   "todas elas", "o mesmo grupo", ou ate sem nenhum pronome explicito, quando o
-   sentido da frase claramente continua o assunto anterior. Julgue pelo SENTIDO
-   da conversa, nao por uma lista fixa de palavras.
-   Quando a pergunta se referir ao resultado anterior, marque
-   "usar_contexto":true e monte a operacao para ser aplicada sobre essas
-   mesmas obras (o sistema ja aplica automaticamente nas obras do contexto,
-   voce so precisa da receita/operacao, sem repetir os filtros da pergunta
-   anterior). Ex.: apos listar obras em licitacao, "liste com o nome do
-   engenheiro" ->
-   {"tipo":"agregacao","termos":[],"usar_contexto":true,"receita":{"filtros":[],"agregacao":{"tipo":"listar","campo":"ENGENHEIRO"}}}
-   "e o valor de cada uma?" -> listar com campo do valor, "usar_contexto":true.
-   "quantas dessas estao paradas?" -> contar com filtro de status,
-   "usar_contexto":true.
-   Se a pergunta for sobre a base inteira (novo assunto, sem relacao com o que
-   foi mostrado), marque "usar_contexto":false.
-1. Foque no que a pessoa REALMENTE quer, nao nas palavras exatas. "ta pronta a
-   creche?", "a creche ja acabou?" e "situacao da creche" pedem a mesma coisa.
-2. Entenda a mesma pergunta escrita de varios jeitos (formal, informal, com erro).
-3. Na duvida entre dois tipos, escolha o mais especifico que caiba. Ex.: se cita
-   o nome de uma pessoa como responsavel, e "engenheiro"; se pede um total/quantos,
-   e "agregacao"; caso contrario, "busca".
-4. So classifique como "saudacao" se NAO houver nenhum pedido de informacao junto.
-5. Extraia termos que DISTINGUEM a obra (bairro, tipo, nome), nunca palavras vazias.
-6. Responda SEMPRE com um JSON valido e completo - nunca texto solto.
+Voce recebe o historico recente + a mensagem atual. Use o historico para entender
+referencias ("e o prazo?", "quanto custou?" = a mesma obra ja tratada).
 
+Responda SEMPRE com um unico JSON valido, neste formato:
+{"tipo":"...","termos":[...],"detalhe":"resumido"|"completo","operacao":"","filtro_status":"","pista_valor":"","receita":null,"usar_contexto":false}
 
-Voce recebe o HISTORICO recente da conversa seguido da mensagem atual. USE o
-historico para resolver referencias: se a pessoa disser "e o prazo?", "quanto
-custou?", "e a empresa?" ou "essa mesma", ela fala da MESMA obra ja tratada -
-gere termos coerentes com esse contexto (repetindo o nome/bairro da obra que
-estava em pauta).
+TIPO (escolha um):
+- "saudacao": so cumprimento/agradecimento/despedida, sem pedido de info ("oi", "obrigado", "tchau").
+- "listagem": pedido generico da lista de obras ("quais obras existem", "o que esta sendo feito").
+- "agregacao": exige conta ou comparacao ("mais cara", "quantas paralisadas", "total gasto", "media", "segunda maior", "top 3", "quantas por bairro").
+- "engenheiro": listar obras de um responsavel ("obras do engenheiro Carlos"). Em "termos", so o nome da pessoa.
+- "busca": qualquer pergunta sobre uma obra ou grupo especifico (bairro, rua, tipo, nome, empresa).
 
-Classifique a mensagem em um destes TIPOS:
+TERMOS: palavras que DISTINGUEM a obra (bairro, tipo, nome). Nunca palavras vazias nem o nome da cidade.
 
-- "saudacao": cumprimento, agradecimento ou despedida sem pedido de informacao
-  (ex: "oi", "bom dia", "obrigado", "valeu", "tchau").
-- "listagem": pedido generico da lista de obras (ex: "quais obras existem",
-  "me mostra as obras", "o que ta sendo feito na cidade").
-- "agregacao": pergunta que exige CONTA ou COMPARACAO sobre o conjunto de obras
-  (ex: "qual a obra mais cara?", "quantas obras estao paralisadas?", "quanto
-  foi gasto no total?", "quantas obras tem?").
-- "engenheiro": pedido para LISTAR/VER as obras de um ENGENHEIRO ou responsavel
-  especifico (ex: "obras do engenheiro Carlos", "o que o Paulo Nunes toca",
-  "obras da arquiteta Ana"). Coloque em "termos" APENAS o nome da pessoa
-  (ex: ["Carlos"]). NAO use este tipo se a pergunta pede uma CONTAGEM ("quantas
-  obras tem/teve", "quantos projetos") - nesse caso use "agregacao" (veja abaixo),
-  porque "engenheiro" so lista, nao calcula um numero.
-- "busca": qualquer pergunta sobre uma obra ou grupo de obras especifico
-  (por bairro, rua, tipo, nome, empresa).
+DETALHE: "resumido" para perguntas diretas; "completo" quando a pessoa quer tudo sobre a obra.
 
-Quando o tipo for "agregacao", escolha a "operacao":
-- "maior_valor"  -> obra mais cara / de maior valor
-- "menor_valor"  -> obra mais barata / de menor valor
-- "soma_valor"   -> total investido / quanto foi gasto somando
-- "media_valor"  -> valor medio das obras
-- "contar_por_status" -> quantas obras estao em determinada situacao. Nesse caso
-  preencha "filtro_status" com o status citado (ex: "paralisada", "concluida",
-  "em andamento"). Se a pessoa pedir a contagem geral por situacao, deixe
-  "filtro_status" vazio.
-- "contar_total" -> quantas obras existem no total
+USAR_CONTEXTO: coloque true quando a pergunta se refere ao resultado que voce acabou de
+mostrar ("liste essas com o engenheiro", "quantas dessas estao paradas", "e o valor de cada uma").
+Nesse caso NAO repita os filtros anteriores - o sistema aplica sobre as obras ja mostradas.
+Se for um assunto novo, deixe false.
 
-Alem das operacoes acima, para perguntas de agregacao MAIS COMPLEXAS (com
-filtros combinados, comparacoes por valor, por empresa, por engenheiro, etc.),
-voce PODE montar uma RECEITA generica no campo "receita", assim:
-  "receita": {
-    "filtros": [
-      { "campo": "BAIRRO", "operador": "igual", "valor": "Centro" },
-      { "campo": "VALOR TOTAL DA OBRA", "operador": "maior_que", "valor": 500000 }
-    ],
-    "agregacao": { "tipo": "somar", "campo": "VALOR TOTAL DA OBRA" }
-  }
-Operadores validos: igual, diferente, contem, maior_que, menor_que, entre.
-Tipos de agregacao: contar, somar, media, maior, menor, listar, top, ordinal,
-contar_por.
-- "top": as N obras de MAIOR VALOR EM DINHEIRO (nunca use para contar quem tem
-  mais obras - isso e "contar_por" com "top", veja mais abaixo). Use "n": 3
-  (ou o numero pedido). Para as
-  menores, use tipo "menores". Ex.: "top 3 obras mais caras" ->
-  {"agregacao":{"tipo":"top","n":3,"campo":"VALOR TOTAL DA OBRA"}}
-- "ordinal": a N-esima obra por valor. Use "posicao": 2 para "segunda", 3 para
-  "terceira". Para menor, use tipo "ordinal_menor". Ex.: "segunda obra mais
-  cara" -> {"agregacao":{"tipo":"ordinal","posicao":2,"campo":"VALOR TOTAL DA OBRA"}}
-- "contar_por": quantas obras em cada grupo. Ex.: "quantas obras por bairro" ->
-  {"agregacao":{"tipo":"contar_por","campo":"BAIRRO"}}
-  Se a pergunta pedir so QUEM TEM MAIS/MENOS de um campo de TEXTO (engenheiro,
-  bairro, empresa, status - nao e um valor em dinheiro), use "contar_por" com
-  "top" (NUNCA use "top"/"ordinal" sozinho aqui - esses sao so para VALOR em
-  dinheiro). Ex.: "qual engenheiro tem mais obras?" ->
-  {"agregacao":{"tipo":"contar_por","campo":"ENGENHEIRO","top":1}}
-  "quais 3 bairros tem mais obras?" ->
-  {"agregacao":{"tipo":"contar_por","campo":"BAIRRO","top":3}}
-  "qual empresa tem menos obras?" ->
-  {"agregacao":{"tipo":"contar_por","campo":"EMPRESA","top":1,"ordem":"asc"}}
-Use nomes de coluna reais da planilha (BAIRRO, STATUS, EMPRESA, ENGENHEIRO,
-VALOR TOTAL DA OBRA, OBJETO DA OBRA...). Prefira a "receita" quando a pergunta
-combina condicoes (ex.: "obras da Construtora Ativa acima de 500 mil", "qual
-engenheiro tem mais obras concluidas", "media das escolas do centro").
-Quando usar "receita", ainda coloque "tipo":"agregacao".
-Se a pessoa pedir UM CAMPO especifico DE CADA obra, EM PARES obra+campo (ex.:
-"nome dos engenheiros de cada obra", "o status de todas", "a empresa de cada
-obra"), use tipo "agregacao" com uma receita de listar apontando o campo:
-  {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","receita":{"filtros":[],"agregacao":{"tipo":"listar","campo":"ENGENHEIRO"}}}
-Troque "ENGENHEIRO" pela coluna pedida (STATUS, EMPRESA, BAIRRO, etc.). Se houver
-recorte (ex.: "engenheiros das obras do centro"), adicione o filtro do bairro.
+AGREGACAO - quando tipo="agregacao", preencha a "receita" descrevendo o calculo:
+  "receita": { "filtros": [ {"campo":"BAIRRO","operador":"igual","valor":"Centro"} ],
+               "agregacao": {"tipo":"somar","campo":"VALOR TOTAL DA OBRA"} }
+- Operadores: igual, diferente, contem, maior_que, menor_que, entre.
+- Tipos de agregacao:
+  - "somar" / "media" / "contar": soma, media ou contagem (use "campo" para somar/mediar valor).
+  - "maior" / "menor": a obra de maior/menor valor.
+  - "top": as N obras de maior valor em dinheiro. Use "n":3. Para menores, "menores".
+  - "ordinal": a N-esima por valor. Use "posicao":2 (segunda), 3 (terceira).
+  - "listar" com "campo": mostra esse campo de cada obra ("engenheiro de cada obra" -> campo "ENGENHEIRO").
+  - "contar_por" com "campo": quantas por grupo ("quantas por bairro" -> campo "BAIRRO").
+    Para "quem tem mais/menos" de um campo de texto (engenheiro/bairro/empresa), use
+    "contar_por" com "top":1 (mais) ou "top":1,"ordem":"asc" (menos).
+Colunas reais: BAIRRO, STATUS, EMPRESA, ENGENHEIRO, VALOR TOTAL DA OBRA, OBJETO DA OBRA.
 
-MUITO IMPORTANTE - nao confunda os TRES casos parecidos:
-(a) "campo X de CADA obra", em pares obra+valor (sem condicao) -> "listar" com
-    campo. Ex.: "os engenheiros de cada obra", "o status de todas".
-(b) SO os valores distintos de um campo, SEM repetir por obra - a pessoa pede
-    "so os nomes", "so a lista", "sem repetir", ou faz essa pergunta LOGO DEPOIS
-    de voce ja ter mostrado o campo em pares (ela quer o mesmo campo, mas
-    enxuto) -> use "contar_por" com esse campo (ele ja agrupa e nao repete):
-    "liste so os nomes dos engenheiros" ->
-    {"tipo":"agregacao","termos":[],...,"receita":{"filtros":[],"agregacao":{"tipo":"contar_por","campo":"ENGENHEIRO"}}}
-    "quais bairros tem obra", "lista as empresas responsaveis" -> mesma logica
-    (campo BAIRRO ou EMPRESA). NUNCA repita "listar" com o mesmo campo que voce
-    acabou de usar quando a pessoa pedir algo "mais enxuto" ou "so os nomes" -
-    isso devolveria a MESMA resposta de novo, o que e um erro.
-(c) pergunta com CONDICOES/FILTROS (empresa, valor, status, bairro) -> use
-    filtros e a agregacao adequada (contar/somar/listar), NUNCA listar-campo com
-    o nome da obra. Ex.: "obras da Construtora Ativa acima de 500 mil" ->
-    {"tipo":"agregacao","termos":[],...,"receita":{"filtros":[{"campo":"EMPRESA","operador":"contem","valor":"Ativa"},{"campo":"VALOR TOTAL DA OBRA","operador":"maior_que","valor":500000}],"agregacao":{"tipo":"listar"}}}
-    (sem "campo" na agregacao: assim ele lista as obras que passam no filtro).
-Nunca use "campo":"OBJETO DA OBRA" numa agregacao listar - isso repete o nome.
+Deixe "operacao", "filtro_status" e "pista_valor" como "" (o sistema usa a receita).
 
-CONTAGEM sobre UMA pessoa/empresa especifica ("quantas obras tem/teve o
-engenheiro X", "quantos projetos a empresa Y fez"): NUNCA use tipo "engenheiro"
-aqui (ele nao conta, so lista). Use "agregacao" com receita: filtro pelo nome
-(operador "contem", que tolera nome parcial ou digitado com pequeno erro) e
-agregacao "contar":
-  "quantas obras a engenheira Marina Costa tem?" ->
-  {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","receita":{"filtros":[{"campo":"ENGENHEIRO","operador":"contem","valor":"Marina Costa"}],"agregacao":{"tipo":"contar"}}}
-Se a agregacao for limitada a um RECORTE (ex: "quanto foi investido no Centro",
-"media das escolas", "total gasto em pavimentacao"), coloque o recorte em
-"termos" (ex: ["centro"], ["escola"], ["pavimentacao"]). O sistema filtra por
-esses termos ANTES de calcular.
-Se a pergunta indicar QUAL valor usar (ex: "valor inicial", "executado", "pago",
-"aditivo"), coloque a pista em "pista_valor". Senao, deixe vazio (usa o total).
-
-Para "busca" e "agregacao" com recorte, extraia em "termos" as palavras que
-realmente identificam a obra (bairro, rua, tipo, nome, empresa), normalizando
-girias e sinonimos para o vocabulario de obras publicas:
-"asfalto"/"asfaltamento" -> "pavimentacao"; "colegio" -> "escola";
-"postinho"/"posto" -> "UBS" ou "posto de saude"; "pracinha" -> "praca";
-"quadra" -> "quadra poliesportiva"; "creche" -> "creche".
-NAO coloque em "termos" palavras genericas como "obra", "valor", "prazo",
-"situacao" - elas nao ajudam a localizar a obra.
-NAO coloque o nome da cidade ("Mamanguape") sozinho como termo: quase toda obra
-fica em Mamanguape, entao isso nao distingue nada. Use o NOME/tipo da obra e o
-BAIRRO especifico. Ex.: em "praca de lazer em Nova Mamanguape", os termos uteis
-sao "praca de lazer" e "nova" (o bairro Nova Mamanguape) - nao "mamanguape".
-Se a mensagem for vaga demais e nao houver contexto ("e aquela obra ali?"),
-devolva "termos" como lista vazia - o sistema vai pedir mais detalhes.
-
-Decida o NIVEL DE DETALHE:
-- "resumido": pede so nomes ou uma lista rapida, sem detalhes especificos.
-- "completo": pede detalhes especificos (valor, empresa, status, prazo,
-  engenheiro, percentual executado) ou pergunta sobre uma obra so.
-
-Responda SOMENTE com um JSON valido, sem texto antes ou depois:
-{"tipo":"busca"|"saudacao"|"listagem"|"agregacao"|"engenheiro","termos":["termo1"],"detalhe":"resumido"|"completo","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":null}
-
-Deixe "operacao", "filtro_status" e "pista_valor" vazios quando nao se aplicarem.
-
-Exemplos:
-"bom dia" -> {"tipo":"saudacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":""}
-"quais obras tem?" -> {"tipo":"listagem","termos":[],"detalhe":"resumido","operacao":"","filtro_status":""}
-"quanto custou o asfalto do centro?" -> {"tipo":"busca","termos":["pavimentacao","centro"],"detalhe":"completo","operacao":"","filtro_status":""}
-"qual a obra mais cara?" -> {"tipo":"agregacao","termos":[],"detalhe":"completo","operacao":"maior_valor","filtro_status":""}
-"quantas estao paradas?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"contar_por_status","filtro_status":"paralisada"}\n"obras do engenheiro Carlos" -> {"tipo":"engenheiro","termos":["Carlos"],"detalhe":"resumido","operacao":"","filtro_status":""}\n"quanto foi investido no centro?" -> {"tipo":"agregacao","termos":["centro"],"detalhe":"resumido","operacao":"soma_valor","filtro_status":"","pista_valor":""}\n"media de valor das escolas?" -> {"tipo":"agregacao","termos":["escola"],"detalhe":"resumido","operacao":"media_valor","filtro_status":"","pista_valor":""}`;
+EXEMPLOS:
+"oi" -> {"tipo":"saudacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","receita":null,"usar_contexto":false}
+"obras no centro" -> {"tipo":"busca","termos":["centro"],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","receita":null,"usar_contexto":false}
+"qual a obra mais cara?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","receita":{"filtros":[],"agregacao":{"tipo":"maior","campo":"VALOR TOTAL DA OBRA"}},"usar_contexto":false}
+"segunda obra mais cara?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","receita":{"filtros":[],"agregacao":{"tipo":"ordinal","posicao":2,"campo":"VALOR TOTAL DA OBRA"}},"usar_contexto":false}
+"quanto foi investido no centro?" -> {"tipo":"agregacao","termos":["centro"],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","receita":{"filtros":[{"campo":"BAIRRO","operador":"igual","valor":"Centro"}],"agregacao":{"tipo":"somar","campo":"VALOR TOTAL DA OBRA"}},"usar_contexto":false}
+"quantas obras por bairro" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","receita":{"filtros":[],"agregacao":{"tipo":"contar_por","campo":"BAIRRO"}},"usar_contexto":false}
+"obras do engenheiro Carlos" -> {"tipo":"engenheiro","termos":["Carlos"],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","receita":null,"usar_contexto":false}
+"liste essas com o engenheiro" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","receita":{"filtros":[],"agregacao":{"tipo":"listar","campo":"ENGENHEIRO"}},"usar_contexto":true}`;
 
 export async function interpretarPergunta(pergunta, historico = []) {
   const mensagens = [
@@ -612,12 +464,12 @@ export async function redigirResposta(pergunta, obras, detalhe, historico = [], 
 //
 //  NOTA: Code Execution usa o endpoint NATIVO do Gemini (nao o
 //  compativel com OpenAI), entao sempre vai direto ao Google -
-//  sem passar pelo OmniRoute. Se o Gemini estiver sem cota,
+//  diretamente pela API do Google. Se o Gemini estiver sem cota,
 //  esta funcao vai lancar erro e o server.js cai no formatador local.
 // ============================================================
 
 const GEMINI_KEY_CE = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL_CE = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_MODEL_CE = process.env.GEMINI_MODEL || "gemini-flash-latest";
 
 const SYSTEM_PROMPT_CODE_EXEC = `Voce e o assistente de obras publicas da Prefeitura de
 Mamanguape. Voce recebe a pergunta do cidadao e uma lista de obras em JSON.
