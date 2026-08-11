@@ -161,7 +161,7 @@ async function rodarGrupo(nome, itens) {
       console.log(`${c.red}ERRO: ${e.message}${c.reset}`);
     }
     // pausa curta para nao estourar limite de requisicoes por minuto
-    await new Promise((s) => setTimeout(s, 400));
+    await new Promise((s) => setTimeout(s, 3000));
   }
 }
 
@@ -198,7 +198,7 @@ async function main() {
       } catch (e) {
         console.log(`${c.red}ERRO: ${e.message}${c.reset}`);
       }
-      await new Promise((s) => setTimeout(s, 400));
+      await new Promise((s) => setTimeout(s, 3000));
     }
   }
 

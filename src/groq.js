@@ -31,15 +31,24 @@ const GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/openai/cha
 const GEMINI_KEY  = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
-// --- Provedor 2: OmniRoute (fallback) ---
+// --- Provedor 2: Groq (fallback direto) ---
+// OpenAI-compativel: base https://api.groq.com/openai/v1. Entra em acao quando
+// o Gemini bate cota (429) ou falha. Modelo gratuito atual: openai/gpt-oss-120b.
+const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_KEY   = process.env.GROQ_API_KEY;
+const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+
+// --- Provedor 3: OmniRoute (fallback opcional) ---
 const OMNIROUTE_URL   = process.env.OMNIROUTE_URL
   ? process.env.OMNIROUTE_URL.replace(/\/$/, "") + "/chat/completions"
   : null;
 const OMNIROUTE_KEY   = process.env.OMNIROUTE_KEY || "omniroute"; // valor padrao se sem auth
-const OMNIROUTE_MODEL = process.env.OMNIROUTE_MODEL || "gemini-2.5-flash";
+const OMNIROUTE_MODEL = process.env.OMNIROUTE_MODEL || "openai/gpt-oss-120b";
 
 // Lista de provedores na ordem de tentativa.
 // O sistema tenta cada um em sequencia; se um bater limite ou falhar, passa pro proximo.
+// Ordem: Gemini (principal, melhor qualidade) -> Groq (fallback rapido) -> OmniRoute.
+// Quando o Gemini sai do "descanso" de 5 min, ele volta a ser tentado primeiro.
 const PROVEDORES = [];
 
 if (GEMINI_KEY) {
@@ -48,6 +57,15 @@ if (GEMINI_KEY) {
     url: GEMINI_URL,
     key: GEMINI_KEY,
     model: GEMINI_MODEL,
+  });
+}
+
+if (GROQ_KEY) {
+  PROVEDORES.push({
+    nome: "groq",
+    url: GROQ_URL,
+    key: GROQ_KEY,
+    model: GROQ_MODEL,
   });
 }
 
@@ -63,7 +81,7 @@ if (OMNIROUTE_URL) {
 if (PROVEDORES.length === 0) {
   console.warn(
     "AVISO: Nenhum provedor de IA configurado. " +
-    "Defina GEMINI_API_KEY e/ou OMNIROUTE_URL no .env."
+    "Defina GEMINI_API_KEY e/ou GROQ_API_KEY no .env."
   );
 }
 
@@ -115,19 +133,17 @@ async function chamarIA(body) {
     }
 
     try {
-      // GEMINI 3.x (3.5/3.6 flash) NAO aceita alguns parametros antigos e
-      // rejeita a requisicao inteira com 400 "INVALID_ARGUMENT". Removemos os
-      // problematicos ANTES de enviar:
-      //  - reasoning_effort: no 3.x virou "thinking_level" com valores
-      //    diferentes; mandar o antigo da 400. Removido (usa o default do modelo).
-      //  - temperature/top_p/top_k: no 3.x valores customizados nao sao
-      //    suportados (ignorados ou rejeitados). Removidos por seguranca.
-      // O response_format (json_object) continua aceito, entao fica.
+      // Cada provedor aceita parametros diferentes. O GEMINI 3.x (3.5/3.6) NAO
+      // aceita reasoning_effort/temperature/top_p/top_k e rejeita a requisicao
+      // inteira com 400 "INVALID_ARGUMENT". Ja o GROQ (gpt-oss) ACEITA esses
+      // parametros normalmente. Entao so limpamos quando o provedor e o Gemini.
       const corpo = { ...body, model: prov.model };
-      delete corpo.reasoning_effort;
-      delete corpo.temperature;
-      delete corpo.top_p;
-      delete corpo.top_k;
+      if (prov.nome === "gemini") {
+        delete corpo.reasoning_effort;
+        delete corpo.temperature;
+        delete corpo.top_p;
+        delete corpo.top_k;
+      }
 
       const resp = await fetch(prov.url, {
         method: "POST",
