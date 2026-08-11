@@ -36,7 +36,7 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 // o Gemini bate cota (429) ou falha. Modelo gratuito atual: openai/gpt-oss-120b.
 const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_KEY   = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 
 // --- Provedor 3: OmniRoute (fallback opcional) ---
 const OMNIROUTE_URL   = process.env.OMNIROUTE_URL
@@ -133,16 +133,24 @@ async function chamarIA(body) {
     }
 
     try {
-      // Cada provedor aceita parametros diferentes. O GEMINI 3.x (3.5/3.6) NAO
-      // aceita reasoning_effort/temperature/top_p/top_k e rejeita a requisicao
-      // inteira com 400 "INVALID_ARGUMENT". Ja o GROQ (gpt-oss) ACEITA esses
-      // parametros normalmente. Entao so limpamos quando o provedor e o Gemini.
+      // Cada provedor aceita parametros diferentes:
+      //  - GEMINI 3.x (3.5/3.6): NAO aceita reasoning_effort/temperature/top_p/
+      //    top_k e rejeita a requisicao com 400. Removemos todos.
+      //  - GROQ (gpt-oss): aceita temperature, mas reasoning_effort SO pode ser
+      //    "low"|"medium"|"high" (NAO aceita "none"). Se vier "none" ou outro
+      //    valor invalido, removemos o parametro (o modelo usa o default).
       const corpo = { ...body, model: prov.model };
+
       if (prov.nome === "gemini") {
         delete corpo.reasoning_effort;
         delete corpo.temperature;
         delete corpo.top_p;
         delete corpo.top_k;
+      } else if (prov.nome === "groq") {
+        const validos = ["low", "medium", "high"];
+        if (!validos.includes(corpo.reasoning_effort)) {
+          delete corpo.reasoning_effort;
+        }
       }
 
       const resp = await fetch(prov.url, {
