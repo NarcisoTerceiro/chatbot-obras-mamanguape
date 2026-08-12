@@ -359,24 +359,92 @@ function agregarContarTotal(obras) {
 //  Ponto de entrada: executa a operacao pedida.
 //  Retorna { fatos, obras } ou null se nao for possivel calcular.
 // ------------------------------------------------------------
+// Filtra as obras por um status pedido (ex.: "concluida"), tolerando sinonimos
+// e acentos, reaproveitando a mesma logica do contar_por_status. Se o filtro
+// nao casar com nenhum status, tenta casar com a ABA de origem. Se ainda assim
+// nao achar nada, devolve a lista original (melhor somar tudo do que somar nada
+// - e o caso raro de um filtro que nao corresponde a nada).
+function filtrarPorStatus(obras, filtroStatus) {
+  if (!filtroStatus) return obras;
+
+  const alvo = normalize(filtroStatus);
+  const sinonimos = {
+    parada: "paralisada", parado: "paralisada", paradas: "paralisada",
+    parados: "paralisada", pausada: "paralisada", suspensa: "paralisada",
+    pronta: "concluida", prontas: "concluida", finalizada: "concluida",
+    finalizado: "concluida", concluido: "concluida", concluidas: "concluida",
+    concluidos: "concluida", terminada: "concluida", terminado: "concluida",
+    entregue: "concluida", acabada: "concluida",
+    andamento: "andamento", executando: "andamento", tocando: "andamento",
+  };
+  const alvos = new Set([alvo]);
+  if (sinonimos[alvo]) alvos.add(sinonimos[alvo]);
+
+  // 1) Tenta casar pelo campo STATUS de cada obra.
+  //    Para tolerar genero (concluida/concluido) e plural, comparamos tambem
+  //    pela RAIZ: cortamos as 2 ultimas letras de palavras longas (>=6), assim
+  //    "conclu-ida" e "conclu-ido" viram a mesma raiz "conclu".
+  const raiz = (t) => (t.length >= 6 ? t.slice(0, -2) : t);
+  const alvosRaiz = new Set([...alvos].map(raiz));
+
+  const porStatus = obras.filter((o) => {
+    const campo = acharCampoStatus(o);
+    const val = campo ? normalize(o[campo] || "") : "";
+    if (!val) return false;
+    for (const a of alvos) {
+      if (val === a || val.startsWith(a) || val.includes(a) || a.includes(val)) {
+        return true;
+      }
+    }
+    // Casamento por raiz (ignora genero/plural): "concluido" ~ "concluida".
+    const valRaiz = raiz(val);
+    for (const ar of alvosRaiz) {
+      if (ar.length >= 4 && (valRaiz.startsWith(ar) || val.startsWith(ar))) {
+        return true;
+      }
+    }
+    return false;
+  });
+  if (porStatus.length > 0) return porStatus;
+
+  // 2) Nao casou por status: tenta pela ABA de origem (ex.: "licitacao").
+  const limpaAba = (t) => normalize(t).replace(/[_\-]+/g, " ").trim();
+  const alvoAba = limpaAba(filtroStatus);
+  const porAba = obras.filter((o) => {
+    const aba = limpaAba(o._aba || "");
+    return aba && (aba.includes(alvoAba) || alvoAba.includes(aba));
+  });
+  if (porAba.length > 0) return porAba;
+
+  // 3) Nao achou nada: devolve tudo (nao trava a operacao).
+  return obras;
+}
+
 export function executarAgregacao(operacao, obras, opcoes = {}) {
   if (!Array.isArray(obras) || obras.length === 0) return null;
 
   const pista = opcoes.pista_valor || ""; // ex.: "inicial", "executado", "pago"
+  const filtroStatus = opcoes.filtro_status || "";
+
+  // CORRECAO: quando ha filtro_status, as operacoes de valor (soma, media,
+  // maior, menor) devem incidir SO nas obras daquele status - nao na base
+  // inteira. Antes, "valor das concluidas" somava as 66 obras porque o filtro
+  // era ignorado aqui. Agora filtramos primeiro.
+  const alvo = filtroStatus ? filtrarPorStatus(obras, filtroStatus) : obras;
 
   switch (operacao) {
     case "maior_valor":
-      return agregarExtremo(obras, true, pista);
+      return agregarExtremo(alvo, true, pista);
     case "menor_valor":
-      return agregarExtremo(obras, false, pista);
+      return agregarExtremo(alvo, false, pista);
     case "soma_valor":
-      return agregarSoma(obras, pista);
+      return agregarSoma(alvo, pista);
     case "media_valor":
-      return agregarMedia(obras, pista);
+      return agregarMedia(alvo, pista);
     case "contar_por_status":
-      return agregarContarPorStatus(obras, opcoes.filtro_status || "");
+      return agregarContarPorStatus(obras, filtroStatus);
     case "contar_total":
-      return agregarContarTotal(obras);
+      return agregarContarTotal(alvo);
     default:
       return null;
   }
