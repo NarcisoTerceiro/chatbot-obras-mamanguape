@@ -967,17 +967,30 @@ async function processarWebhook(payload) {
           const ehSomaOuMedia = /^(o valor total|a média)/i.test(resultado.fatos || "");
 
           if (ehSomaOuMedia) {
-            // Soma/media: mostra o valor + as obras que entraram na conta,
-            // como LISTA INFORMATIVA (nao pede pra "escolher uma").
-            const BLOCO = 15;
-            const nomes = resultado.obras.slice(0, BLOCO).map(
-              (o) => `• ${campoNome(o)}`
-            );
-            const resto = resultado.obras.length - nomes.length;
-            texto = `${resultado.fatos}\n\nObras consideradas:\n${nomes.join("\n")}`;
-            if (resto > 0) texto += `\n_...e mais ${resto}._`;
+            // Soma/media: o SISTEMA ja calculou o valor exato (em resultado.fatos).
+            // A IA agora REDIGE esse resultado de forma natural, humana - em vez
+            // do texto fixo de sistema que soava robotico. O numero vem do
+            // calculo (exato), so a forma de dizer e da IA. Passamos as obras
+            // consideradas para a IA poder cita-las se fizer sentido.
             obrasParaGuardar = resultado.obras.slice(0, 10);
             falhasParaGuardar = 0;
+            try {
+              texto = await redigirResposta(
+                pergunta,
+                resultado.obras,
+                interpretacao.detalhe,
+                historico,
+                resultado.fatos // valor JA calculado - a IA nao refaz a conta
+              );
+            } catch (e) {
+              // Se a IA falhar, cai no texto do sistema (melhor que nada).
+              console.error("IA de redacao (soma) falhou, usando local:", e.message);
+              const BLOCO = 15;
+              const nomes = resultado.obras.slice(0, BLOCO).map((o) => `• ${campoNome(o)}`);
+              const resto = resultado.obras.length - nomes.length;
+              texto = `${resultado.fatos}\n\nObras consideradas:\n${nomes.join("\n")}`;
+              if (resto > 0) texto += `\n_...e mais ${resto}._`;
+            }
           } else {
             // Contagem por status com a lista COMPLETA em maos. Guardamos todas as
             // obras como opcoes paginaveis: o cidadao pode ver todas (MAIS),

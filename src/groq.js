@@ -245,6 +245,14 @@ Para "agregacao", use "operacao" quando for um caso simples:
   maior_valor | menor_valor | soma_valor | media_valor | contar_total
   contar_por_status (preencha "filtro_status" com o status citado, ou vazio para contagem geral por situacao)
 
+REGRA IMPORTANTE sobre VALOR TOTAL: qualquer pergunta que peca o valor/custo/
+investimento de um CONJUNTO de obras e SEMPRE soma_valor - nao importa como foi
+escrita. Trate como iguais todas estas: "qual o valor investido", "quais os
+valores investidos", "quanto foi investido", "quanto custou tudo", "quanto gastou",
+"deu quanto no total", "soma dos valores", "valor total dessas", "quanto saiu".
+Singular ou plural ("qual valor" / "quais valores") NAO muda nada: as duas sao
+soma_valor. Se a pergunta se refere as obras ja mostradas, marque usar_contexto:true.
+
 Para agregacoes mais complexas (filtros combinados, agrupar/listar por campo, top N),
 use "receita" em vez de "operacao":
   "receita": { "filtros": [ {"campo":"BAIRRO","operador":"igual","valor":"Centro"} ],
@@ -280,6 +288,8 @@ Exemplos:
 "qual a obra mais cara?" -> {"tipo":"agregacao","termos":[],"detalhe":"completo","operacao":"maior_valor","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":null}
 "quantas estao concluidas?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"contar_por_status","filtro_status":"concluida","pista_valor":"","usar_contexto":false,"receita":null}
 "quanto foi o total executado dessas?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"soma_valor","filtro_status":"","pista_valor":"executado","usar_contexto":true,"receita":null}
+"quais os valores investidos nessas obras?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"soma_valor","filtro_status":"","pista_valor":"","usar_contexto":true,"receita":null}
+"quanto custou tudo isso?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"soma_valor","filtro_status":"","pista_valor":"","usar_contexto":true,"receita":null}
 "so os nomes dos engenheiros" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":{"filtros":[],"agregacao":{"tipo":"contar_por","campo":"ENGENHEIRO"}}}
 `;
 
