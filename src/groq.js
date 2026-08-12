@@ -38,11 +38,15 @@ const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_KEY   = process.env.GROQ_API_KEY;
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 
-// --- Provedor 3: OmniRoute (fallback opcional) ---
-const OMNIROUTE_URL   = process.env.OMNIROUTE_URL
+// --- Provedor 3: OmniRoute (DESATIVADO) ---
+// Removido de proposito: nunca teve creditos (dava erro 402 constante) e so
+// poluia os logs. O sistema opera so com Gemini (principal) + Groq (fallback).
+// Para reativar no futuro, defina OMNIROUTE_URL no .env e mude a condicao abaixo.
+const OMNIROUTE_ATIVO = false; // <- mude para true se um dia configurar o OmniRoute
+const OMNIROUTE_URL   = OMNIROUTE_ATIVO && process.env.OMNIROUTE_URL
   ? process.env.OMNIROUTE_URL.replace(/\/$/, "") + "/chat/completions"
   : null;
-const OMNIROUTE_KEY   = process.env.OMNIROUTE_KEY || "omniroute"; // valor padrao se sem auth
+const OMNIROUTE_KEY   = process.env.OMNIROUTE_KEY || "omniroute";
 const OMNIROUTE_MODEL = process.env.OMNIROUTE_MODEL || "openai/gpt-oss-120b";
 
 // Lista de provedores na ordem de tentativa.
@@ -106,12 +110,13 @@ const OPERACOES_VALIDAS = new Set([
 // ------------------------------------------------------------
 //  Funcao auxiliar generica pra chamar a IA.
 // ------------------------------------------------------------
-// Tenta cada provedor na ordem: Gemini (principal) -> OmniRoute (fallback).
+// Tenta cada provedor na ordem: Gemini (principal) -> Groq (fallback).
 // O "body" NAO deve conter "model": ele e definido aqui conforme o provedor.
-// Quando um provedor bate o limite (429) ou falha, entra de "descanso" por
-// 5 minutos: o sistema pula ele e usa o proximo direto - sem tentar de novo
-// a cada mensagem. Apos o descanso, volta a tentar normalmente.
-const DESCANSO_MS = 5 * 60 * 1000; // 5 minutos
+// Quando um provedor bate o limite (429), entra de "descanso" curto: o sistema
+// prefere os outros por um tempo. MAS, se TODOS estiverem descansando, ele ainda
+// tenta o que esta mais perto de voltar - nunca desiste sem ao menos tentar.
+// O limite gratuito do Gemini/Groq e POR MINUTO, entao 60s de descanso basta.
+const DESCANSO_MS = 60 * 1000; // 60 segundos (era 5 min - agressivo demais)
 const provedorDescansando = new Map(); // nome -> timestamp de quando pode voltar
 
 async function chamarIA(body) {
@@ -122,23 +127,30 @@ async function chamarIA(body) {
   let ultimoErro = null;
   const agora = Date.now();
 
+  // Monta a ordem de tentativa: primeiro os que NAO estao descansando (na ordem
+  // normal), depois - como ultimo recurso - os que estao descansando, do que
+  // volta mais cedo para o que volta mais tarde. Assim, mesmo com todos em
+  // descanso, sempre tentamos alguem em vez de falhar direto.
+  const livres = [];
+  const descansando = [];
   for (const prov of PROVEDORES) {
-    // Pula provedores em descanso (bateram limite recentemente).
     const voltaEm = provedorDescansando.get(prov.nome);
     if (voltaEm && agora < voltaEm) {
-      console.log(
-        `DEBUG ${prov.nome} em descanso ainda por ${Math.ceil((voltaEm - agora) / 1000)}s - pulando`
-      );
-      continue;
+      descansando.push({ prov, voltaEm });
+    } else {
+      livres.push(prov);
     }
+  }
+  descansando.sort((a, b) => a.voltaEm - b.voltaEm);
+  const ordem = [...livres, ...descansando.map((d) => d.prov)];
 
+  for (const prov of ordem) {
     try {
       // Cada provedor aceita parametros diferentes:
       //  - GEMINI 3.x (3.5/3.6): NAO aceita reasoning_effort/temperature/top_p/
       //    top_k e rejeita a requisicao com 400. Removemos todos.
-      //  - GROQ (gpt-oss): aceita temperature, mas reasoning_effort SO pode ser
-      //    "low"|"medium"|"high" (NAO aceita "none"). Se vier "none" ou outro
-      //    valor invalido, removemos o parametro (o modelo usa o default).
+      //  - GROQ: aceita temperature, mas reasoning_effort SO pode ser
+      //    "low"|"medium"|"high". Se vier "none"/invalido, removemos.
       const corpo = { ...body, model: prov.model };
 
       if (prov.nome === "gemini") {
@@ -172,21 +184,20 @@ async function chamarIA(body) {
       const data = await resp.json();
       const texto = data.choices?.[0]?.message?.content?.trim() || "";
       if (!texto) throw new Error(`${prov.nome} devolveu resposta vazia`);
-      // Respondeu com sucesso: se estava de descanso, tira do descanso.
+      // Sucesso: tira do descanso e loga qual provedor respondeu de verdade.
       provedorDescansando.delete(prov.nome);
-      const via = prov.nome === "omniroute" ? "OmniRoute (fallback)" : "Gemini (principal)";
+      const via = prov.nome === "gemini" ? "Gemini (principal)" : "Groq (fallback)";
       console.log(`DEBUG IA usada: ${via} | modelo: ${prov.model}`);
       return texto;
     } catch (e) {
       console.error(`IA (${prov.nome}) falhou:`, e.message);
       ultimoErro = e;
-      // 429 = limite de cota: poe esse provedor de descanso, evitando
-      // tentar ele de novo nas proximas mensagens ate o tempo passar.
+      // 429 = limite de cota: poe de descanso curto (o proximo assume).
       if (e.status === 429) {
         provedorDescansando.set(prov.nome, Date.now() + DESCANSO_MS);
-        console.log(`DEBUG ${prov.nome} atingiu limite - descansando ${DESCANSO_MS / 60000} min`);
+        console.log(`DEBUG ${prov.nome} bateu limite - descanso de ${DESCANSO_MS / 1000}s`);
       }
-      // tenta o proximo provedor da lista
+      // tenta o proximo provedor
     }
   }
 
