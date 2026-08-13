@@ -271,41 +271,46 @@ function agregarContarPorStatus(obras, filtroStatus) {
     const alvos = new Set([alvo]);
     if (sinonimos[alvo]) alvos.add(sinonimos[alvo]);
 
-    // Prioridade de casamento: 1) EXATO ("em andamento" == "Em andamento"),
-    // 2) o status COMECA com o alvo, 3) o status CONTEM o alvo. Sem isso,
-    // "em andamento" casaria com "Habilitacao em andamento" por vir primeiro.
-    let achou = null;
-    for (const nivel of ["exato", "comeca", "contem"]) {
-      for (const [chave, qtd] of contagem) {
-        const n = normalize(chave);
-        for (const a of alvos) {
-          const bate =
-            nivel === "exato" ? n === a :
-            nivel === "comeca" ? n.startsWith(a) :
-            (n.includes(a) || a.includes(n));
-          if (bate) {
-            achou = { chave, qtd };
-            break;
-          }
-        }
-        if (achou) break;
+    // Prioridade de casamento: 1) EXATO, 2) COMECA com o alvo, 3) CONTEM.
+    // MAS agora juntamos TODOS os status equivalentes (ex.: "Concluído" +
+    // "Concluída" = concluida), em vez de pegar so o primeiro. Antes, perguntar
+    // "concluidas" achava so as "Concluída" (fem.) e ignorava as "Concluído"
+    // (masc.) - contando de menos. A raiz (corta 2 letras) une os generos.
+    const raiz = (t) => (t.length >= 6 ? t.slice(0, -2) : t);
+    const alvosRaiz = new Set([...alvos].map(raiz));
+
+    const chavesQueBatem = [];
+    for (const [chave] of contagem) {
+      const n = normalize(chave);
+      const nRaiz = raiz(n);
+      let bate = false;
+      for (const a of alvos) {
+        if (n === a || n.startsWith(a) || n.includes(a) || a.includes(n)) { bate = true; break; }
       }
-      if (achou) break;
+      if (!bate) {
+        for (const ar of alvosRaiz) {
+          if (ar.length >= 4 && (nRaiz.startsWith(ar) || n.startsWith(ar))) { bate = true; break; }
+        }
+      }
+      if (bate) chavesQueBatem.push(chave);
     }
-    if (achou) {
-      // Devolve TODAS as obras daquele status (nao so 3), para que o sistema
-      // possa listar por completo se a pessoa pedir.
+
+    if (chavesQueBatem.length > 0) {
+      // Junta TODAS as obras de TODOS os status equivalentes.
       const doStatus = obras.filter((o) => {
         const campo = acharCampoStatus(o);
-        return campo && (o[campo] || "").trim() === achou.chave;
+        const v = campo ? (o[campo] || "").trim() : "";
+        return v && chavesQueBatem.includes(v);
       });
+      // Rotulo amigavel: usa a forma que a pessoa pediu, capitalizada.
+      const rotulo = filtroStatus.charAt(0).toUpperCase() + filtroStatus.slice(1).toLowerCase();
       return {
-        fatos: `Existem ${achou.qtd} obra(s) com status "${achou.chave}".`,
+        fatos: `Existem ${doStatus.length} obra(s) com status "${rotulo}".`,
         obras: doStatus,
-        // marca que "obras" e a lista COMPLETA do filtro (nao apenas exemplos)
         listaCompleta: true,
       };
     }
+    let achou = null; // (mantido para nao quebrar o fluxo abaixo)
     // O filtro nao casou com nenhum STATUS. Antes de dizer que nao existe,
     // tenta casar com a ABA de origem (_aba): "licitacao" -> EM_LICITACAO,
     // "projeto" -> EM_PROJETO, "pavimentacao" -> PAVIMENTACAO etc.
