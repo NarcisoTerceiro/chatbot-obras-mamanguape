@@ -236,38 +236,37 @@ Se for assunto novo sobre a base inteira, "usar_contexto":false.
 
 TIPOS possiveis:
 - "saudacao": so cumprimento/agradecimento, SEM pedido de informacao ("oi", "bom dia", "valeu").
-- "listagem": pedido generico da lista de obras ("quais obras existem", "me mostra as obras").
+- "listagem": pedido generico da lista de obras, SEM citar bairro/nome/tipo
+  especifico ("quais obras existem", "me mostra as obras", "o que ta sendo feito
+  na cidade", "quais obras tem", "o que ta rolando de obra", "que obras a
+  prefeitura ta tocando"). Se NAO menciona um lugar/obra especifica, e listagem.
 - "agregacao": exige CONTA ou COMPARACAO ("mais cara", "quantas concluidas", "total gasto", "quantas por bairro").
 - "engenheiro": listar obras de um responsavel especifico ("obras do engenheiro Carlos") - poe SO o nome em "termos". (Se pedir CONTAGEM de obras de alguem, e "agregacao", nao "engenheiro".)
 - "busca": qualquer pergunta sobre uma obra/grupo especifico (bairro, rua, tipo, nome, empresa).
 
-Para "agregacao", use "operacao" quando for um caso simples:
+Para "agregacao", use "operacao":
   maior_valor | menor_valor | soma_valor | media_valor | contar_total
-  contar_por_status (preencha "filtro_status" com o status citado, ou vazio para contagem geral por situacao)
+  contar_por_status (preencha "filtro_status" com o status citado, ou vazio para contagem geral)
 
-REGRA IMPORTANTE sobre VALOR TOTAL: qualquer pergunta que peca o valor/custo/
-investimento de um CONJUNTO de obras e SEMPRE soma_valor - nao importa como foi
-escrita. Trate como iguais todas estas: "qual o valor investido", "quais os
-valores investidos", "quanto foi investido", "quanto custou tudo", "quanto gastou",
-"deu quanto no total", "soma dos valores", "valor total dessas", "quanto saiu".
-Singular ou plural ("qual valor" / "quais valores") NAO muda nada: as duas sao
-soma_valor. Se a pergunta se refere as obras ja mostradas, marque usar_contexto:true.
+REGRA sobre VALOR TOTAL: qualquer pergunta pedindo o valor/custo/investimento de
+um CONJUNTO de obras e SEMPRE soma_valor - nao importa como foi escrita. Trate
+como iguais: "qual o valor investido", "quais os valores", "quanto foi investido",
+"quanto custou tudo", "quanto gastou", "deu quanto no total", "soma dos valores".
+Singular ou plural NAO muda: as duas sao soma_valor. Se refere as obras ja
+mostradas, marque usar_contexto:true.
 
-Para agregacoes mais complexas (filtros combinados, agrupar/listar por campo, top N),
-use "receita" em vez de "operacao":
-  "receita": { "filtros": [ {"campo":"BAIRRO","operador":"igual","valor":"Centro"} ],
-               "agregacao": { "tipo":"contar_por", "campo":"ENGENHEIRO" } }
-  Operadores: igual, diferente, contem, maior_que, menor_que, entre.
-  Tipos de agregacao: contar, somar, media, maior, menor, listar, top, ordinal, contar_por.
-  Colunas reais: BAIRRO, STATUS, EMPRESA, ENGENHEIRO, VALOR TOTAL DA OBRA, OBJETO DA OBRA.
-  - "quantas obras por bairro" -> contar_por campo BAIRRO
-  - "qual engenheiro tem mais obras" -> contar_por campo ENGENHEIRO, "top":1
-  - "so os nomes dos engenheiros" / "quais empresas" / "quais bairros" -> contar_por
-    do campo pedido (ele agrupa sem repetir). NUNCA use listar com o mesmo campo so
-    para repetir a lista - isso e erro.
-  - "top 3 mais caras" -> {"tipo":"top","n":3,"campo":"VALOR TOTAL DA OBRA"}
-  - "obras da Construtora X acima de 500 mil" -> filtros (EMPRESA contem X, VALOR maior_que 500000) + agregacao listar (sem campo).
-  Quando usar "receita", mantenha "tipo":"agregacao".
+Para "listar nomes sem repetir" (ex.: "so os nomes dos engenheiros", "quais
+empresas", "quais bairros tem obra"), use "receita" com contar_por:
+  "receita": { "filtros": [], "agregacao": { "tipo":"contar_por", "campo":"ENGENHEIRO" } }
+  Campos possiveis: ENGENHEIRO, EMPRESA, BAIRRO, STATUS.
+  Isso agrupa sem repetir a ficha da obra.
+
+Para "liste cada obra com seu X" (ex.: "quais engenheiros dessas obras", "liste
+cada obra com o valor", "cada uma com o engenheiro", "o valor de cada obra"), use
+"receita" com listar + campo - mostra cada obra e o valor daquele campo:
+  "receita": { "filtros": [], "agregacao": { "tipo":"listar", "campo":"ENGENHEIRO" } }
+  Campo pode ser: ENGENHEIRO, EMPRESA, VALOR TOTAL DA OBRA, BAIRRO, STATUS.
+  Se a pergunta se refere as obras ja mostradas, marque usar_contexto:true.
 
 Em "termos" (para busca e agregacao com recorte), coloque so o que IDENTIFICA a
 obra (bairro, rua, tipo, nome, empresa), normalizando girias: asfalto->pavimentacao,
@@ -284,6 +283,7 @@ Responda SOMENTE com um JSON valido, sem texto antes ou depois:
 Exemplos:
 "bom dia" -> {"tipo":"saudacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":null}
 "quais obras tem?" -> {"tipo":"listagem","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":null}
+"o que ta sendo feito ai?" -> {"tipo":"listagem","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":null}
 "quanto custou o asfalto do centro?" -> {"tipo":"busca","termos":["pavimentacao","centro"],"detalhe":"completo","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":null}
 "qual a obra mais cara?" -> {"tipo":"agregacao","termos":[],"detalhe":"completo","operacao":"maior_valor","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":null}
 "quantas estao concluidas?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"contar_por_status","filtro_status":"concluida","pista_valor":"","usar_contexto":false,"receita":null}
@@ -291,6 +291,8 @@ Exemplos:
 "quais os valores investidos nessas obras?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"soma_valor","filtro_status":"","pista_valor":"","usar_contexto":true,"receita":null}
 "quanto custou tudo isso?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"soma_valor","filtro_status":"","pista_valor":"","usar_contexto":true,"receita":null}
 "so os nomes dos engenheiros" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":{"filtros":[],"agregacao":{"tipo":"contar_por","campo":"ENGENHEIRO"}}}
+"quais engenheiros dessas obras?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":true,"receita":{"filtros":[],"agregacao":{"tipo":"listar","campo":"ENGENHEIRO"}}}
+"liste cada obra com seu valor investido" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":true,"receita":{"filtros":[],"agregacao":{"tipo":"listar","campo":"VALOR TOTAL DA OBRA"}}}
 `;
 
 export async function interpretarPergunta(pergunta, historico = []) {
