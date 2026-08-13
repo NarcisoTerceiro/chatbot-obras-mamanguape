@@ -903,7 +903,20 @@ async function processarWebhook(payload) {
       else if (interpretacao.tipo === "agregacao") {
         // Se a pergunta tem recorte (ex.: "mais cara do Centro"), filtra antes.
         let base = obras;
-        if (interpretacao.termos.length > 0) {
+
+        // CONTEXTO: se a pessoa disse "dessas/nessas" (usar_contexto:true) e a
+        // gente mostrou uma lista antes, a conta deve incidir SO nessas obras -
+        // nao na base inteira. Sem isso, "valor dessas" somava as 66 (bug).
+        const refereAnteriorRegex = /\b(essas|dessas|nessas|delas|desses|nesses|deles|as de cima|as que voce|as listadas|acima|cada uma|cada um)\b/i.test(
+          pergunta || ""
+        );
+        const usarContexto =
+          (interpretacao.usar_contexto === true || refereAnteriorRegex) &&
+          Array.isArray(obrasContexto) && obrasContexto.length > 1;
+        if (usarContexto) {
+          base = obrasContexto;
+          console.log(`DEBUG agregacao usando contexto: ${base.length} obra(s)`);
+        } else if (interpretacao.termos.length > 0) {
           const filtradas = buscarObrasPorTermos(interpretacao.termos, obras, obras.length);
           if (filtradas.length > 0) base = filtradas;
         }
