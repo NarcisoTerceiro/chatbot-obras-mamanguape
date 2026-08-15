@@ -52,13 +52,24 @@ function pegar(obra, campo) {
 function padronizarStatus(txt) {
   const s = norm(txt);
   if (!s) return "";
-  if (s.includes("conclu") || s.includes("finaliz")) return "Concluída";
-  if (s.includes("andamento") || s.includes("execu")) return "Em andamento";
+  // ORDEM IMPORTA. Casos especificos primeiro, para evitar que uma palavra
+  // solta ("concluido" numa observacao) classifique errado.
+  // "Em elaboracao" / "em projeto" tem prioridade - sao status de projeto,
+  // nao de obra concluida, mesmo que o texto tenha "conclu" em outra parte.
+  if (s.includes("elabora") || s.includes("em projeto") || s.includes("estudo")) return "Em projeto";
+  if (s.includes("andamento") || s.includes("em obra") || s.includes("execu")) return "Em andamento";
   if (s.includes("licita") || s.includes("edital") || s.includes("propost") || s.includes("habilita")) return "Em licitação";
-  if (s.includes("elabora") || s.includes("projeto") || s.includes("estudo")) return "Em projeto";
   if (s.includes("parad") || s.includes("paralis") || s.includes("suspens")) return "Paralisada";
-  if (s.includes("iniciar")) return "A iniciar";
   if (s.includes("homolog")) return "Homologada";
+  if (s.includes("iniciar")) return "A iniciar";
+  // Concluida por ultimo: so classifica assim se o status for claramente isso
+  // (comeca com "conclu"/"finaliz" ou e exatamente a palavra), nao se "conclu"
+  // aparecer perdido no meio de uma frase.
+  if (s.startsWith("conclu") || s.startsWith("finaliz") ||
+      s === "concluida" || s === "concluido" || s === "finalizado" ||
+      s === "concluída" || s === "concluído") {
+    return "Concluída";
+  }
   return (txt || "").toString().trim();
 }
 
