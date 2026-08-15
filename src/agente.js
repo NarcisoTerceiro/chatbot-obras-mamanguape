@@ -58,6 +58,23 @@ function comLimite(sql, max = 200) {
   return `${s} LIMIT ${max}`;
 }
 
+// Monta um resumo curto das ultimas trocas, para dar contexto ao gerar SQL.
+// So as ultimas 2-3 trocas importam para perguntas de acompanhamento.
+function resumoHistorico(historico = []) {
+  if (!Array.isArray(historico) || historico.length === 0) {
+    return "(inicio da conversa - sem contexto anterior)";
+  }
+  // pega as ultimas 4 mensagens (2 trocas)
+  const recentes = historico.slice(-4);
+  return recentes
+    .map((m) => {
+      const quem = m.role === "user" ? "Cidadao perguntou" : "Assistente respondeu";
+      const txt = (m.content || "").toString().slice(0, 200);
+      return `${quem}: ${txt}`;
+    })
+    .join("\n");
+}
+
 // --- CHAMADA 1: pergunta -> SQL ---
 async function gerarSQL(pergunta, historico = []) {
   const prompt = `Voce e um tradutor de perguntas para SQL (PostgreSQL).
@@ -79,7 +96,11 @@ REGRAS:
   Isso faz "sao jose" achar "São José" e "rodoviario" achar "rodoviário".
 - Responda SOMENTE com a SQL, sem explicacao, sem marcadores de codigo, sem ponto e virgula.
 
-Pergunta: ${pergunta}
+CONTEXTO DA CONVERSA (use para entender perguntas de acompanhamento como
+"e o valor dessas?", "quais delas no Centro?", "e os engenheiros?"):
+${resumoHistorico(historico)}
+
+Pergunta atual: ${pergunta}
 SQL:`;
 
   const resposta = await chamarIAbruta([
