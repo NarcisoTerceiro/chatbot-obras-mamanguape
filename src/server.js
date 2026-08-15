@@ -21,6 +21,7 @@ import express from "express";
 
 import { getObras, getDiagnostico } from "./sheets.js";
 import { sincronizar } from "./ingestao.js";
+import { responderPergunta } from "./agente.js";
 import { buscarObrasPorTermos, buscarObras, buscarPorEngenheiro } from "./search.js";
 import { interpretarPergunta, redigirResposta, calcularComCodeExecution, gerarCodigoPython } from "./groq.js";
 import { executarAgregacao, executarReceita } from "./agregacao.js";
@@ -140,8 +141,40 @@ app.get("/sincronizar", async (req, res) => {
       quando: new Date().toISOString(),
     });
   } catch (e) {
-    console.error("ERRO na sincronizacao:", e.message);
-    res.status(500).json({ ok: false, erro: e.message });
+    // Mostra o erro completo para diagnostico (mensagem + tipo + detalhe).
+    const detalhe = e && (e.message || e.toString());
+    const codigo = e && (e.code || "");
+    console.error("ERRO na sincronizacao:", detalhe, codigo, e && e.stack);
+    res.status(500).json({
+      ok: false,
+      erro: detalhe || "erro desconhecido",
+      codigo: codigo || undefined,
+      dica: "Verifique DATABASE_URL no Render e as credenciais do Google.",
+    });
+  }
+});
+
+// ------------------------------------------------------------
+//  TESTAR-AGENTE: testa o agente SQL sem WhatsApp.
+//  Acesse: /testar-agente?token=SEU_TOKEN&q=quantas obras concluidas
+//  Mostra o SQL gerado, quantas linhas voltaram, e a resposta.
+//  So para TESTE - nao mexe no bot do WhatsApp.
+// ------------------------------------------------------------
+app.get("/testar-agente", async (req, res) => {
+  if (req.query.token !== VERIFY_TOKEN) return res.sendStatus(403);
+  const pergunta = req.query.q;
+  if (!pergunta) return res.json({ erro: "passe a pergunta em ?q=..." });
+  try {
+    const r = await responderPergunta(pergunta);
+    res.json({
+      pergunta,
+      sql_gerada: r.sql || r.sqlBloqueada || null,
+      linhas_retornadas: r.linhas ?? null,
+      resposta: r.resposta,
+      erro: r.erro || null,
+    });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
   }
 });
 

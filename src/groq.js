@@ -149,8 +149,8 @@ async function chamarIA(body) {
       // Cada provedor aceita parametros diferentes:
       //  - GEMINI 3.x (3.5/3.6): NAO aceita reasoning_effort/temperature/top_p/
       //    top_k e rejeita a requisicao com 400. Removemos todos.
-      //  - GROQ llama-3.3: NAO suporta reasoning_effort de jeito nenhum (da 400
-      //    "reasoning_effort is not supported with this model"). Removemos sempre.
+      //  - GROQ: aceita temperature, mas reasoning_effort SO pode ser
+      //    "low"|"medium"|"high". Se vier "none"/invalido, removemos.
       const corpo = { ...body, model: prov.model };
 
       if (prov.nome === "gemini") {
@@ -159,8 +159,10 @@ async function chamarIA(body) {
         delete corpo.top_p;
         delete corpo.top_k;
       } else if (prov.nome === "groq") {
-        // llama-3.3 nao aceita reasoning_effort. Remove sempre.
-        delete corpo.reasoning_effort;
+        const validos = ["low", "medium", "high"];
+        if (!validos.includes(corpo.reasoning_effort)) {
+          delete corpo.reasoning_effort;
+        }
       }
 
       const resp = await fetch(prov.url, {
@@ -616,4 +618,18 @@ export async function gerarCodigoPython(pergunta, colunas) {
     .replace(/```python/gi, "")
     .replace(/```/g, "")
     .trim();
+}
+// ============================================================
+//  chamarIAbruta — funcao simples para o agente SQL.
+//  Recebe uma lista de mensagens [{role, content}] e devolve o
+//  texto da resposta. Reaproveita o chamarIA interno (com
+//  fallback Gemini -> Groq e limpeza de parametros por provedor).
+// ============================================================
+export async function chamarIAbruta(mensagens, opcoes = {}) {
+  const body = {
+    max_tokens: opcoes.max_tokens || 1024,
+    messages: mensagens,
+  };
+  if (opcoes.temperature !== undefined) body.temperature = opcoes.temperature;
+  return await chamarIA(body);
 }
