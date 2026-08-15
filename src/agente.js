@@ -111,8 +111,50 @@ REGRAS:
   return await chamarIAbruta([{ role: "user", content: prompt }]);
 }
 
+// Detecta saudacoes, agradecimentos e despedidas simples - que nao precisam
+// de banco de dados. Retorna uma resposta pronta, ou null se nao for saudacao.
+function respostaSocial(pergunta) {
+  const p = pergunta.toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  // remove pontuacao das bordas
+  const limpo = p.replace(/[!?.,;]+/g, " ").replace(/\s+/g, " ").trim();
+
+  // Saudacoes (oi, ola, bom dia, boa tarde, boa noite, e ce, salve...)
+  const saudacoes = ["oi", "ola", "opa", "eai", "e ai", "salve", "bom dia",
+    "boa tarde", "boa noite", "boas", "ei", "hello", "oii", "oie"];
+  // Agradecimentos
+  const agradece = ["obrigado", "obrigada", "obg", "vlw", "valeu", "grato",
+    "grata", "agradecido", "thanks"];
+  // Despedidas
+  const despede = ["tchau", "ate mais", "ate logo", "adeus", "falou", "flw", "ate"];
+
+  const comeca = (lista) => lista.some((s) => limpo === s || limpo.startsWith(s + " ") || limpo.endsWith(" " + s));
+
+  // So trata como saudacao pura se a mensagem for CURTA (senao pode ter pergunta junto)
+  const curta = limpo.split(" ").length <= 4;
+
+  if (curta && comeca(agradece)) {
+    return "Por nada! Estou aqui para ajudar com informacoes sobre as obras de Mamanguape. 😊";
+  }
+  if (curta && comeca(despede)) {
+    return "Ate mais! Qualquer duvida sobre as obras da cidade, e so chamar. 👋";
+  }
+  if (curta && comeca(saudacoes)) {
+    return "Ola! Sou o assistente de obras publicas da Prefeitura de Mamanguape. " +
+      "Posso te dizer quais obras estao em andamento, concluidas, seus valores, " +
+      "bairros e responsaveis. O que voce gostaria de saber? 🏗️";
+  }
+  return null;
+}
+
 // --- FLUXO COMPLETO ---
 export async function responderPergunta(pergunta, historico = []) {
+  // 0. Saudacao/agradecimento/despedida - responde sem tocar no banco.
+  const social = respostaSocial(pergunta);
+  if (social) {
+    console.log("AGENTE: resposta social (sem SQL).");
+    return { resposta: social, social: true };
+  }
+
   // 1. Gera SQL
   let sql;
   try {
