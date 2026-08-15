@@ -73,7 +73,10 @@ REGRAS:
   "em obra"/"tocando" = 'Em andamento'.
 - Se pedir soma/total de valor, use SUM(valor_total).
 - Se pedir contagem, use COUNT(*).
-- Se filtrar por bairro/empresa/engenheiro, use ILIKE '%termo%' (ignora acento/maiuscula).
+- Para filtrar por texto (bairro/empresa/engenheiro/objeto), use unaccent()
+  nos DOIS lados para ignorar acento E maiuscula. Exemplo:
+  WHERE unaccent(bairro) ILIKE unaccent('%centro%')
+  Isso faz "sao jose" achar "São José" e "rodoviario" achar "rodoviário".
 - Responda SOMENTE com a SQL, sem explicacao, sem marcadores de codigo, sem ponto e virgula.
 
 Pergunta: ${pergunta}

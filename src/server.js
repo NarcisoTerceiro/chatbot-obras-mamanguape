@@ -568,6 +568,39 @@ async function processarWebhook(payload) {
   const pergunta = mensagem.text.body;
   console.log(`Pergunta de ${de}: ${pergunta}`);
 
+  // ============================================================
+  //  SISTEMA NOVO (agente SQL + banco). So e usado se a variavel
+  //  de ambiente USAR_AGENTE_SQL estiver "true". Assim voce liga/
+  //  desliga o sistema novo SEM mexer no codigo - se algo der errado,
+  //  basta por USAR_AGENTE_SQL=false no Render e volta pro antigo.
+  //
+  //  Mantem a memoria de conversa (historico) para perguntas de
+  //  acompanhamento ("e o valor dessas?").
+  // ============================================================
+  if (process.env.USAR_AGENTE_SQL === "true") {
+    const memoriaAg = lerMemoria(de);
+    const historicoAg = memoriaAg.historico || [];
+    let respostaAg;
+    try {
+      const r = await responderPergunta(pergunta, historicoAg);
+      respostaAg = r.resposta;
+    } catch (e) {
+      console.error("AGENTE SQL falhou:", e.message);
+      respostaAg = "Desculpe, tive um problema para responder agora. Pode tentar de novo?";
+    }
+    // Atualiza memoria (so historico - o agente usa SQL, nao precisa de obras em contexto)
+    salvarMemoria(de, {
+      ...memoriaAg,
+      historico: [
+        ...historicoAg,
+        { role: "user", content: pergunta },
+        { role: "assistant", content: respostaAg },
+      ].slice(-10),
+    });
+    await enviarTexto(de, respostaAg);
+    return; // nao executa o sistema antigo
+  }
+
   const memoria = lerMemoria(de);
   const { historico, obras: obrasContexto, termos: termosAnteriores } = memoria;
 
