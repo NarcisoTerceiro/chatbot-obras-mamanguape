@@ -20,6 +20,7 @@ import "dotenv/config";
 import express from "express";
 
 import { getObras, getDiagnostico } from "./sheets.js";
+import { sincronizar } from "./ingestao.js";
 import { buscarObrasPorTermos, buscarObras, buscarPorEngenheiro } from "./search.js";
 import { interpretarPergunta, redigirResposta, calcularComCodeExecution, gerarCodigoPython } from "./groq.js";
 import { executarAgregacao, executarReceita } from "./agregacao.js";
@@ -120,6 +121,27 @@ app.get("/diagnostico", async (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ erro: e.message });
+  }
+});
+
+// ------------------------------------------------------------
+//  SINCRONIZAR: le a planilha e popula o banco (Supabase).
+//  Acesse:  https://SEU-APP.onrender.com/sincronizar?token=SEU_VERIFY_TOKEN
+//  Use para testar a ingestao manualmente. Depois, o webhook do
+//  Google Sheets chama isso automaticamente quando a planilha muda.
+// ------------------------------------------------------------
+app.get("/sincronizar", async (req, res) => {
+  if (req.query.token !== VERIFY_TOKEN) return res.sendStatus(403);
+  try {
+    const resultado = await sincronizar();
+    res.json({
+      ok: true,
+      obras_inseridas: resultado.inseridas,
+      quando: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("ERRO na sincronizacao:", e.message);
+    res.status(500).json({ ok: false, erro: e.message });
   }
 });
 
