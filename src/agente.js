@@ -94,6 +94,12 @@ REGRAS:
   nos DOIS lados para ignorar acento E maiuscula. Exemplo:
   WHERE unaccent(bairro) ILIKE unaccent('%centro%')
   Isso faz "sao jose" achar "São José" e "rodoviario" achar "rodoviário".
+- IMPORTANTE - ao filtrar por BAIRRO ou LOCAL (ex.: "obras no Centro",
+  "valores no Bela Vista"), procure o lugar TANTO na coluna bairro QUANTO
+  na coluna objeto, porque as vezes o bairro esta no nome da obra
+  (ex.: "Rua do Cruzeiro - Centro"). Use:
+  WHERE (unaccent(bairro) ILIKE unaccent('%centro%')
+         OR unaccent(objeto) ILIKE unaccent('%centro%'))
 - Responda SOMENTE com a SQL, sem explicacao, sem marcadores de codigo, sem ponto e virgula.
 
 CONTEXTO DA CONVERSA (use para entender perguntas de acompanhamento como
@@ -117,19 +123,23 @@ SQL:`;
 // --- CHAMADA 2: resultado -> resposta natural ---
 async function redigir(pergunta, linhas) {
   const dados = JSON.stringify(linhas.slice(0, 50));
+  const muitasLinhas = linhas.length > 8;
   const prompt = `Voce e o Assistente de Obras da Prefeitura de Mamanguape no WhatsApp.
 O cidadao perguntou: "${pergunta}"
 O sistema consultou o banco e retornou estes dados (JSON): ${dados}
 
-Escreva uma resposta curta, clara e cordial em portugues, formato WhatsApp.
+Escreva uma resposta clara e cordial em portugues, formato WhatsApp.
 REGRAS:
 - Use SOMENTE os dados acima. Nunca invente valores, nomes ou numeros.
 - Se os dados vierem vazios, diga que nao encontrou e peca para reformular.
 - Valores em reais no formato R$ 1.234.567,00.
 - Nao mencione "banco", "SQL", "dados" nem que voce e uma IA.
-- No maximo um emoji sutil.`;
+- No maximo um emoji sutil.
+${muitasLinhas ? "- A lista e LONGA: seja ENXUTO. Liste um item por linha, so o essencial (nome e, se houver, valor). NAO repita rotulos como 'Status:' em toda linha. NAO escreva introducao longa." : "- Seja conciso."}`;
 
-  return await chamarIAbruta([{ role: "user", content: prompt }]);
+  // max_tokens maior para listas longas nao cortarem no meio.
+  const limite = muitasLinhas ? 2048 : 1024;
+  return await chamarIAbruta([{ role: "user", content: prompt }], { max_tokens: limite });
 }
 
 // Detecta saudacoes, agradecimentos e despedidas simples - que nao precisam

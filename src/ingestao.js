@@ -93,14 +93,36 @@ function categoriaDaAba(aba) {
   return (aba || "").toString().trim();
 }
 
+// Tenta extrair o bairro do NOME da obra quando a coluna bairro esta vazia.
+// Muitas obras vem como "Rua do Cruzeiro - Centro" ou "Avenida X - Bela Vista",
+// onde o bairro esta depois do traco. Sem isso, buscas por bairro perdem
+// essas obras (elas nao tem a coluna bairro preenchida).
+function bairroDoNome(nome) {
+  if (!nome) return null;
+  const partes = nome.toString().split(/\s+[-\u2013\u2014]\s+/); // separa por " - "
+  if (partes.length >= 2) {
+    const ultima = partes[partes.length - 1].trim();
+    // so aceita se parecer um bairro (curto, sem numeros de contrato etc.)
+    if (ultima.length >= 3 && ultima.length <= 40 && !/^\d+$/.test(ultima)) {
+      return ultima;
+    }
+  }
+  return null;
+}
+
 // Transforma uma obra crua (da planilha) numa linha limpa pro banco.
 function limpar(obra) {
   const objeto = pegar(obra, "objeto");
   if (!objeto) return null; // sem nome, ignora
   const categoria = categoriaDaAba(obra._aba);
+  // bairro: primeiro tenta a coluna; se vazia, tenta extrair do nome.
+  let bairro = (pegar(obra, "bairro") || "").toString().trim();
+  if (!bairro) {
+    bairro = bairroDoNome(objeto) || "";
+  }
   return {
     objeto: objeto.toString().trim(),
-    bairro: (pegar(obra, "bairro") || "").toString().trim() || null,
+    bairro: bairro || null,
     status: padronizarStatus(pegar(obra, "status")) || categoria,
     categoria,
     valor_total: parseValor(pegar(obra, "valor_total")),
