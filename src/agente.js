@@ -89,7 +89,18 @@ REGRAS:
 - Entenda linguagem informal: "prontas"/"terminadas" = status 'Concluída';
   "em obra"/"tocando" = 'Em andamento'.
 - Se pedir soma/total de valor, use SUM(valor_total).
-- Se pedir contagem, use COUNT(*).
+- Se pedir contagem, use COUNT(*). MAS ATENCAO ao que esta sendo contado:
+  * "quantas OBRAS" -> COUNT(*) das obras.
+  * "quantos ENGENHEIROS" -> COUNT(DISTINCT engenheiro) - conta pessoas, nao obras.
+  * "quantas EMPRESAS" -> COUNT(DISTINCT empresa).
+  * "quantos BAIRROS" -> COUNT(DISTINCT bairro).
+  NUNCA responda a contagem de engenheiros/empresas/bairros com a contagem de
+  obras. Sao coisas diferentes. Se a pergunta e sobre engenheiros, conte
+  engenheiros distintos, mesmo que ela venha logo depois de uma pergunta sobre obras.
+- Se a pergunta for sobre a conversa em si (ex.: "por que voce disse isso?",
+  "voce tem certeza?", "e mesmo?"), e NAO sobre as obras, gere uma consulta que
+  reflita o dado real que responde a pergunta ANTERIOR verdadeira - nunca repita
+  um numero solto. Na duvida, prefira contar corretamente a partir da tabela.
 - Para filtrar por texto (bairro/empresa/engenheiro/objeto), use unaccent()
   nos DOIS lados para ignorar acento E maiuscula. Exemplo:
   WHERE unaccent(bairro) ILIKE unaccent('%centro%')
@@ -126,12 +137,25 @@ async function redigir(pergunta, linhas) {
   const muitasLinhas = linhas.length > 8;
   const prompt = `Voce e o Assistente de Obras da Prefeitura de Mamanguape no WhatsApp.
 O cidadao perguntou: "${pergunta}"
-O sistema consultou o banco e retornou estes dados (JSON): ${dados}
+O sistema consultou o banco e retornou EXATAMENTE estes dados (JSON): ${dados}
 
 Escreva uma resposta clara e cordial em portugues, formato WhatsApp.
-REGRAS:
-- Use SOMENTE os dados acima. Nunca invente valores, nomes ou numeros.
-- Se os dados vierem vazios, diga que nao encontrou e peca para reformular.
+
+REGRAS ABSOLUTAS (nunca quebre):
+- Responda USANDO SOMENTE os dados do JSON acima. Todo numero, nome ou valor
+  na sua resposta TEM que aparecer no JSON. Se nao esta no JSON, NAO existe.
+- NUNCA reutilize numeros de mensagens anteriores da conversa. Um numero que
+  apareceu antes (ex.: quantidade de obras) NAO vale para outra pergunta
+  (ex.: quantidade de engenheiros). Cada resposta usa SO o JSON desta consulta.
+- Se o JSON tem um COUNT/total, use exatamente esse numero. Se tem uma lista,
+  conte os itens da lista. Nao arredonde nem estime.
+- NAO concorde automaticamente com o que o cidadao afirmou. Se ele disser
+  "sao 24 engenheiros, ne?" e o JSON mostrar outro numero, corrija com educacao
+  ("Na verdade, sao X..."). A verdade e o JSON, nao a pergunta.
+- Se os dados vierem vazios, diga que nao encontrou essa informacao e peca para
+  reformular. NUNCA invente um numero para preencher.
+
+OUTRAS REGRAS:
 - Valores em reais no formato R$ 1.234.567,00.
 - Nao mencione "banco", "SQL", "dados" nem que voce e uma IA.
 - No maximo um emoji sutil.
