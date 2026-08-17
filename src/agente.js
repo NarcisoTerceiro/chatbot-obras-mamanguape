@@ -48,6 +48,13 @@ function sqlSegura(sql) {
   // So uma instrucao (sem ; no meio)
   const semFinal = s.endsWith(";") ? s.slice(0, -1) : s;
   if (semFinal.includes(";")) return { ok: false, motivo: "multiplas instrucoes" };
+  // Detecta SQL TRUNCADO (cortado no meio pela IA): aspas ou parenteses
+  // desbalanceados. Sem isso, um SELECT cortado vira erro de sintaxe no banco.
+  const aspas = (sql.match(/'/g) || []).length;
+  if (aspas % 2 !== 0) return { ok: false, motivo: "SQL truncado (aspas abertas)" };
+  const abre = (sql.match(/\(/g) || []).length;
+  const fecha = (sql.match(/\)/g) || []).length;
+  if (abre !== fecha) return { ok: false, motivo: "SQL truncado (parenteses desbalanceados)" };
   return { ok: true };
 }
 
@@ -105,6 +112,11 @@ REGRAS:
   nos DOIS lados para ignorar acento E maiuscula. Exemplo:
   WHERE unaccent(bairro) ILIKE unaccent('%centro%')
   Isso faz "sao jose" achar "São José" e "rodoviario" achar "rodoviário".
+- USE TERMOS CURTOS no ILIKE, nunca a frase inteira da pergunta. Extraia so a
+  palavra-chave essencial. Ex.: para "informacoes sobre a construcao da praca de
+  lazer em Nova Mamanguape", NAO busque '%praca de lazer nova mamanguape%'
+  (quase nunca acha e incha a consulta). Busque so '%praca de lazer%' ou
+  '%praca%'. Frase longa dentro do ILIKE quase nunca da resultado.
 - IMPORTANTE - ao filtrar por BAIRRO ou LOCAL (ex.: "obras no Centro",
   "valores no Bela Vista"), procure o lugar TANTO na coluna bairro QUANTO
   na coluna objeto, porque as vezes o bairro esta no nome da obra
@@ -122,7 +134,7 @@ SQL:`;
 
   const resposta = await chamarIAbruta([
     { role: "user", content: prompt },
-  ]);
+  ], { max_tokens: 512 });
   // Limpa possiveis marcadores de codigo
   let sql = resposta.replace(/```sql/gi, "").replace(/```/g, "").trim();
   // Pega so a primeira linha que comeca com SELECT, se vier texto junto
