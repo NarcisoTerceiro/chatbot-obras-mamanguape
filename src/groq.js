@@ -36,7 +36,7 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 // o Gemini bate cota (429) ou falha. Modelo gratuito atual: openai/gpt-oss-120b.
 const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_KEY   = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 
 // --- Provedor 3: OmniRoute (DESATIVADO) ---
 // Removido de proposito: nunca teve creditos (dava erro 402 constante) e so
