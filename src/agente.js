@@ -103,6 +103,11 @@ ${SCHEMA}
 
 REGRAS:
 - Gere APENAS SELECT. Nunca INSERT/UPDATE/DELETE/DROP.
+- Se a mensagem NAO for uma pergunta clara sobre obras (ex.: so uma saudacao
+  solta, um "ok", um "kkk", algo vago ou sem sentido), NAO invente uma consulta.
+  Responda EXATAMENTE com a palavra: SEM_CONSULTA
+  (o sistema vai pedir para o cidadao reformular). NUNCA gere um COUNT ou SELECT
+  aleatorio so para ter uma resposta.
 - Use os nomes de coluna exatos do schema.
 - Para status, use os valores exatos (ex.: 'Concluída' com acento).
 - Entenda linguagem informal: "prontas"/"terminadas" = status 'Concluída';
@@ -212,27 +217,32 @@ function respostaSocial(pergunta) {
   // remove pontuacao das bordas
   const limpo = p.replace(/[!?.,;]+/g, " ").replace(/\s+/g, " ").trim();
 
-  // Saudacoes (oi, ola, bom dia, boa tarde, boa noite, e ce, salve...)
-  const saudacoes = ["oi", "ola", "opa", "eai", "e ai", "salve", "bom dia",
-    "boa tarde", "boa noite", "boas", "ei", "hello", "oii", "oie"];
-  // Agradecimentos
+  // So trata como saudacao/social se a mensagem for CURTA (senao pode ter pergunta junto)
+  const curta = limpo.split(" ").length <= 4;
+  if (!curta) return null;
+
+  // Saudacoes detectadas por PADRAO (aceita variacoes: oi/oii/oiii, ola/olaa,
+  // eai/eaii, etc.) - mais robusto que uma lista fixa de palavras exatas.
+  const ehSaudacao =
+    /^o+i+$/.test(limpo) ||                                   // oi, oii, oiii, ooi...
+    /^o+la+$/.test(limpo) ||                                  // ola, olaa, oola...
+    /^(opa|opaa|salve|ei+|hey|hello|hi|oie|alo+)$/.test(limpo) ||
+    /^e+ ?a+i+$/.test(limpo) ||                               // eai, e ai, eaii...
+    /\b(bom dia|boa tarde|boa noite|boas)\b/.test(limpo);
+
+  // Agradecimentos e despedidas
   const agradece = ["obrigado", "obrigada", "obg", "vlw", "valeu", "grato",
     "grata", "agradecido", "thanks"];
-  // Despedidas
   const despede = ["tchau", "ate mais", "ate logo", "adeus", "falou", "flw", "ate"];
-
   const comeca = (lista) => lista.some((s) => limpo === s || limpo.startsWith(s + " ") || limpo.endsWith(" " + s));
 
-  // So trata como saudacao pura se a mensagem for CURTA (senao pode ter pergunta junto)
-  const curta = limpo.split(" ").length <= 4;
-
-  if (curta && comeca(agradece)) {
+  if (comeca(agradece)) {
     return "Por nada! Estou aqui para ajudar com informacoes sobre as obras de Mamanguape. 😊";
   }
-  if (curta && comeca(despede)) {
+  if (comeca(despede)) {
     return "Ate mais! Qualquer duvida sobre as obras da cidade, e so chamar. 👋";
   }
-  if (curta && comeca(saudacoes)) {
+  if (ehSaudacao) {
     return "Ola! Sou o assistente de obras publicas da Prefeitura de Mamanguape. " +
       "Posso te dizer quais obras estao em andamento, concluidas, seus valores, " +
       "bairros e responsaveis. O que voce gostaria de saber? 🏗️";
@@ -257,6 +267,17 @@ export async function responderPergunta(pergunta, historico = []) {
     return { resposta: "Desculpe, tive um problema ao entender sua pergunta. Pode reformular?", erro: "gerar_sql: " + e.message };
   }
   console.log("AGENTE: SQL gerada:", sql);
+
+  // 1b. A IA sinalizou que a mensagem nao e uma pergunta clara sobre obras?
+  // (ex.: saudacao solta que escapou, "ok", algo vago). Pede reformular em vez
+  // de inventar um numero. Cobre casos que a deteccao de saudacao nao pegou.
+  if (/sem_consulta/i.test(sql) || !/select/i.test(sql)) {
+    console.log("AGENTE: mensagem sem consulta clara - pedindo reformular.");
+    return {
+      resposta: "Nao entendi bem sua pergunta. Posso te informar sobre obras em andamento, concluidas, valores, bairros e engenheiros responsaveis. O que voce gostaria de saber? 🏗️",
+      semConsulta: true,
+    };
+  }
 
   // 2. Valida seguranca
   const check = sqlSegura(sql);
