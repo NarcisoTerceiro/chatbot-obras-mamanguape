@@ -132,15 +132,32 @@ ${resumoHistorico(historico)}
 Pergunta atual: ${pergunta}
 SQL:`;
 
-  const resposta = await chamarIAbruta([
-    { role: "user", content: prompt },
-  ], { max_tokens: 512 });
-  // Limpa possiveis marcadores de codigo
-  let sql = resposta.replace(/```sql/gi, "").replace(/```/g, "").trim();
-  // Pega so a primeira linha que comeca com SELECT, se vier texto junto
-  const m = sql.match(/select[\s\S]+/i);
-  if (m) sql = m[0].trim();
-  return sql.replace(/;$/, "").trim();
+  // A IA (Gemini/Groq no plano gratuito) as vezes devolve o SQL truncado -
+  // corta no meio de '%pr... por instabilidade/cota, nao por max_tokens.
+  // Por isso tentamos ate 3 vezes: se vier cortado, geramos de novo.
+  let sql = "";
+  for (let tentativa = 1; tentativa <= 3; tentativa++) {
+    const resposta = await chamarIAbruta([
+      { role: "user", content: prompt },
+    ], { max_tokens: 512 });
+    // Limpa possiveis marcadores de codigo
+    let s = resposta.replace(/```sql/gi, "").replace(/```/g, "").trim();
+    // Pega so o trecho que comeca com SELECT, se vier texto junto
+    const m = s.match(/select[\s\S]+/i);
+    if (m) s = m[0].trim();
+    s = s.replace(/;$/, "").trim();
+
+    // O SQL esta completo? (aspas e parenteses balanceados)
+    const aspasOk = ((s.match(/'/g) || []).length % 2) === 0;
+    const parOk = (s.match(/\(/g) || []).length === (s.match(/\)/g) || []).length;
+    if (s && aspasOk && parOk) {
+      sql = s;
+      break; // veio completo, pode usar
+    }
+    console.warn(`AGENTE: SQL truncado na tentativa ${tentativa}/3, gerando de novo. Parcial:`, s);
+    sql = s; // guarda o ultimo, caso todas falhem
+  }
+  return sql;
 }
 
 // --- CHAMADA 2: resultado -> resposta natural ---
