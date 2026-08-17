@@ -37,6 +37,22 @@ const PALAVRAS_PROIBIDAS = [
   "grant", "revoke", "replace", "merge", "call", "execute", "--", "/*", "#",
 ];
 
+// Checa se o SQL parece COMPLETO (nao foi cortado pela IA no meio).
+// Pega tres tipos de corte: aspas abertas, parenteses desbalanceados, e o
+// SQL terminando numa palavra que nao pode ser o fim (OR, AND, ILIKE...) -
+// esse ultimo caso causava o "syntax error at or near LIMIT".
+function sqlCompleta(s) {
+  if (!s) return false;
+  const aspasOk = ((s.match(/'/g) || []).length % 2) === 0;
+  if (!aspasOk) return false;
+  const parOk = (s.match(/\(/g) || []).length === (s.match(/\)/g) || []).length;
+  if (!parOk) return false;
+  const fim = s.replace(/;$/, "").trim().toLowerCase();
+  const terminaMal = /(\bor|\band|\bwhere|\bilike|\blike|\bunaccent|\bfrom|\bselect|\bon|\bin|=|,|\()$/.test(fim);
+  if (terminaMal) return false;
+  return true;
+}
+
 function sqlSegura(sql) {
   const s = sql.toLowerCase().trim();
   // Tem que comecar com SELECT
@@ -48,13 +64,9 @@ function sqlSegura(sql) {
   // So uma instrucao (sem ; no meio)
   const semFinal = s.endsWith(";") ? s.slice(0, -1) : s;
   if (semFinal.includes(";")) return { ok: false, motivo: "multiplas instrucoes" };
-  // Detecta SQL TRUNCADO (cortado no meio pela IA): aspas ou parenteses
-  // desbalanceados. Sem isso, um SELECT cortado vira erro de sintaxe no banco.
-  const aspas = (sql.match(/'/g) || []).length;
-  if (aspas % 2 !== 0) return { ok: false, motivo: "SQL truncado (aspas abertas)" };
-  const abre = (sql.match(/\(/g) || []).length;
-  const fecha = (sql.match(/\)/g) || []).length;
-  if (abre !== fecha) return { ok: false, motivo: "SQL truncado (parenteses desbalanceados)" };
+  // Detecta SQL TRUNCADO (cortado no meio pela IA). Sem isso, um SELECT
+  // cortado vira erro de sintaxe no banco (ex.: "syntax error at LIMIT").
+  if (!sqlCompleta(sql)) return { ok: false, motivo: "SQL truncado (incompleto)" };
   return { ok: true };
 }
 
@@ -147,14 +159,12 @@ SQL:`;
     if (m) s = m[0].trim();
     s = s.replace(/;$/, "").trim();
 
-    // O SQL esta completo? (aspas e parenteses balanceados)
-    const aspasOk = ((s.match(/'/g) || []).length % 2) === 0;
-    const parOk = (s.match(/\(/g) || []).length === (s.match(/\)/g) || []).length;
-    if (s && aspasOk && parOk) {
+    // O SQL veio completo? (mesma checagem usada na validacao)
+    if (sqlCompleta(s)) {
       sql = s;
       break; // veio completo, pode usar
     }
-    console.warn(`AGENTE: SQL truncado na tentativa ${tentativa}/3, gerando de novo. Parcial:`, s);
+    console.warn(`AGENTE: SQL incompleto na tentativa ${tentativa}/3, gerando de novo. Parcial:`, s);
     sql = s; // guarda o ultimo, caso todas falhem
   }
   return sql;
