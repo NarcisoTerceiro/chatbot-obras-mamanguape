@@ -10,7 +10,7 @@
 //  Assim o banco fica sempre IGUAL a planilha - simples e seguro.
 // ============================================================
 
-import { getObras } from "./sheets.js";
+import { getObras, limparCache } from "./sheets.js";
 import { query } from "./db.js";
 
 // --- utilidades de limpeza ---
@@ -161,6 +161,7 @@ function limpar(obra) {
 // Roda a ingestao completa: le planilha -> limpa -> substitui no banco.
 export async function sincronizar() {
   console.log("INGESTAO: lendo planilha...");
+  limparCache(); // forca releitura da planilha fresca (ignora cache velho)
   const cruas = await getObras();
   const limpas = cruas.map(limpar).filter(Boolean);
   console.log(`INGESTAO: ${cruas.length} linhas lidas, ${limpas.length} obras limpas.`);

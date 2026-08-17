@@ -41,6 +41,14 @@ COMO CONSULTAR dados_extras (JSONB no PostgreSQL):
   WHERE unaccent(dados_extras->>'RECURSO') ILIKE unaccent('%proprio%')
 - Se o cidadao perguntar sobre RECURSO, CONTRATO, CONVENIO, ADITIVO, PRAZO ou
   qualquer coisa que NAO tem coluna propria, procure em dados_extras.
+- ATENCAO: cada aba nomeia as colunas de um jeito. O "recurso" (fonte do
+  dinheiro) pode estar em chaves diferentes: 'RECURSO', 'CONVENIO/RECURSO',
+  'CONVÊNIO/RECURSO', 'FONTE', 'FONTE DE RECURSO'. Ao buscar recurso, use
+  COALESCE para tentar varias chaves. Exemplo pratico para "qual o recurso":
+  SELECT objeto,
+    COALESCE(dados_extras->>'RECURSO', dados_extras->>'CONVÊNIO/RECURSO',
+             dados_extras->>'CONVENIO/RECURSO', dados_extras->>'FONTE') AS recurso
+  FROM obras WHERE unaccent(objeto) ILIKE unaccent('%cristo rei%')
 - IMPORTANTE: os nomes das chaves variam (podem ter espacos, barras, acentos).
   Na duvida sobre o nome exato da chave, prefira trazer a obra inteira
   (SELECT objeto, dados_extras FROM ...) e deixe a resposta mostrar o campo.
@@ -194,9 +202,21 @@ SQL:`;
 }
 
 // --- CHAMADA 2: resultado -> resposta natural ---
-async function redigir(pergunta, linhas) {
-  const dados = JSON.stringify(linhas.slice(0, 50));
-  const muitasLinhas = linhas.length > 8;
+async function redigir(pergunta, linhas, ehInicio = false) {
+  // Se as linhas tem dados_extras (JSONB), ele vem como objeto e polui o JSON
+  // que a IA recebe (fica gigante e confuso, causando "dificuldade para montar
+  // a resposta"). Achatamos: cada chave do dados_extras vira um campo normal.
+  const linhasLimpas = linhas.map((lin) => {
+    if (!lin || typeof lin !== "object") return lin;
+    const { dados_extras, ...resto } = lin;
+    if (dados_extras && typeof dados_extras === "object") {
+      // junta os campos extras no nivel de cima, com nomes legiveis
+      return { ...resto, ...dados_extras };
+    }
+    return resto;
+  });
+  const dados = JSON.stringify(linhasLimpas.slice(0, 50));
+  const muitasLinhas = linhasLimpas.length > 8;
   const prompt = `Voce e o Assistente de Obras da Prefeitura de Mamanguape no WhatsApp.
 O cidadao perguntou: "${pergunta}"
 O sistema consultou o banco e retornou EXATAMENTE estes dados (JSON): ${dados}
@@ -211,20 +231,28 @@ REGRAS ABSOLUTAS (nunca quebre):
   (ex.: quantidade de engenheiros). Cada resposta usa SO o JSON desta consulta.
 - Se o JSON tem um COUNT/total, use exatamente esse numero. Se tem uma lista,
   conte os itens da lista. Nao arredonde nem estime.
+- CUIDADO com "ao todo"/"no total"/"geral": esse numero e DIFERENTE de "em
+  andamento". "Em andamento" e so um status; "ao todo" e a soma de TODAS as
+  obras (todos os status). Use exatamente o numero que o JSON traz para a
+  pergunta feita - nao troque um pelo outro.
 - NAO concorde automaticamente com o que o cidadao afirmou. Se ele disser
   "sao 24 engenheiros, ne?" e o JSON mostrar outro numero, corrija com educacao
   ("Na verdade, sao X..."). A verdade e o JSON, nao a pergunta.
 - Se os dados vierem vazios, diga que nao encontrou essa informacao e peca para
   reformular. NUNCA invente um numero para preencher.
+- ${ehInicio
+    ? "Esta e a PRIMEIRA mensagem: pode cumprimentar uma vez (Ola/Bom dia)."
+    : "NAO cumprimente (nao comece com Ola, Oi, Bom dia, Boa tarde). A conversa JA comecou - va DIRETO a resposta. Cumprimentar de novo soa robotico."}
 
 OUTRAS REGRAS:
 - Valores em reais no formato R$ 1.234.567,00.
 - Nao mencione "banco", "SQL", "dados" nem que voce e uma IA.
 - No maximo um emoji sutil.
-${muitasLinhas ? "- A lista e LONGA: seja ENXUTO. Liste um item por linha, so o essencial (nome e, se houver, valor). NAO repita rotulos como 'Status:' em toda linha. NAO escreva introducao longa." : "- Seja conciso."}`;
+${muitasLinhas ? "- A lista e LONGA: seja MUITO ENXUTO. UMA linha por obra, so o nome (e valor se existir). Formato: '• Nome da obra — R$ valor'. SEM introducao longa, SEM detalhes por obra, SEM repetir rotulos. Termine com o total de itens (ex.: 'Total: 24 obras')." : "- Seja conciso."}`;
 
-  // max_tokens maior para listas longas nao cortarem no meio.
-  const limite = muitasLinhas ? 2048 : 1024;
+  // max_tokens ALTO para listas longas (24+ obras) nao cortarem no meio.
+  // Uma lista de 24 obras com nome+valor precisa de bastante espaco.
+  const limite = muitasLinhas ? 4096 : 1024;
   return await chamarIAbruta([{ role: "user", content: prompt }], { max_tokens: limite });
 }
 
@@ -317,7 +345,9 @@ export async function responderPergunta(pergunta, historico = []) {
 
   // 4. Redige resposta
   try {
-    const resposta = await redigir(pergunta, linhas);
+    // Saudacao so na PRIMEIRA mensagem (historico vazio). Depois, resposta direta.
+    const ehInicio = !Array.isArray(historico) || historico.length === 0;
+    const resposta = await redigir(pergunta, linhas, ehInicio);
     return { resposta, sql, linhas: linhas.length };
   } catch (e) {
     return { resposta: "Encontrei os dados, mas tive dificuldade para montar a resposta. Pode reformular?", erro: "redigir: " + e.message };

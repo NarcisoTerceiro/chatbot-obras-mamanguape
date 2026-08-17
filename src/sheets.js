@@ -60,6 +60,16 @@ export function getDiagnostico() {
   return ultimoDiagnostico;
 }
 
+// Limpa o cache, forcando a proxima leitura a buscar a planilha FRESCA.
+// A sincronizacao (via webhook ou manual) chama isto ANTES de ler, pra
+// garantir que uma edicao recente na planilha seja lida de verdade - e nao
+// devolvida do cache velho (que causava "editei mas o banco nao mudou").
+export function limparCache() {
+  cache = { data: null, time: 0 };
+  cacheAbas = { nomes: null, time: 0 };
+  console.log("SHEETS: cache limpo - proxima leitura sera da planilha fresca.");
+}
+
 async function listarAbasDaPlanilha() {
   const agora = Date.now();
   if (cacheAbas.nomes && agora - cacheAbas.time < CACHE_ABAS_MS) {
