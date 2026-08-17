@@ -29,6 +29,21 @@ Colunas:
 - engenheiro (texto) - engenheiro responsavel
 - empresa (texto) - empresa executora
 - aba_origem (texto) - de qual aba da planilha veio
+- dados_extras (JSONB) - TODAS as outras colunas da planilha que nao tem campo
+  proprio acima. Guarda coisas como RECURSO (fonte do dinheiro), No DO CONTRATO,
+  No DO CONVENIO/PROPOSTA, VALOR INICIAL DO CONTRATO, VALOR TOTAL DOS ADITIVOS,
+  PRAZO, DATAS, etc. As chaves sao os nomes ORIGINAIS das colunas da planilha
+  (em maiuscula, com acento).
+
+COMO CONSULTAR dados_extras (JSONB no PostgreSQL):
+- Para LER um campo: dados_extras->>'RECURSO' (retorna texto).
+- Para FILTRAR/BUSCAR dentro dele, use ILIKE com unaccent, igual aos textos:
+  WHERE unaccent(dados_extras->>'RECURSO') ILIKE unaccent('%proprio%')
+- Se o cidadao perguntar sobre RECURSO, CONTRATO, CONVENIO, ADITIVO, PRAZO ou
+  qualquer coisa que NAO tem coluna propria, procure em dados_extras.
+- IMPORTANTE: os nomes das chaves variam (podem ter espacos, barras, acentos).
+  Na duvida sobre o nome exato da chave, prefira trazer a obra inteira
+  (SELECT objeto, dados_extras FROM ...) e deixe a resposta mostrar o campo.
 `;
 
 // --- SEGURANCA: valida a SQL antes de executar ---
@@ -103,11 +118,14 @@ ${SCHEMA}
 
 REGRAS:
 - Gere APENAS SELECT. Nunca INSERT/UPDATE/DELETE/DROP.
-- Se a mensagem NAO for uma pergunta clara sobre obras (ex.: so uma saudacao
-  solta, um "ok", um "kkk", algo vago ou sem sentido), NAO invente uma consulta.
-  Responda EXATAMENTE com a palavra: SEM_CONSULTA
-  (o sistema vai pedir para o cidadao reformular). NUNCA gere um COUNT ou SELECT
-  aleatorio so para ter uma resposta.
+- Na DUVIDA, SEMPRE gere uma consulta SELECT. So use SEM_CONSULTA em casos
+  OBVIOS de mensagem que NAO pede informacao: saudacao solta ("oi", "bom dia"),
+  "ok", "kkk", "obrigado", ou texto sem sentido. QUALQUER mensagem que fale de
+  obra, recurso, valor, bairro, engenheiro, empresa, prazo, status, praca, rua,
+  escola, ou pergunte "qual/quanto/quantos/onde/quando" sobre algo DEVE virar
+  SELECT - nunca SEM_CONSULTA. Exemplos que SAO consulta (gere SELECT):
+  "qual o recurso da praca de lazer", "quem e o engenheiro", "quanto custou",
+  "obras no centro". Na duvida entre consultar e recusar, CONSULTE.
 - Use os nomes de coluna exatos do schema.
 - Para status, use os valores exatos (ex.: 'Concluída' com acento).
 - Entenda linguagem informal: "prontas"/"terminadas" = status 'Concluída';

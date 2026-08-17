@@ -110,6 +110,29 @@ function bairroDoNome(nome) {
   return null;
 }
 
+// Junta todos os nomes de coluna ja usados pelos campos fixos (com sinonimos),
+// pra saber quais colunas da planilha JA foram aproveitadas. O resto vira extra.
+const NOMES_FIXOS_USADOS = new Set();
+for (const campo of Object.keys(MAPA)) {
+  for (const sin of MAPA[campo]) NOMES_FIXOS_USADOS.add(sin);
+}
+
+// Coleta TODAS as outras colunas da planilha (as que nao viraram campo fixo)
+// num objeto "dados_extras". Assim NADA se perde: recurso, convenio, contrato,
+// aditivos, prazo, datas - tudo que a planilha tiver e nao for campo fixo entra
+// aqui, com o nome original da coluna. Se a planilha ganhar coluna nova amanha,
+// ela entra sozinha, sem mexer no codigo.
+function coletarExtras(obra) {
+  const extras = {};
+  for (const chave of Object.keys(obra)) {
+    if (chave === "_aba") continue;              // controle interno, ignora
+    if (NOMES_FIXOS_USADOS.has(norm(chave))) continue; // ja virou campo fixo
+    const valor = (obra[chave] || "").toString().trim();
+    if (valor) extras[chave.trim()] = valor;     // guarda com o nome original
+  }
+  return Object.keys(extras).length ? extras : null;
+}
+
 // Transforma uma obra crua (da planilha) numa linha limpa pro banco.
 function limpar(obra) {
   const objeto = pegar(obra, "objeto");
@@ -131,6 +154,7 @@ function limpar(obra) {
     engenheiro: (pegar(obra, "engenheiro") || "").toString().trim() || null,
     empresa: (pegar(obra, "empresa") || "").toString().trim() || null,
     aba_origem: obra._aba || null,
+    dados_extras: coletarExtras(obra), // TODAS as outras colunas da planilha
   };
 }
 
@@ -151,10 +175,15 @@ export async function sincronizar() {
 
   // Insere em lote.
   const campos = ["objeto","bairro","status","categoria","valor_total",
-    "valor_executado","percentual_executado","engenheiro","empresa","aba_origem"];
+    "valor_executado","percentual_executado","engenheiro","empresa","aba_origem",
+    "dados_extras"];
   let inseridas = 0;
   for (const o of limpas) {
-    const valores = campos.map((c) => o[c]);
+    const valores = campos.map((c) => {
+      // dados_extras vai como JSON (string) para a coluna JSONB do Postgres.
+      if (c === "dados_extras") return o[c] ? JSON.stringify(o[c]) : null;
+      return o[c];
+    });
     const marcadores = campos.map((_, i) => `$${i + 1}`).join(",");
     await query(
       `INSERT INTO obras (${campos.join(",")}) VALUES (${marcadores})`,
