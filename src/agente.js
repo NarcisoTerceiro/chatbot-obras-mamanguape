@@ -212,14 +212,22 @@ async function redigir(pergunta, linhas, ehInicio = false) {
     const junto = (dados_extras && typeof dados_extras === "object")
       ? { ...resto, ...dados_extras }
       : { ...resto };
-    // formata qualquer campo de valor em reais para texto pronto
     for (const chave of Object.keys(junto)) {
       const v = junto[chave];
-      const ehValor = /valor|total|custo|investi|aditivo|contrato/i.test(chave);
+      // So formata como R$ campos que sao REALMENTE valor monetario. Evita
+      // pegar contagens (count, total de obras) - por isso exige "valor" ou
+      // palavras de dinheiro, e ignora nomes com "obras"/"count"/"quantidade".
+      const ehContagem = /obras|count|quantidade|qtd|numero de/i.test(chave);
+      const ehValor = !ehContagem &&
+        /valor|custo|investi|aditivo|orcamento|montante|r\$/i.test(chave);
       if (ehValor && v !== null && v !== undefined && v !== "" && !isNaN(Number(v))) {
         junto[chave] = "R$ " + Number(v).toLocaleString("pt-BR", {
           minimumFractionDigits: 2, maximumFractionDigits: 2,
         });
+      }
+      // Valor vazio/null vira texto amigavel (nao mostra "null" pro cidadao).
+      if (ehValor && (v === null || v === undefined || v === "")) {
+        junto[chave] = "valor nao informado";
       }
     }
     return junto;
@@ -255,7 +263,7 @@ OUTRAS REGRAS:
 - Os valores JA VEM formatados como "R$ ..." no JSON - use-os como estao.
 - Nao mencione "banco", "SQL", "dados" nem que voce e uma IA.
 - No maximo um emoji sutil. Seja objetivo e direto, sem floreio.
-${muitasLinhas ? "- A lista e LONGA: UMA linha por obra: '• Nome — R$ valor'. SEM introducao, SEM detalhes extras. Termine com 'Total: N obras' onde N e a quantidade EXATA de itens que voce listou." : "- Responda de forma completa mas objetiva. Se houver valor, cite-o exatamente."}`;
+${muitasLinhas ? "- A lista e LONGA: UMA linha por obra: '• Nome — R$ valor'. Se o valor for 'valor nao informado', escreva assim mesmo (nao invente). SEM introducao. Termine com 'Total: N obras' onde N e a quantidade EXATA de itens listados. Se algumas obras nao tem valor, acrescente uma linha curta explicando: 'Obs.: algumas obras ainda nao tem valor cadastrado.'" : "- Responda de forma completa mas objetiva. Se o valor for 'valor nao informado', diga isso - nao invente numero."}`;
 
   const limite = muitasLinhas ? 4096 : 1024;
   return await chamarIAbruta([{ role: "user", content: prompt }], { max_tokens: limite });
