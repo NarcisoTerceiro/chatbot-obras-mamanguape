@@ -203,17 +203,26 @@ SQL:`;
 
 // --- CHAMADA 2: resultado -> resposta natural ---
 async function redigir(pergunta, linhas, ehInicio = false) {
-  // Se as linhas tem dados_extras (JSONB), ele vem como objeto e polui o JSON
-  // que a IA recebe (fica gigante e confuso, causando "dificuldade para montar
-  // a resposta"). Achatamos: cada chave do dados_extras vira um campo normal.
+  // Achata dados_extras E pre-formata valores em reais NO CODIGO. Assim os
+  // numeros ja chegam prontos ("R$ 1.408.500,00") e a IA so COPIA - nunca
+  // recalcula nem redigita, o que elimina o erro de valor mudar entre respostas.
   const linhasLimpas = linhas.map((lin) => {
     if (!lin || typeof lin !== "object") return lin;
     const { dados_extras, ...resto } = lin;
-    if (dados_extras && typeof dados_extras === "object") {
-      // junta os campos extras no nivel de cima, com nomes legiveis
-      return { ...resto, ...dados_extras };
+    const junto = (dados_extras && typeof dados_extras === "object")
+      ? { ...resto, ...dados_extras }
+      : { ...resto };
+    // formata qualquer campo de valor em reais para texto pronto
+    for (const chave of Object.keys(junto)) {
+      const v = junto[chave];
+      const ehValor = /valor|total|custo|investi|aditivo|contrato/i.test(chave);
+      if (ehValor && v !== null && v !== undefined && v !== "" && !isNaN(Number(v))) {
+        junto[chave] = "R$ " + Number(v).toLocaleString("pt-BR", {
+          minimumFractionDigits: 2, maximumFractionDigits: 2,
+        });
+      }
     }
-    return resto;
+    return junto;
   });
   const dados = JSON.stringify(linhasLimpas.slice(0, 50));
   const muitasLinhas = linhasLimpas.length > 8;
@@ -223,35 +232,31 @@ O sistema consultou o banco e retornou EXATAMENTE estes dados (JSON): ${dados}
 
 Escreva uma resposta clara e cordial em portugues, formato WhatsApp.
 
-REGRAS ABSOLUTAS (nunca quebre):
-- Responda USANDO SOMENTE os dados do JSON acima. Todo numero, nome ou valor
-  na sua resposta TEM que aparecer no JSON. Se nao esta no JSON, NAO existe.
-- NUNCA reutilize numeros de mensagens anteriores da conversa. Um numero que
-  apareceu antes (ex.: quantidade de obras) NAO vale para outra pergunta
-  (ex.: quantidade de engenheiros). Cada resposta usa SO o JSON desta consulta.
-- Se o JSON tem um COUNT/total, use exatamente esse numero. Se tem uma lista,
-  conte os itens da lista. Nao arredonde nem estime.
-- CUIDADO com "ao todo"/"no total"/"geral": esse numero e DIFERENTE de "em
-  andamento". "Em andamento" e so um status; "ao todo" e a soma de TODAS as
-  obras (todos os status). Use exatamente o numero que o JSON traz para a
-  pergunta feita - nao troque um pelo outro.
-- NAO concorde automaticamente com o que o cidadao afirmou. Se ele disser
-  "sao 24 engenheiros, ne?" e o JSON mostrar outro numero, corrija com educacao
-  ("Na verdade, sao X..."). A verdade e o JSON, nao a pergunta.
-- Se os dados vierem vazios, diga que nao encontrou essa informacao e peca para
-  reformular. NUNCA invente um numero para preencher.
+REGRAS ABSOLUTAS DE EXATIDAO (o mais importante - nunca quebre):
+- COPIE os numeros e valores EXATAMENTE como aparecem no JSON, digito por digito.
+  Se o JSON diz "R$ 1.408.500,00", escreva "R$ 1.408.500,00" - NAO troque nenhum
+  algarismo, NAO arredonde, NAO recalcule. Copiar errado um valor e o pior erro.
+- Todo numero, nome ou valor na resposta TEM que aparecer no JSON. Se nao esta
+  no JSON, NAO existe - nao invente.
+- Para "quantas" (contagem): conte os itens do JSON ou use o COUNT que ele traz.
+  O total que voce disser TEM que bater com a quantidade de itens listados. Se
+  listou 6 obras, o total e 6 - nunca diga um numero diferente do que listou.
+- NUNCA reutilize numeros de mensagens anteriores. Cada resposta usa SO este JSON.
+- CUIDADO: "ao todo/geral" e DIFERENTE de "em andamento" (um status so). Use o
+  numero exato que o JSON traz para a pergunta feita.
+- NAO concorde com o cidadao sem conferir. A verdade e o JSON, nao a pergunta.
+- Se o JSON vier vazio, diga que nao encontrou e peca para reformular. NUNCA
+  invente numero para preencher.
 - ${ehInicio
     ? "Esta e a PRIMEIRA mensagem: pode cumprimentar uma vez (Ola/Bom dia)."
-    : "NAO cumprimente (nao comece com Ola, Oi, Bom dia, Boa tarde). A conversa JA comecou - va DIRETO a resposta. Cumprimentar de novo soa robotico."}
+    : "NAO cumprimente. A conversa JA comecou - va DIRETO a resposta."}
 
 OUTRAS REGRAS:
-- Valores em reais no formato R$ 1.234.567,00.
+- Os valores JA VEM formatados como "R$ ..." no JSON - use-os como estao.
 - Nao mencione "banco", "SQL", "dados" nem que voce e uma IA.
-- No maximo um emoji sutil.
-${muitasLinhas ? "- A lista e LONGA: seja MUITO ENXUTO. UMA linha por obra, so o nome (e valor se existir). Formato: '• Nome da obra — R$ valor'. SEM introducao longa, SEM detalhes por obra, SEM repetir rotulos. Termine com o total de itens (ex.: 'Total: 24 obras')." : "- Seja conciso."}`;
+- No maximo um emoji sutil. Seja objetivo e direto, sem floreio.
+${muitasLinhas ? "- A lista e LONGA: UMA linha por obra: '• Nome — R$ valor'. SEM introducao, SEM detalhes extras. Termine com 'Total: N obras' onde N e a quantidade EXATA de itens que voce listou." : "- Responda de forma completa mas objetiva. Se houver valor, cite-o exatamente."}`;
 
-  // max_tokens ALTO para listas longas (24+ obras) nao cortarem no meio.
-  // Uma lista de 24 obras com nome+valor precisa de bastante espaco.
   const limite = muitasLinhas ? 4096 : 1024;
   return await chamarIAbruta([{ role: "user", content: prompt }], { max_tokens: limite });
 }
