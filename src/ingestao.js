@@ -178,19 +178,43 @@ export async function sincronizar() {
   const campos = ["objeto","bairro","status","categoria","valor_total",
     "valor_executado","percentual_executado","engenheiro","empresa","aba_origem",
     "dados_extras"];
+
+  // INSERCAO EM LOTE: junta varias obras numa unica query, em blocos.
+  // Antes era uma query por obra (2000 obras = 2000 idas ao banco = timeout).
+  // Agora insere ~100 por vez, o que aguenta milhares de obras em segundos.
+  // Postgres limita ~65535 parametros por query; com 11 campos, 100 obras =
+  // 1100 parametros, bem dentro do limite e com folga.
+  const TAMANHO_LOTE = 100;
   let inseridas = 0;
-  for (const o of limpas) {
-    const valores = campos.map((c) => {
-      // dados_extras vai como JSON (string) para a coluna JSONB do Postgres.
+
+  function valoresDaObra(o) {
+    return campos.map((c) => {
       if (c === "dados_extras") return o[c] ? JSON.stringify(o[c]) : null;
       return o[c];
     });
-    const marcadores = campos.map((_, i) => `$${i + 1}`).join(",");
+  }
+
+  for (let inicio = 0; inicio < limpas.length; inicio += TAMANHO_LOTE) {
+    const bloco = limpas.slice(inicio, inicio + TAMANHO_LOTE);
+    const todosValores = [];
+    const gruposMarcadores = [];
+
+    bloco.forEach((o, idxObra) => {
+      const vals = valoresDaObra(o);
+      const marcadores = vals.map((_, idxCampo) => {
+        const posicao = idxObra * campos.length + idxCampo + 1;
+        return `$${posicao}`;
+      });
+      gruposMarcadores.push(`(${marcadores.join(",")})`);
+      todosValores.push(...vals);
+    });
+
     await query(
-      `INSERT INTO obras (${campos.join(",")}) VALUES (${marcadores})`,
-      valores
+      `INSERT INTO obras (${campos.join(",")}) VALUES ${gruposMarcadores.join(",")}`,
+      todosValores
     );
-    inseridas++;
+    inseridas += bloco.length;
+    console.log(`INGESTAO: lote inserido (${inseridas}/${limpas.length}).`);
   }
 
   console.log(`INGESTAO: ${inseridas} obras inseridas no banco.`);

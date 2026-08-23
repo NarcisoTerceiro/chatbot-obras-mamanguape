@@ -232,8 +232,15 @@ async function redigir(pergunta, linhas, ehInicio = false) {
     }
     return junto;
   });
-  const dados = JSON.stringify(linhasLimpas.slice(0, 50));
-  const muitasLinhas = linhasLimpas.length > 8;
+  // Protecao para listas GIGANTES (planilha grande, ex: 500+ obras).
+  // Nao da pra despejar 500 obras num WhatsApp (o app corta, fica caro e lento).
+  // Se vier muita coisa, mostramos uma AMOSTRA e avisamos o total real.
+  const totalLinhas = linhasLimpas.length;
+  const LIMITE_LISTA = 30; // acima disso, vira amostra
+  const listaGigante = totalLinhas > LIMITE_LISTA;
+  const amostra = listaGigante ? linhasLimpas.slice(0, LIMITE_LISTA) : linhasLimpas;
+  const dados = JSON.stringify(amostra.slice(0, 50));
+  const muitasLinhas = amostra.length > 8;
   const prompt = `Voce e o Assistente de Obras da Prefeitura de Mamanguape no WhatsApp.
 O cidadao perguntou: "${pergunta}"
 O sistema consultou o banco e retornou EXATAMENTE estes dados (JSON): ${dados}
@@ -263,6 +270,7 @@ OUTRAS REGRAS:
 - Os valores JA VEM formatados como "R$ ..." no JSON - use-os como estao.
 - Nao mencione "banco", "SQL", "dados" nem que voce e uma IA.
 - No maximo um emoji sutil. Seja objetivo e direto, sem floreio.
+${listaGigante ? `- ATENCAO: existem ${totalLinhas} obras no total, mas voce recebeu so as primeiras ${LIMITE_LISTA} como amostra. Liste essas ${LIMITE_LISTA} e diga claramente: "Estas sao as primeiras ${LIMITE_LISTA} de ${totalLinhas} obras. Para ver melhor, me diga um bairro ou status especifico." NAO diga que sao so ${LIMITE_LISTA} no total - o total real e ${totalLinhas}.` : ""}
 ${muitasLinhas ? "- A lista e LONGA: UMA linha por obra: '• Nome — R$ valor'. Se o valor for 'valor nao informado', escreva assim mesmo (nao invente). SEM introducao. Termine com 'Total: N obras' onde N e a quantidade EXATA de itens listados. Se algumas obras nao tem valor, acrescente uma linha curta explicando: 'Obs.: algumas obras ainda nao tem valor cadastrado.'" : "- Responda de forma completa mas objetiva. Se o valor for 'valor nao informado', diga isso - nao invente numero."}`;
 
   const limite = muitasLinhas ? 4096 : 1024;

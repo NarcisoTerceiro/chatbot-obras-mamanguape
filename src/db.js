@@ -27,6 +27,16 @@ function montarConfig() {
     connectionString: url,
     // aceita o certificado do pooler sem exigir CA
     ssl: { rejectUnauthorized: false },
+    // --- Ajustes de desempenho/estabilidade (importantes no plano gratuito) ---
+    // max: o Supabase gratuito tem POUCAS conexoes. Um pool pequeno evita
+    // estourar o limite e ficar esperando na fila (o que parece "SQL lento").
+    max: 5,
+    // Fecha conexoes ociosas rapido, liberando slots do Supabase.
+    idleTimeoutMillis: 10000,
+    // Se a conexao nao estabelece em 10s, falha rapido em vez de pendurar.
+    connectionTimeoutMillis: 10000,
+    // Se uma query travar por mais de 15s, aborta (evita ficar pendurado).
+    statement_timeout: 15000,
   };
 }
 
