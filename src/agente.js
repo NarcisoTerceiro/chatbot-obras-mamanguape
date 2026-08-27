@@ -202,77 +202,49 @@ SQL:`;
 }
 
 // --- CHAMADA 2: resultado -> resposta natural ---
-async function redigir(pergunta, linhas, ehInicio = false) {
-  // Achata dados_extras E pre-formata valores em reais NO CODIGO. Assim os
-  // numeros ja chegam prontos ("R$ 1.408.500,00") e a IA so COPIA - nunca
-  // recalcula nem redigita, o que elimina o erro de valor mudar entre respostas.
+async function redigir(pergunta, linhas) {
+  // Se as linhas tem dados_extras (JSONB), ele vem como objeto e polui o JSON
+  // que a IA recebe (fica gigante e confuso, causando "dificuldade para montar
+  // a resposta"). Achatamos: cada chave do dados_extras vira um campo normal.
   const linhasLimpas = linhas.map((lin) => {
     if (!lin || typeof lin !== "object") return lin;
     const { dados_extras, ...resto } = lin;
-    const junto = (dados_extras && typeof dados_extras === "object")
-      ? { ...resto, ...dados_extras }
-      : { ...resto };
-    for (const chave of Object.keys(junto)) {
-      const v = junto[chave];
-      // So formata como R$ campos que sao REALMENTE valor monetario. Evita
-      // pegar contagens (count, total de obras) - por isso exige "valor" ou
-      // palavras de dinheiro, e ignora nomes com "obras"/"count"/"quantidade".
-      const ehContagem = /obras|count|quantidade|qtd|numero de/i.test(chave);
-      const ehValor = !ehContagem &&
-        /valor|custo|investi|aditivo|orcamento|montante|r\$/i.test(chave);
-      if (ehValor && v !== null && v !== undefined && v !== "" && !isNaN(Number(v))) {
-        junto[chave] = "R$ " + Number(v).toLocaleString("pt-BR", {
-          minimumFractionDigits: 2, maximumFractionDigits: 2,
-        });
-      }
-      // Valor vazio/null vira texto amigavel (nao mostra "null" pro cidadao).
-      if (ehValor && (v === null || v === undefined || v === "")) {
-        junto[chave] = "valor nao informado";
-      }
+    if (dados_extras && typeof dados_extras === "object") {
+      // junta os campos extras no nivel de cima, com nomes legiveis
+      return { ...resto, ...dados_extras };
     }
-    return junto;
+    return resto;
   });
-  // Protecao para listas GIGANTES (planilha grande, ex: 500+ obras).
-  // Nao da pra despejar 500 obras num WhatsApp (o app corta, fica caro e lento).
-  // Se vier muita coisa, mostramos uma AMOSTRA e avisamos o total real.
-  const totalLinhas = linhasLimpas.length;
-  const LIMITE_LISTA = 30; // acima disso, vira amostra
-  const listaGigante = totalLinhas > LIMITE_LISTA;
-  const amostra = listaGigante ? linhasLimpas.slice(0, LIMITE_LISTA) : linhasLimpas;
-  const dados = JSON.stringify(amostra.slice(0, 50));
-  const muitasLinhas = amostra.length > 8;
+  const dados = JSON.stringify(linhasLimpas.slice(0, 50));
+  const muitasLinhas = linhasLimpas.length > 8;
   const prompt = `Voce e o Assistente de Obras da Prefeitura de Mamanguape no WhatsApp.
 O cidadao perguntou: "${pergunta}"
 O sistema consultou o banco e retornou EXATAMENTE estes dados (JSON): ${dados}
 
 Escreva uma resposta clara e cordial em portugues, formato WhatsApp.
 
-REGRAS ABSOLUTAS DE EXATIDAO (o mais importante - nunca quebre):
-- COPIE os numeros e valores EXATAMENTE como aparecem no JSON, digito por digito.
-  Se o JSON diz "R$ 1.408.500,00", escreva "R$ 1.408.500,00" - NAO troque nenhum
-  algarismo, NAO arredonde, NAO recalcule. Copiar errado um valor e o pior erro.
-- Todo numero, nome ou valor na resposta TEM que aparecer no JSON. Se nao esta
-  no JSON, NAO existe - nao invente.
-- Para "quantas" (contagem): conte os itens do JSON ou use o COUNT que ele traz.
-  O total que voce disser TEM que bater com a quantidade de itens listados. Se
-  listou 6 obras, o total e 6 - nunca diga um numero diferente do que listou.
-- NUNCA reutilize numeros de mensagens anteriores. Cada resposta usa SO este JSON.
-- CUIDADO: "ao todo/geral" e DIFERENTE de "em andamento" (um status so). Use o
-  numero exato que o JSON traz para a pergunta feita.
-- NAO concorde com o cidadao sem conferir. A verdade e o JSON, nao a pergunta.
-- Se o JSON vier vazio, diga que nao encontrou e peca para reformular. NUNCA
-  invente numero para preencher.
-- ${ehInicio
-    ? "Esta e a PRIMEIRA mensagem: pode cumprimentar uma vez (Ola/Bom dia)."
-    : "NAO cumprimente. A conversa JA comecou - va DIRETO a resposta."}
+REGRAS ABSOLUTAS (nunca quebre):
+- Responda USANDO SOMENTE os dados do JSON acima. Todo numero, nome ou valor
+  na sua resposta TEM que aparecer no JSON. Se nao esta no JSON, NAO existe.
+- NUNCA reutilize numeros de mensagens anteriores da conversa. Um numero que
+  apareceu antes (ex.: quantidade de obras) NAO vale para outra pergunta
+  (ex.: quantidade de engenheiros). Cada resposta usa SO o JSON desta consulta.
+- Se o JSON tem um COUNT/total, use exatamente esse numero. Se tem uma lista,
+  conte os itens da lista. Nao arredonde nem estime.
+- NAO concorde automaticamente com o que o cidadao afirmou. Se ele disser
+  "sao 24 engenheiros, ne?" e o JSON mostrar outro numero, corrija com educacao
+  ("Na verdade, sao X..."). A verdade e o JSON, nao a pergunta.
+- Se os dados vierem vazios, diga que nao encontrou essa informacao e peca para
+  reformular. NUNCA invente um numero para preencher.
 
 OUTRAS REGRAS:
-- Os valores JA VEM formatados como "R$ ..." no JSON - use-os como estao.
+- Valores em reais no formato R$ 1.234.567,00.
 - Nao mencione "banco", "SQL", "dados" nem que voce e uma IA.
-- No maximo um emoji sutil. Seja objetivo e direto, sem floreio.
-${listaGigante ? `- ATENCAO: existem ${totalLinhas} obras no total, mas voce recebeu so as primeiras ${LIMITE_LISTA} como amostra. Liste essas ${LIMITE_LISTA} e diga claramente: "Estas sao as primeiras ${LIMITE_LISTA} de ${totalLinhas} obras. Para ver melhor, me diga um bairro ou status especifico." NAO diga que sao so ${LIMITE_LISTA} no total - o total real e ${totalLinhas}.` : ""}
-${muitasLinhas ? "- A lista e LONGA: UMA linha por obra: '• Nome — R$ valor'. Se o valor for 'valor nao informado', escreva assim mesmo (nao invente). SEM introducao. Termine com 'Total: N obras' onde N e a quantidade EXATA de itens listados. Se algumas obras nao tem valor, acrescente uma linha curta explicando: 'Obs.: algumas obras ainda nao tem valor cadastrado.'" : "- Responda de forma completa mas objetiva. Se o valor for 'valor nao informado', diga isso - nao invente numero."}`;
+- No maximo um emoji sutil.
+${muitasLinhas ? "- A lista e LONGA: seja MUITO ENXUTO. UMA linha por obra, so o nome (e valor se existir). Formato: '• Nome da obra — R$ valor'. SEM introducao longa, SEM detalhes por obra, SEM repetir rotulos. Termine com o total de itens (ex.: 'Total: 24 obras')." : "- Seja conciso."}`;
 
+  // max_tokens ALTO para listas longas (24+ obras) nao cortarem no meio.
+  // Uma lista de 24 obras com nome+valor precisa de bastante espaco.
   const limite = muitasLinhas ? 4096 : 1024;
   return await chamarIAbruta([{ role: "user", content: prompt }], { max_tokens: limite });
 }
@@ -366,9 +338,7 @@ export async function responderPergunta(pergunta, historico = []) {
 
   // 4. Redige resposta
   try {
-    // Saudacao so na PRIMEIRA mensagem (historico vazio). Depois, resposta direta.
-    const ehInicio = !Array.isArray(historico) || historico.length === 0;
-    const resposta = await redigir(pergunta, linhas, ehInicio);
+    const resposta = await redigir(pergunta, linhas);
     return { resposta, sql, linhas: linhas.length };
   } catch (e) {
     return { resposta: "Encontrei os dados, mas tive dificuldade para montar a resposta. Pode reformular?", erro: "redigir: " + e.message };
