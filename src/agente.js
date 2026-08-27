@@ -147,6 +147,14 @@ REGRAS:
   "voce tem certeza?", "e mesmo?"), e NAO sobre as obras, gere uma consulta que
   reflita o dado real que responde a pergunta ANTERIOR verdadeira - nunca repita
   um numero solto. Na duvida, prefira contar corretamente a partir da tabela.
+- MUITO IMPORTANTE - CONTEXTO DA CONVERSA: se a pergunta atual e um
+  ACOMPANHAMENTO da anterior (ex.: "me informa os nomes", "e o engenheiro
+  dessas?", "quais sao elas?", "lista essas"), ela HERDA o filtro da pergunta
+  anterior. Exemplo real: se o cidadao perguntou "quantas obras concluidas?" e
+  DEPOIS "me informa os nomes das obras", ele quer os nomes das CONCLUIDAS -
+  entao gere: SELECT objeto, engenheiro FROM obras WHERE status = 'Concluída'.
+  NUNCA traga TODAS as obras se a conversa estava filtrada (por status, bairro,
+  etc.). Olhe o CONTEXTO abaixo e mantenha o mesmo filtro que estava valendo.
 - Para filtrar por texto (bairro/empresa/engenheiro/objeto), use unaccent()
   nos DOIS lados para ignorar acento E maiuscula. Exemplo:
   WHERE unaccent(bairro) ILIKE unaccent('%centro%')
