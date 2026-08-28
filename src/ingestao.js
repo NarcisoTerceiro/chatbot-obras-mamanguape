@@ -11,7 +11,7 @@
 // ============================================================
 
 import { getObras, limparCache } from "./sheets.js";
-import { query } from "./db.js";
+import { withAdminTransaction } from "./db.js";
 
 // --- utilidades de limpeza ---
 function norm(s) {
@@ -171,9 +171,6 @@ export async function sincronizar() {
     return { inseridas: 0 };
   }
 
-  // Substitui tudo: limpa a tabela e insere as novas.
-  await query("TRUNCATE TABLE obras RESTART IDENTITY;");
-
   // Insere em lote.
   const campos = ["objeto","bairro","status","categoria","valor_total",
     "valor_executado","percentual_executado","engenheiro","empresa","aba_origem",
@@ -194,28 +191,35 @@ export async function sincronizar() {
     });
   }
 
-  for (let inicio = 0; inicio < limpas.length; inicio += TAMANHO_LOTE) {
-    const bloco = limpas.slice(inicio, inicio + TAMANHO_LOTE);
-    const todosValores = [];
-    const gruposMarcadores = [];
+  // TRUNCATE + TODOS os lotes ficam na mesma transacao. O PostgreSQL torna o
+  // TRUNCATE transacional: se um INSERT falhar, o banco volta integralmente ao
+  // estado anterior, sem ficar vazio ou pela metade.
+  await withAdminTransaction(async (client) => {
+    await client.query("TRUNCATE TABLE obras RESTART IDENTITY;");
 
-    bloco.forEach((o, idxObra) => {
-      const vals = valoresDaObra(o);
-      const marcadores = vals.map((_, idxCampo) => {
-        const posicao = idxObra * campos.length + idxCampo + 1;
-        return `$${posicao}`;
+    for (let inicio = 0; inicio < limpas.length; inicio += TAMANHO_LOTE) {
+      const bloco = limpas.slice(inicio, inicio + TAMANHO_LOTE);
+      const todosValores = [];
+      const gruposMarcadores = [];
+
+      bloco.forEach((o, idxObra) => {
+        const vals = valoresDaObra(o);
+        const marcadores = vals.map((_, idxCampo) => {
+          const posicao = idxObra * campos.length + idxCampo + 1;
+          return `$${posicao}`;
+        });
+        gruposMarcadores.push(`(${marcadores.join(",")})`);
+        todosValores.push(...vals);
       });
-      gruposMarcadores.push(`(${marcadores.join(",")})`);
-      todosValores.push(...vals);
-    });
 
-    await query(
-      `INSERT INTO obras (${campos.join(",")}) VALUES ${gruposMarcadores.join(",")}`,
-      todosValores
-    );
-    inseridas += bloco.length;
-    console.log(`INGESTAO: lote inserido (${inseridas}/${limpas.length}).`);
-  }
+      await client.query(
+        `INSERT INTO obras (${campos.join(",")}) VALUES ${gruposMarcadores.join(",")}`,
+        todosValores
+      );
+      inseridas += bloco.length;
+      console.log(`INGESTAO: lote inserido (${inseridas}/${limpas.length}).`);
+    }
+  });
 
   console.log(`INGESTAO: ${inseridas} obras inseridas no banco.`);
   return { inseridas };

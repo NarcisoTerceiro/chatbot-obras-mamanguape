@@ -1,22 +1,16 @@
 // ============================================================
 //  server.js  -  ponto de entrada do chatbot
 //
-//  Fluxo:
-//  WhatsApp -> Webhook (aqui)
-//           -> A IA (Groq) interpreta o pedido usando o HISTORICO
-//              da conversa e devolve tipo + termos (+ agregacao).
-//           -> O SISTEMA busca na planilha (search.js) e, quando e
-//              agregacao, CALCULA em JavaScript puro (agregacao.js).
-//           -> O SISTEMA entrega esses dados de volta a IA.
-//           -> A IA REDIGE a resposta final, conectada com a conversa.
-//           -> WhatsApp Cloud API envia ao cidadao.
+//  Fluxo padrao:
+//  Google Sheets --(conta de servico/sincronizacao)--> Supabase
+//  WhatsApp -> Webhook validado -> agente SQL -> Supabase -> WhatsApp.
 //
-//  A IA lembra da conversa e redige, mas NUNCA acessa a planilha,
-//  NUNCA faz conta e NUNCA inventa dado. Se a IA falhar, o proprio
-//  sistema monta a resposta, sem travar o atendimento.
+//  O motor antigo que consulta a planilha diretamente permanece somente como
+//  retorno de emergencia quando USAR_AGENTE_SQL=false.
 // ============================================================
 
 import "dotenv/config";
+import crypto from "crypto";
 import express from "express";
 
 import { getObras, getDiagnostico } from "./sheets.js";
@@ -27,12 +21,69 @@ import { interpretarPergunta, redigirResposta, calcularComCodeExecution, gerarCo
 import { executarAgregacao, executarReceita } from "./agregacao.js";
 import { sandboxDisponivel, executarNoSandbox } from "./sandboxClient.js";
 import { enviarTexto } from "./whatsapp.js";
+import { queryReadOnly } from "./db.js";
 
 const app = express();
-app.use(express.json());
+// Guarda os bytes originais para validar a assinatura HMAC enviada pela Meta.
+app.use(express.json({
+  verify: (req, _res, buffer) => {
+    req.rawBody = Buffer.from(buffer);
+  },
+}));
 
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const META_APP_SECRET = process.env.META_APP_SECRET;
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || VERIFY_TOKEN;
+// Banco/Supabase e o caminho normal. O motor antigo so e ativado quando a
+// variavel for explicitamente "false", como retorno de emergencia.
+const USAR_AGENTE_SQL = process.env.USAR_AGENTE_SQL !== "false";
+const PERMITIR_TOKEN_QUERY = process.env.PERMITIR_TOKEN_QUERY === "true";
+const PERMITIR_SYNC_GET_LEGADO = process.env.PERMITIR_SYNC_GET_LEGADO === "true";
+
+if (!VERIFY_TOKEN) {
+  throw new Error("VERIFY_TOKEN e obrigatorio; o servidor nao inicia sem ele.");
+}
+if (!META_APP_SECRET) {
+  throw new Error("META_APP_SECRET e obrigatorio para validar o webhook da Meta.");
+}
+if (!ADMIN_TOKEN) {
+  throw new Error("ADMIN_TOKEN e obrigatorio para as rotas administrativas.");
+}
+if (USAR_AGENTE_SQL && !process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL read-only e obrigatoria para o agente SQL.");
+}
+
+function compararSegredo(a, b) {
+  const ba = Buffer.from((a || "").toString());
+  const bb = Buffer.from((b || "").toString());
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+}
+
+function adminAutorizado(req) {
+  const cabecalho = req.get("authorization") || "";
+  const bearer = cabecalho.match(/^Bearer\s+(.+)$/i)?.[1] || "";
+  if (compararSegredo(bearer, ADMIN_TOKEN)) return true;
+  // Compatibilidade temporaria, desligada por padrao. Tokens na URL podem
+  // aparecer em historico, proxy e logs; migre o chamador para Authorization.
+  return PERMITIR_TOKEN_QUERY && compararSegredo(req.query.token, ADMIN_TOKEN);
+}
+
+function exigirAdmin(req, res) {
+  if (adminAutorizado(req)) return true;
+  res.sendStatus(403);
+  return false;
+}
+
+function assinaturaMetaValida(req) {
+  const recebida = req.get("x-hub-signature-256") || "";
+  if (!recebida.startsWith("sha256=") || !req.rawBody) return false;
+  const esperada = "sha256=" + crypto
+    .createHmac("sha256", META_APP_SECRET)
+    .update(req.rawBody)
+    .digest("hex");
+  return compararSegredo(recebida, esperada);
+}
 
 // Contato humano para escalar quando o bot nao resolve (opcional, via .env).
 const CONTATO_SECRETARIA = process.env.CONTATO_SECRETARIA || "";
@@ -49,6 +100,23 @@ const LIMITE_RESUMIDO = 15;
 const memoriaPorUsuario = new Map();
 const MEMORIA_VALIDADE_MS = 10 * 60 * 1000; // 10 minutos
 const MAX_HISTORICO = 8; // guarda ate 8 mensagens (~4 trocas)
+
+// Evita responder duas vezes ao mesmo evento da Meta. E uma protecao local;
+// para varias instancias, substitua por Redis/PostgreSQL com chave unica.
+const mensagensEmProcessamento = new Set();
+const mensagensProcessadas = new Map();
+const DEDUP_VALIDADE_MS = 24 * 60 * 60 * 1000;
+
+function limparDeduplicacao(agora = Date.now()) {
+  for (const [id, quando] of mensagensProcessadas) {
+    if (agora - quando > DEDUP_VALIDADE_MS) mensagensProcessadas.delete(id);
+  }
+}
+
+function mascararTelefone(numero) {
+  const s = (numero || "").toString();
+  return s.length <= 4 ? "****" : `***${s.slice(-4)}`;
+}
 
 function memoriaVazia() {
   return { historico: [], obras: [], termos: [], tipo: "", falhas: 0, mostradas: 0 };
@@ -87,11 +155,13 @@ function salvarMemoria(de, dados) {
 // Nao guarda o numero de telefone (privacidade). Serve para quem administra o
 // bot revisar depois e ajustar sinonimos no prompt ou completar a planilha.
 function logPerguntaSemResultado(pergunta, termos, motivo) {
+  const texto = (pergunta || "").toString().trim().toLowerCase();
   console.log(
     "LOG_SEM_RESULTADO " +
       JSON.stringify({
         data: new Date().toISOString(),
-        pergunta,
+        pergunta_hash: crypto.createHash("sha256").update(texto).digest("hex").slice(0, 16),
+        caracteres: texto.length,
         termos,
         motivo,
       })
@@ -102,19 +172,37 @@ function logPerguntaSemResultado(pergunta, termos, motivo) {
 app.get("/", (_req, res) => res.send("Chatbot de Obras de Mamanguape no ar."));
 
 // ------------------------------------------------------------
-//  Rota de DIAGNOSTICO da planilha (protegida pelo VERIFY_TOKEN).
-//  Abra no navegador:
-//    https://SEU-APP.onrender.com/diagnostico?token=SEU_VERIFY_TOKEN
-//  Mostra quantas obras foram lidas de cada aba, quais colunas foram
-//  detectadas e um exemplo de obra - util para conferir se a planilha
-//  esta sendo lida do jeito certo.
+//  Rota administrativa de diagnostico. Use:
+//    Authorization: Bearer SEU_ADMIN_TOKEN
+//  Quando o agente SQL esta ativo, o diagnostico consulta o MESMO banco usado
+//  pelo WhatsApp, e nao a planilha.
 // ------------------------------------------------------------
 app.get("/diagnostico", async (req, res) => {
-  if (req.query.token !== VERIFY_TOKEN) return res.sendStatus(403);
+  if (!exigirAdmin(req, res)) return;
   try {
+    if (USAR_AGENTE_SQL) {
+      const [total, status, exemplo] = await Promise.all([
+        queryReadOnly("SELECT COUNT(*)::int AS total FROM obras"),
+        queryReadOnly(
+          "SELECT COALESCE(status, 'Não informado') AS status, COUNT(*)::int AS total " +
+          "FROM obras GROUP BY status ORDER BY total DESC LIMIT 20"
+        ),
+        queryReadOnly(
+          "SELECT id, objeto, bairro, status, categoria, aba_origem FROM obras ORDER BY id LIMIT 1"
+        ),
+      ]);
+      return res.json({
+        fonte_do_atendimento: "PostgreSQL/Supabase",
+        total_de_obras: total.rows[0]?.total || 0,
+        contagem_por_status: status.rows,
+        exemplo_de_obra: exemplo.rows[0] || null,
+      });
+    }
+
     const obras = await getObras();
     const diag = getDiagnostico();
-    res.json({
+    return res.json({
+      fonte_do_atendimento: "Google Sheets (modo legado)",
       total_de_obras: obras.length,
       abas: diag.abas,
       exemplo_de_obra: obras[0] || null,
@@ -126,13 +214,12 @@ app.get("/diagnostico", async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  SINCRONIZAR: le a planilha e popula o banco (Supabase).
-//  Acesse:  https://SEU-APP.onrender.com/sincronizar?token=SEU_VERIFY_TOKEN
-//  Use para testar a ingestao manualmente. Depois, o webhook do
-//  Google Sheets chama isso automaticamente quando a planilha muda.
+//  SINCRONIZAR: a conta de servico LE o Google Sheets e esta rota popula o
+//  Supabase. O WhatsApp continua consultando somente o banco.
+//  Chame com POST + Authorization: Bearer SEU_ADMIN_TOKEN.
 // ------------------------------------------------------------
-app.get("/sincronizar", async (req, res) => {
-  if (req.query.token !== VERIFY_TOKEN) return res.sendStatus(403);
+async function executarRotaSincronizacao(req, res) {
+  if (!exigirAdmin(req, res)) return;
   try {
     const resultado = await sincronizar();
     res.json({
@@ -149,19 +236,33 @@ app.get("/sincronizar", async (req, res) => {
       ok: false,
       erro: detalhe || "erro desconhecido",
       codigo: codigo || undefined,
-      dica: "Verifique DATABASE_URL no Render e as credenciais do Google.",
+      dica: "Verifique DATABASE_ADMIN_URL no Render e as credenciais do Google.",
     });
   }
+}
+
+app.post("/sincronizar", executarRotaSincronizacao);
+
+app.get("/sincronizar", (req, res) => {
+  if (!PERMITIR_SYNC_GET_LEGADO) {
+    res.set("Allow", "POST");
+    return res.status(405).json({
+      erro: "Use POST /sincronizar com Authorization: Bearer <ADMIN_TOKEN>.",
+    });
+  }
+  console.warn("AVISO: sincronizacao por GET legado habilitada; migre o chamador para POST.");
+  return executarRotaSincronizacao(req, res);
 });
 
 // ------------------------------------------------------------
 //  TESTAR-AGENTE: testa o agente SQL sem WhatsApp.
-//  Acesse: /testar-agente?token=SEU_TOKEN&q=quantas obras concluidas
+//  Chame GET /testar-agente?q=quantas obras concluidas com o cabecalho:
+//    Authorization: Bearer SEU_ADMIN_TOKEN
 //  Mostra o SQL gerado, quantas linhas voltaram, e a resposta.
 //  So para TESTE - nao mexe no bot do WhatsApp.
 // ------------------------------------------------------------
 app.get("/testar-agente", async (req, res) => {
-  if (req.query.token !== VERIFY_TOKEN) return res.sendStatus(403);
+  if (!exigirAdmin(req, res)) return;
   const pergunta = req.query.q;
   if (!pergunta) return res.json({ erro: "passe a pergunta em ?q=..." });
   try {
@@ -186,7 +287,7 @@ app.get("/webhook", (req, res) => {
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+  if (mode === "subscribe" && compararSegredo(token, VERIFY_TOKEN)) {
     console.log("Webhook verificado com sucesso.");
     return res.status(200).send(challenge);
   }
@@ -197,6 +298,10 @@ app.get("/webhook", (req, res) => {
 //  2) RECEBIMENTO DE MENSAGENS (a Meta manda cada msg via POST)
 // ------------------------------------------------------------
 app.post("/webhook", (req, res) => {
+  if (!assinaturaMetaValida(req)) {
+    console.warn("Webhook rejeitado: assinatura da Meta invalida ou ausente.");
+    return res.sendStatus(401);
+  }
   res.sendStatus(200);
   processarWebhook(req.body).catch((e) =>
     console.error("Erro ao processar webhook:", e)
@@ -559,31 +664,58 @@ function textoEscalada() {
 //  O envio e o salvamento acontecem uma unica vez, no fim.
 // ------------------------------------------------------------
 async function processarWebhook(payload) {
-  const value = payload?.entry?.[0]?.changes?.[0]?.value;
-  const mensagem = value?.messages?.[0];
+  const mensagens = (payload?.entry || []).flatMap((entry) =>
+    (entry?.changes || []).flatMap((change) => change?.value?.messages || [])
+  );
 
+  limparDeduplicacao();
+  for (const mensagem of mensagens) {
+    if (!mensagem || mensagem.type !== "text") continue;
+    const id = (mensagem.id || "").toString();
+    if (id && (mensagensProcessadas.has(id) || mensagensEmProcessamento.has(id))) {
+      console.log("Webhook duplicado ignorado:", id);
+      continue;
+    }
+
+    if (id) mensagensEmProcessamento.add(id);
+    try {
+      await processarMensagem(mensagem);
+      if (id) mensagensProcessadas.set(id, Date.now());
+    } catch (e) {
+      console.error("Erro ao processar mensagem do webhook:", e.message);
+    } finally {
+      if (id) mensagensEmProcessamento.delete(id);
+    }
+  }
+}
+
+async function processarMensagem(mensagem) {
   if (!mensagem || mensagem.type !== "text") return;
 
   const de = mensagem.from;
   const pergunta = mensagem.text.body;
-  console.log(`Pergunta de ${de}: ${pergunta}`);
+  console.log("Mensagem recebida:", {
+    id: mensagem.id || null,
+    de: mascararTelefone(de),
+    caracteres: (pergunta || "").length,
+  });
 
   // ============================================================
   //  SISTEMA NOVO (agente SQL + banco). So e usado se a variavel
-  //  de ambiente USAR_AGENTE_SQL estiver "true". Assim voce liga/
-  //  desliga o sistema novo SEM mexer no codigo - se algo der errado,
-  //  basta por USAR_AGENTE_SQL=false no Render e volta pro antigo.
+  //  de ambiente USAR_AGENTE_SQL NAO estiver explicitamente "false".
+  //  Assim o banco e a fonte padrao; false ativa o retorno de emergencia.
   //
   //  Mantem a memoria de conversa (historico) para perguntas de
   //  acompanhamento ("e o valor dessas?").
   // ============================================================
-  if (process.env.USAR_AGENTE_SQL === "true") {
+  if (USAR_AGENTE_SQL) {
     const memoriaAg = lerMemoria(de);
     const historicoAg = memoriaAg.historico || [];
     let respostaAg;
+    let resultadoAg = null;
     try {
-      const r = await responderPergunta(pergunta, historicoAg);
-      respostaAg = r.resposta;
+      resultadoAg = await responderPergunta(pergunta, historicoAg);
+      respostaAg = resultadoAg.resposta;
     } catch (e) {
       console.error("AGENTE SQL falhou:", e.message);
       respostaAg = "Desculpe, tive um problema para responder agora. Pode tentar de novo?";
@@ -594,7 +726,12 @@ async function processarWebhook(payload) {
       historico: [
         ...historicoAg,
         { role: "user", content: pergunta },
-        { role: "assistant", content: respostaAg },
+        {
+          role: "assistant",
+          content: respostaAg,
+          sql: resultadoAg?.sql || null,
+          linhas: resultadoAg?.linhas ?? null,
+        },
       ].slice(-10),
     });
     await enviarTexto(de, respostaAg);

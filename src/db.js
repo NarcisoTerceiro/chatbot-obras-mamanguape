@@ -1,8 +1,9 @@
 // ============================================================
 //  db.js
 //  Conexao com o Supabase (PostgreSQL) usando a biblioteca 'pg'.
-//  A string de conexao vem da variavel de ambiente DATABASE_URL
-//  (voce pega no Supabase: Settings > Database > Connection string).
+//  Sao usadas duas credenciais separadas:
+//  - DATABASE_URL: usuario somente leitura, usado pelo chatbot.
+//  - DATABASE_ADMIN_URL: usuario de escrita, usado apenas na sincronizacao.
 // ============================================================
 
 import pg from "pg";
@@ -15,8 +16,8 @@ const { Pool } = pg;
 // modo ser definido pela propria connection string (adicionamos ?sslmode
 // mais abaixo, se nao vier). rejectUnauthorized:false evita erro de
 // certificado auto-assinado do pooler.
-function montarConfig() {
-  let url = process.env.DATABASE_URL || "";
+function montarConfig(urlOriginal) {
+  let url = urlOriginal || "";
 
   // Se a URL nao traz sslmode, adiciona um que o pooler aceita.
   if (url && !/sslmode=/.test(url)) {
@@ -40,7 +41,10 @@ function montarConfig() {
   };
 }
 
-const pool = new Pool(montarConfig());
+const pool = new Pool(montarConfig(process.env.DATABASE_URL));
+const adminPool = process.env.DATABASE_ADMIN_URL
+  ? new Pool(montarConfig(process.env.DATABASE_ADMIN_URL))
+  : null;
 
 // Executa uma query. Uso interno.
 export async function query(sql, params = []) {
@@ -50,6 +54,60 @@ export async function query(sql, params = []) {
   } finally {
     client.release();
   }
+}
+
+// Executa varias operacoes na MESMA conexao e na MESMA transacao.
+// E indispensavel para a sincronizacao: se qualquer lote falhar depois do
+// TRUNCATE, o rollback restaura automaticamente a versao anterior da tabela.
+export async function withTransaction(executar, { readOnly = false } = {}) {
+  const client = await pool.connect();
+  try {
+    await client.query(readOnly ? "BEGIN READ ONLY" : "BEGIN");
+    const resultado = await executar(client);
+    await client.query("COMMIT");
+    return resultado;
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackErro) {
+      console.error("Falha ao executar rollback:", rollbackErro.message);
+    }
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// Escrita administrativa exclusiva da ingestao. Nao existe fallback para a
+// credencial do chatbot: se DATABASE_ADMIN_URL faltar, a sincronizacao falha
+// fechada em vez de ampliar silenciosamente as permissoes do agente.
+export async function withAdminTransaction(executar) {
+  if (!adminPool) {
+    throw new Error("DATABASE_ADMIN_URL nao configurada para a sincronizacao");
+  }
+  const client = await adminPool.connect();
+  try {
+    await client.query("BEGIN");
+    const resultado = await executar(client);
+    await client.query("COMMIT");
+    return resultado;
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackErro) {
+      console.error("Falha ao executar rollback administrativo:", rollbackErro.message);
+    }
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// Consultas produzidas pelo agente sempre rodam numa transacao explicitamente
+// somente-leitura. A credencial DATABASE_URL tambem deve ser read-only no
+// Supabase; esta camada funciona como uma segunda barreira.
+export async function queryReadOnly(sql, params = []) {
+  return withTransaction((client) => client.query(sql, params), { readOnly: true });
 }
 
 export { pool };

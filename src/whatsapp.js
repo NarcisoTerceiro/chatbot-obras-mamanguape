@@ -28,17 +28,44 @@ export async function enviarTexto(para, texto) {
     text: { body: cortarSeNecessario(texto) },
   };
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${TOKEN}`,
-    },
-    body: JSON.stringify(body),
-  });
+  const MAX_TENTATIVAS = 3;
+  let ultimoErro = null;
 
-  if (!resp.ok) {
-    const erro = await resp.text();
-    console.error(`Erro ao enviar WhatsApp (${resp.status}):`, erro);
+  for (let tentativa = 1; tentativa <= MAX_TENTATIVAS; tentativa++) {
+    const controle = new AbortController();
+    const timeout = setTimeout(() => controle.abort(), 15000);
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${TOKEN}`,
+        },
+        body: JSON.stringify(body),
+        signal: controle.signal,
+      });
+
+      if (resp.ok) return await resp.json().catch(() => ({ ok: true }));
+
+      const erro = await resp.text();
+      const e = new Error(`WhatsApp respondeu ${resp.status}: ${erro.slice(0, 300)}`);
+      e.status = resp.status;
+      ultimoErro = e;
+
+      // So repete erros temporarios. Erros 4xx de autenticacao/destinatario
+      // precisam de correcao, nao de novas tentativas.
+      const temporario = resp.status === 429 || resp.status >= 500;
+      if (!temporario || tentativa === MAX_TENTATIVAS) throw e;
+    } catch (e) {
+      ultimoErro = e;
+      const temporario = e.name === "AbortError" || e.status === 429 || e.status >= 500;
+      if (!temporario || tentativa === MAX_TENTATIVAS) throw e;
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 500 * tentativa));
   }
+
+  throw ultimoErro || new Error("Falha desconhecida ao enviar mensagem pelo WhatsApp");
 }
