@@ -26,6 +26,17 @@
 //  Repositorio: https://github.com/diegosouzapw/OmniRoute
 // ============================================================
 
+// --- Provedor PRINCIPAL: GLM (Z.ai / Zhipu) ---
+// OpenAI-compativel, GRATIS e sem expirar (nao precisa cartao). Cadastro em
+// z.ai/chat com email -> API Keys. E mais lento que Gemini/Groq (pode levar
+// 10-25s), mas o tier gratuito nao tem o limite diario apertado que derruba
+// os outros. Por isso vai em PRIMEIRO; Gemini e Groq ficam de reserva.
+//   ZAI_API_KEY  -> chave em z.ai (comeca com algo tipo "xxxx.yyyy")
+//   GLM_MODEL    -> opcional. Padrao: glm-4.7-flash (gratis). Alt: glm-4.5-flash.
+const GLM_URL   = "https://api.z.ai/api/paas/v4/chat/completions";
+const GLM_KEY   = process.env.ZAI_API_KEY;
+const GLM_MODEL = process.env.GLM_MODEL || "glm-4.7-flash";
+
 // --- Provedor 1: Gemini direto ---
 const GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 const GEMINI_KEY  = process.env.GEMINI_API_KEY;
@@ -36,7 +47,7 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 // o Gemini bate cota (429) ou falha. Modelo gratuito atual: openai/gpt-oss-120b.
 const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_KEY   = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 
 // --- Provedor 3: OmniRoute (DESATIVADO) ---
 // Removido de proposito: nunca teve creditos (dava erro 402 constante) e so
@@ -55,6 +66,19 @@ const OMNIROUTE_MODEL = process.env.OMNIROUTE_MODEL || "openai/gpt-oss-120b";
 // Quando o Gemini sai do "descanso" de 5 min, ele volta a ser tentado primeiro.
 const PROVEDORES = [];
 
+// ORDEM POR VELOCIDADE: Groq em PRIMEIRO porque e o mais rapido (1-3s), o que
+// resolve a demora. Gemini fica em segundo (bom mas as vezes lento/sobrecarregado,
+// 503). GLM em terceiro (gratis sem expirar, mas lento ~20s). Assim o bot
+// responde rapido no dia a dia e ainda tem reservas se o Groq falhar.
+if (GROQ_KEY) {
+  PROVEDORES.push({
+    nome: "groq",
+    url: GROQ_URL,
+    key: GROQ_KEY,
+    model: GROQ_MODEL,
+  });
+}
+
 if (GEMINI_KEY) {
   PROVEDORES.push({
     nome: "gemini",
@@ -64,12 +88,12 @@ if (GEMINI_KEY) {
   });
 }
 
-if (GROQ_KEY) {
+if (GLM_KEY) {
   PROVEDORES.push({
-    nome: "groq",
-    url: GROQ_URL,
-    key: GROQ_KEY,
-    model: GROQ_MODEL,
+    nome: "glm",
+    url: GLM_URL,
+    key: GLM_KEY,
+    model: GLM_MODEL,
   });
 }
 
@@ -163,16 +187,31 @@ async function chamarIA(body) {
         if (!validos.includes(corpo.reasoning_effort)) {
           delete corpo.reasoning_effort;
         }
+      } else if (prov.nome === "glm") {
+        // GLM (Z.ai) e OpenAI-compativel mas nao usa reasoning_effort.
+        // Aceita temperature normalmente. Removemos so o que ele nao entende.
+        delete corpo.reasoning_effort;
+        delete corpo.top_k;
       }
 
-      const resp = await fetch(prov.url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${prov.key}`,
-        },
-        body: JSON.stringify(corpo),
-      });
+      // TIMEOUT: se o provedor nao responder em 20s, aborta e tenta o proximo.
+      // Evita ficar 1-2 minutos pendurado num Gemini sobrecarregado (503/lento).
+      const controlador = new AbortController();
+      const tempoLimite = setTimeout(() => controlador.abort(), 20000);
+      let resp;
+      try {
+        resp = await fetch(prov.url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${prov.key}`,
+          },
+          body: JSON.stringify(corpo),
+          signal: controlador.signal,
+        });
+      } finally {
+        clearTimeout(tempoLimite);
+      }
 
       if (!resp.ok) {
         const erro = await resp.text();
@@ -186,7 +225,10 @@ async function chamarIA(body) {
       if (!texto) throw new Error(`${prov.nome} devolveu resposta vazia`);
       // Sucesso: tira do descanso e loga qual provedor respondeu de verdade.
       provedorDescansando.delete(prov.nome);
-      const via = prov.nome === "gemini" ? "Gemini (principal)" : "Groq (fallback)";
+      const via = prov.nome === "groq" ? "Groq (principal)"
+        : prov.nome === "gemini" ? "Gemini (reserva)"
+        : prov.nome === "glm" ? "GLM (reserva)"
+        : prov.nome;
       console.log(`DEBUG IA usada: ${via} | modelo: ${prov.model}`);
       return texto;
     } catch (e) {
