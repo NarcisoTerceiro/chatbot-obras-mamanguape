@@ -181,9 +181,15 @@ export function sqlSegura(sql) {
   if (referencias.length === 0 || referencias.some((t) => t !== "obras")) {
     return { ok: false, motivo: "a consulta so pode usar a tabela obras" };
   }
-  // Bloqueia funcoes fora da allowlist. Palavras estruturais como IN podem
-  // aparecer seguidas de parenteses e por isso sao ignoradas aqui.
-  const palavrasEstruturais = new Set(["in", "exists", "select", "case", "when"]);
+  // Bloqueia funcoes fora da allowlist. Palavras estruturais (operadores e
+  // palavras-chave SQL) podem aparecer seguidas de parenteses - ex.:
+  // "... AND (bairro ...)" - e NAO sao funcoes. Por isso sao ignoradas aqui.
+  // BUG corrigido: "and", "or", "not" estavam sendo tratados como funcao e
+  // faziam consultas validas serem rejeitadas ("funcao nao permitida: and").
+  const palavrasEstruturais = new Set([
+    "in", "exists", "select", "case", "when",
+    "and", "or", "not", "between", "like", "ilike", "is", "null",
+  ]);
   const funcoes = [...estrutural.matchAll(/\b([a-z_][a-z0-9_]*)\s*\(/gi)]
     .map((m) => m[1].toLowerCase())
     .filter((f) => !palavrasEstruturais.has(f));
