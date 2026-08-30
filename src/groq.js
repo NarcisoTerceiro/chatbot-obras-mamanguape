@@ -1,125 +1,56 @@
 // ============================================================
-//  groq.js  (nome mantido por compatibilidade - hoje e o modulo de IA)
+//  groq.js
+//  Modulo de IA otimizado para o chatbot de obras.
 //
-//  ESTRATEGIA DE PROVEDORES:
-//    1. GEMINI (principal) - chamado diretamente pela API do Google.
-//       Gratis, rapido e de alta qualidade.
-//    2. OMNIROUTE (fallback) - gateway open-source que roteia para
-//       270+ provedores automaticamente (Groq, OpenRouter, DeepSeek,
-//       Kimi, etc.). Assume quando o Gemini bate o limite de cota (429)
-//       ou retorna erro. O cidadao nunca percebe a troca.
+//  PROVEDORES (somente dois):
+//    1. Groq   -> principal, rapido e barato.
+//    2. Gemini -> fallback quando Groq estiver em limite/erro.
 //
-//  Configuracao (variaveis de ambiente no Render / .env):
-//    GEMINI_API_KEY   -> chave do Google AI Studio (OBRIGATORIO)
-//    GEMINI_MODEL     -> opcional (padrao: gemini-2.5-flash)
-//    OMNIROUTE_URL    -> URL do OmniRoute (ex: http://localhost:4000/v1
-//                        ou https://SEU-OMNIROUTE.onrender.com/v1)
-//    OMNIROUTE_KEY    -> chave do OmniRoute (opcional, se configurou auth)
-//    OMNIROUTE_MODEL  -> modelo preferido no OmniRoute (padrao: gemini-2.5-flash)
-//                        O OmniRoute faz fallback automatico se esse modelo
-//                        tambem estiver sem cota.
+//  Objetivo desta versao:
+//  - usar somente Groq e Gemini;
+//  - reduzir tokens de entrada/saida;
+//  - nao insistir em provedor que acabou de devolver 429;
+//  - manter respostas rapidas no WhatsApp.
 //
-//  Como instalar o OmniRoute (uma vez):
-//    npx omniroute   (requer Node >= 22)
-//  Ou via Docker:
-//    docker run -p 4000:4000 diegosouzapw/omniroute
-//  Repositorio: https://github.com/diegosouzapw/OmniRoute
+//  Variaveis:
+//    GROQ_API_KEY
+//    GROQ_MODEL      (padrao: llama-3.1-8b-instant)
+//    GEMINI_API_KEY
+//    GEMINI_MODEL    (padrao: gemini-3.5-flash-lite)
 // ============================================================
 
-// --- Provedor PRINCIPAL: GLM (Z.ai / Zhipu) ---
-// OpenAI-compativel, GRATIS e sem expirar (nao precisa cartao). Cadastro em
-// z.ai/chat com email -> API Keys. E mais lento que Gemini/Groq (pode levar
-// 10-25s), mas o tier gratuito nao tem o limite diario apertado que derruba
-// os outros. Por isso vai em PRIMEIRO; Gemini e Groq ficam de reserva.
-//   ZAI_API_KEY  -> chave em z.ai (comeca com algo tipo "xxxx.yyyy")
-//   GLM_MODEL    -> opcional. Padrao: glm-4.7-flash (gratis). Alt: glm-4.5-flash.
-const GLM_URL   = "https://api.z.ai/api/paas/v4/chat/completions";
-const GLM_KEY   = process.env.ZAI_API_KEY;
-const GLM_MODEL = process.env.GLM_MODEL || "glm-4.7-flash";
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_KEY = process.env.GROQ_API_KEY;
+// Se o Render ainda estiver com openai/gpt-oss-120b, troca automaticamente pelo
+// modelo leve. Foi exatamente o 120B que bateu TPM no log enviado.
+const GROQ_MODEL_ENV = (process.env.GROQ_MODEL || "").trim();
+const GROQ_MODEL = /gpt-oss-120b/i.test(GROQ_MODEL_ENV)
+  ? "llama-3.1-8b-instant"
+  : (GROQ_MODEL_ENV || "llama-3.1-8b-instant");
 
-// --- Provedor 1: Gemini direto ---
-const GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
-const GEMINI_KEY  = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
+const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+const GEMINI_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 
-// --- Provedor 2: Groq (fallback direto) ---
-// OpenAI-compativel: base https://api.groq.com/openai/v1. Entra em acao quando
-// o Gemini bate cota (429) ou falha. Modelo gratuito atual: openai/gpt-oss-120b.
-const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_KEY   = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
-
-// --- Provedor 3: OmniRoute (DESATIVADO) ---
-// Removido de proposito: nunca teve creditos (dava erro 402 constante) e so
-// poluia os logs. O sistema opera so com Gemini (principal) + Groq (fallback).
-// Para reativar no futuro, defina OMNIROUTE_URL no .env e mude a condicao abaixo.
-const OMNIROUTE_ATIVO = false; // <- mude para true se um dia configurar o OmniRoute
-const OMNIROUTE_URL   = OMNIROUTE_ATIVO && process.env.OMNIROUTE_URL
-  ? process.env.OMNIROUTE_URL.replace(/\/$/, "") + "/chat/completions"
-  : null;
-const OMNIROUTE_KEY   = process.env.OMNIROUTE_KEY || "omniroute";
-const OMNIROUTE_MODEL = process.env.OMNIROUTE_MODEL || "openai/gpt-oss-120b";
-
-// Lista de provedores na ordem de tentativa.
-// O sistema tenta cada um em sequencia; se um bater limite ou falhar, passa pro proximo.
-// Ordem: Gemini (principal, melhor qualidade) -> Groq (fallback rapido) -> OmniRoute.
-// Quando o Gemini sai do "descanso" de 5 min, ele volta a ser tentado primeiro.
 const PROVEDORES = [];
-
-// ORDEM POR VELOCIDADE: Groq em PRIMEIRO porque e o mais rapido (1-3s), o que
-// resolve a demora. Gemini fica em segundo (bom mas as vezes lento/sobrecarregado,
-// 503). GLM em terceiro (gratis sem expirar, mas lento ~20s). Assim o bot
-// responde rapido no dia a dia e ainda tem reservas se o Groq falhar.
 if (GROQ_KEY) {
-  PROVEDORES.push({
-    nome: "groq",
-    url: GROQ_URL,
-    key: GROQ_KEY,
-    model: GROQ_MODEL,
-  });
+  PROVEDORES.push({ nome: "groq", url: GROQ_URL, key: GROQ_KEY, model: GROQ_MODEL });
 }
-
 if (GEMINI_KEY) {
-  PROVEDORES.push({
-    nome: "gemini",
-    url: GEMINI_URL,
-    key: GEMINI_KEY,
-    model: GEMINI_MODEL,
-  });
-}
-
-if (GLM_KEY) {
-  PROVEDORES.push({
-    nome: "glm",
-    url: GLM_URL,
-    key: GLM_KEY,
-    model: GLM_MODEL,
-  });
-}
-
-if (OMNIROUTE_URL) {
-  PROVEDORES.push({
-    nome: "omniroute",
-    url: OMNIROUTE_URL,
-    key: OMNIROUTE_KEY,
-    model: OMNIROUTE_MODEL,
-  });
+  PROVEDORES.push({ nome: "gemini", url: GEMINI_URL, key: GEMINI_KEY, model: GEMINI_MODEL });
 }
 
 if (PROVEDORES.length === 0) {
-  console.warn(
-    "AVISO: Nenhum provedor de IA configurado. " +
-    "Defina GEMINI_API_KEY e/ou GROQ_API_KEY no .env."
-  );
+  console.warn("AVISO: configure GROQ_API_KEY e/ou GEMINI_API_KEY.");
 }
 
 // Contato para escalar quando o bot nao resolve (opcional, via .env).
 const CONTATO_SECRETARIA = process.env.CONTATO_SECRETARIA || "";
 
 // Quantas mensagens do historico enviar (ida + volta = 2). 6 = ~3 trocas.
-const MAX_HISTORICO_ENVIO = 6;
+const MAX_HISTORICO_ENVIO = 4;
 // Corta cada mensagem antiga pra nao estourar tokens.
-const MAX_CHARS_HISTORICO = 500;
+const MAX_CHARS_HISTORICO = 240;
 
 // Operacoes de agregacao que o SISTEMA sabe executar (agregacao.js).
 const OPERACOES_VALIDAS = new Set([
@@ -132,72 +63,68 @@ const OPERACOES_VALIDAS = new Set([
 ]);
 
 // ------------------------------------------------------------
-//  Funcao auxiliar generica pra chamar a IA.
+//  Chamada generica com fallback Groq -> Gemini.
 // ------------------------------------------------------------
-// Tenta cada provedor na ordem: Gemini (principal) -> Groq (fallback).
-// O "body" NAO deve conter "model": ele e definido aqui conforme o provedor.
-// Quando um provedor bate o limite (429), entra de "descanso" curto: o sistema
-// prefere os outros por um tempo. MAS, se TODOS estiverem descansando, ele ainda
-// tenta o que esta mais perto de voltar - nunca desiste sem ao menos tentar.
-// O limite gratuito do Gemini/Groq e POR MINUTO, entao 60s de descanso basta.
-const DESCANSO_MS = 60 * 1000; // 60 segundos (era 5 min - agressivo demais)
-const provedorDescansando = new Map(); // nome -> timestamp de quando pode voltar
+const provedorDescansando = new Map(); // nome -> timestamp
+const DESCANSO_PADRAO_MS = 15 * 1000;
+const TIMEOUT_IA_MS = 12000;
+const MAX_SAIDA_GLOBAL = 1200;
+
+function retryDepoisMs(resp, corpoErro = "") {
+  const cab = resp.headers?.get?.("retry-after");
+  if (cab) {
+    const seg = Number(cab);
+    if (Number.isFinite(seg) && seg > 0) return Math.min(seg * 1000, 60_000);
+  }
+  const m = (corpoErro || "").match(/try again in\s+([0-9.]+)s/i);
+  if (m) return Math.min(Math.ceil(Number(m[1]) * 1000) + 500, 60_000);
+  return DESCANSO_PADRAO_MS;
+}
 
 async function chamarIA(body) {
   if (PROVEDORES.length === 0) {
-    throw new Error("Nenhuma chave de IA configurada (GEMINI_API_KEY ou GROQ_API_KEY).");
+    throw new Error("Nenhuma chave de IA configurada (GROQ_API_KEY ou GEMINI_API_KEY).");
+  }
+
+  const agora = Date.now();
+  // Nao martela um provedor que acabou de devolver 429.
+  const ordem = PROVEDORES.filter((p) => (provedorDescansando.get(p.nome) || 0) <= agora);
+  if (ordem.length === 0) {
+    const proximo = Math.min(...PROVEDORES.map((p) => provedorDescansando.get(p.nome) || agora));
+    const erro = new Error(`Provedores em limite temporario. Tente novamente em ${Math.max(1, Math.ceil((proximo - agora) / 1000))}s.`);
+    erro.status = 429;
+    throw erro;
   }
 
   let ultimoErro = null;
-  const agora = Date.now();
-
-  // Monta a ordem de tentativa: primeiro os que NAO estao descansando (na ordem
-  // normal), depois - como ultimo recurso - os que estao descansando, do que
-  // volta mais cedo para o que volta mais tarde. Assim, mesmo com todos em
-  // descanso, sempre tentamos alguem em vez de falhar direto.
-  const livres = [];
-  const descansando = [];
-  for (const prov of PROVEDORES) {
-    const voltaEm = provedorDescansando.get(prov.nome);
-    if (voltaEm && agora < voltaEm) {
-      descansando.push({ prov, voltaEm });
-    } else {
-      livres.push(prov);
-    }
-  }
-  descansando.sort((a, b) => a.voltaEm - b.voltaEm);
-  const ordem = [...livres, ...descansando.map((d) => d.prov)];
 
   for (const prov of ordem) {
     try {
-      // Cada provedor aceita parametros diferentes:
-      //  - GEMINI 3.x (3.5/3.6): NAO aceita reasoning_effort/temperature/top_p/
-      //    top_k e rejeita a requisicao com 400. Removemos todos.
-      //  - GROQ: aceita temperature, mas reasoning_effort SO pode ser
-      //    "low"|"medium"|"high". Se vier "none"/invalido, removemos.
       const corpo = { ...body, model: prov.model };
 
+      // Evita saidas enormes por engano.
+      const pedido = Number(corpo.max_completion_tokens ?? corpo.max_tokens ?? 512);
+      const limite = Math.max(64, Math.min(Number.isFinite(pedido) ? pedido : 512, MAX_SAIDA_GLOBAL));
+
       if (prov.nome === "gemini") {
-        delete corpo.reasoning_effort;
-        delete corpo.temperature;
-        delete corpo.top_p;
+        // Mantem max_tokens, que ja era usado com sucesso neste projeto.
+        // O OpenAI-compatible atual do Gemini aceita reasoning_effort; "low"
+        // reduz thinking e ajuda a economizar cota.
+        delete corpo.max_completion_tokens;
+        corpo.max_tokens = limite;
+        corpo.reasoning_effort = ["minimal", "low", "medium", "high"].includes(corpo.reasoning_effort)
+          ? corpo.reasoning_effort
+          : "low";
         delete corpo.top_k;
       } else if (prov.nome === "groq") {
+        delete corpo.max_tokens;
+        corpo.max_completion_tokens = limite;
         const validos = ["low", "medium", "high"];
-        if (!validos.includes(corpo.reasoning_effort)) {
-          delete corpo.reasoning_effort;
-        }
-      } else if (prov.nome === "glm") {
-        // GLM (Z.ai) e OpenAI-compativel mas nao usa reasoning_effort.
-        // Aceita temperature normalmente. Removemos so o que ele nao entende.
-        delete corpo.reasoning_effort;
-        delete corpo.top_k;
+        if (!validos.includes(corpo.reasoning_effort)) delete corpo.reasoning_effort;
       }
 
-      // TIMEOUT: se o provedor nao responder em 20s, aborta e tenta o proximo.
-      // Evita ficar 1-2 minutos pendurado num Gemini sobrecarregado (503/lento).
       const controlador = new AbortController();
-      const tempoLimite = setTimeout(() => controlador.abort(), 20000);
+      const timer = setTimeout(() => controlador.abort(), TIMEOUT_IA_MS);
       let resp;
       try {
         resp = await fetch(prov.url, {
@@ -210,40 +137,38 @@ async function chamarIA(body) {
           signal: controlador.signal,
         });
       } finally {
-        clearTimeout(tempoLimite);
+        clearTimeout(timer);
       }
 
       if (!resp.ok) {
-        const erro = await resp.text();
-        const err = new Error(`${prov.nome} respondeu ${resp.status}: ${erro.slice(0, 300)}`);
+        const erroTxt = await resp.text();
+        const err = new Error(`${prov.nome} respondeu ${resp.status}: ${erroTxt.slice(0, 280)}`);
         err.status = resp.status;
+        if (resp.status === 429) err.retryAfterMs = retryDepoisMs(resp, erroTxt);
         throw err;
       }
 
       const data = await resp.json();
       const texto = data.choices?.[0]?.message?.content?.trim() || "";
       if (!texto) throw new Error(`${prov.nome} devolveu resposta vazia`);
-      // Sucesso: tira do descanso e loga qual provedor respondeu de verdade.
+
       provedorDescansando.delete(prov.nome);
-      const via = prov.nome === "groq" ? "Groq (principal)"
-        : prov.nome === "gemini" ? "Gemini (reserva)"
-        : prov.nome === "glm" ? "GLM (reserva)"
-        : prov.nome;
-      console.log(`DEBUG IA usada: ${via} | modelo: ${prov.model}`);
+      console.log(`DEBUG IA usada: ${prov.nome === "groq" ? "Groq (principal)" : "Gemini (fallback)"} | modelo: ${prov.model}`);
       return texto;
     } catch (e) {
-      console.error(`IA (${prov.nome}) falhou:`, e.message);
       ultimoErro = e;
-      // 429 = limite de cota: poe de descanso curto (o proximo assume).
+      console.error(`IA (${prov.nome}) falhou:`, e.message);
+
       if (e.status === 429) {
-        provedorDescansando.set(prov.nome, Date.now() + DESCANSO_MS);
-        console.log(`DEBUG ${prov.nome} bateu limite - descanso de ${DESCANSO_MS / 1000}s`);
+        const pausa = Math.max(5_000, Math.min(e.retryAfterMs || DESCANSO_PADRAO_MS, 60_000));
+        provedorDescansando.set(prov.nome, Date.now() + pausa);
+        console.log(`DEBUG ${prov.nome} em limite - ignorando por ${Math.ceil(pausa / 1000)}s`);
       }
-      // tenta o proximo provedor
+      // Sem sleep: passa imediatamente para o outro provedor.
     }
   }
 
-  throw ultimoErro || new Error("Todos os provedores de IA falharam.");
+  throw ultimoErro || new Error("Groq e Gemini falharam.");
 }
 
 // Normaliza o historico em mensagens que a API entende.
@@ -357,8 +282,8 @@ export async function interpretarPergunta(pergunta, historico = []) {
     // Desligamos o thinking com "none" (suportado nos modelos Gemini 2.5): o
     // modelo vai direto ao JSON, mais rapido, mais barato e sem estourar. O
     // max_tokens generoso fica como rede de seguranca para o JSON completo.
-    max_tokens: 4096,
-    reasoning_effort: "none",
+    max_tokens: 450,
+    reasoning_effort: "low",
     messages: mensagens,
   };
 
@@ -377,7 +302,7 @@ export async function interpretarPergunta(pergunta, historico = []) {
       // Ultima tentativa: orcamento ainda maior e sem modo JSON. Cobre o caso
       // raro de o modelo precisar de muito raciocinio numa pergunta ambigua.
       console.error("Interpretacao (2a tentativa) falhou, tentando com folga:", e2.message);
-      texto = await chamarIA({ ...base, max_tokens: 8192 });
+      texto = await chamarIA({ ...base, max_tokens: 650 });
     }
   }
 
@@ -514,7 +439,7 @@ export async function redigirResposta(pergunta, obras, detalhe, historico = [], 
   const texto = await chamarIA({
     temperature: 0.2,
     // Cobre o raciocinio do modelo + o texto final da mensagem.
-    max_tokens: 2048,
+    max_tokens: 700,
     reasoning_effort: "low",
     messages: [
       { role: "system", content: SYSTEM_PROMPT_RESPOSTA },
@@ -545,7 +470,7 @@ export async function redigirResposta(pergunta, obras, detalhe, historico = [], 
 //
 //  NOTA: Code Execution usa o endpoint NATIVO do Gemini (nao o
 //  compativel com OpenAI), entao sempre vai direto ao Google -
-//  sem passar pelo OmniRoute. Se o Gemini estiver sem cota,
+//  Se o Gemini estiver sem cota,
 //  esta funcao vai lancar erro e o server.js cai no formatador local.
 // ============================================================
 
@@ -648,7 +573,7 @@ export async function gerarCodigoPython(pergunta, colunas) {
   };
   const codigo = await chamarIA({
     temperature: 0,
-    max_tokens: 800,
+    max_tokens: 500,
     reasoning_effort: "low",
     messages: [
       { role: "system", content: SYSTEM_PROMPT_GERAR_CODIGO },
@@ -665,11 +590,11 @@ export async function gerarCodigoPython(pergunta, colunas) {
 //  chamarIAbruta — funcao simples para o agente SQL.
 //  Recebe uma lista de mensagens [{role, content}] e devolve o
 //  texto da resposta. Reaproveita o chamarIA interno (com
-//  fallback Gemini -> Groq e limpeza de parametros por provedor).
+//  fallback Groq -> Gemini e limpeza de parametros por provedor).
 // ============================================================
 export async function chamarIAbruta(mensagens, opcoes = {}) {
   const body = {
-    max_tokens: opcoes.max_tokens || 1024,
+    max_tokens: Math.min(Number(opcoes.max_tokens) || 512, 1200),
     messages: mensagens,
   };
   if (opcoes.temperature !== undefined) body.temperature = opcoes.temperature;

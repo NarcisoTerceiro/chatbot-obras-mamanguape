@@ -98,8 +98,8 @@ const LIMITE_RESUMIDO = 15;
 // busca e o TIPO da ultima interacao. Isso permite refinar perguntas do tipo
 // "e tem mais alguma por la?", que dependem do recorte anterior.
 const memoriaPorUsuario = new Map();
-const MEMORIA_VALIDADE_MS = 10 * 60 * 1000; // 10 minutos
-const MAX_HISTORICO = 8; // guarda ate 8 mensagens (~4 trocas)
+const MEMORIA_VALIDADE_MS = 30 * 60 * 1000; // 30 minutos; o agente envia so contexto curto
+const MAX_HISTORICO = 6; // guarda ate 6 mensagens; reduz memoria e mantem contexto suficiente
 
 // Evita responder duas vezes ao mesmo evento da Meta. E uma protecao local;
 // para varias instancias, substitua por Redis/PostgreSQL com chave unica.
