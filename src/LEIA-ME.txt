@@ -1,0 +1,60 @@
+CORRECAO V2 - CHATBOT OBRAS MAMANGUAPE
+=======================================
+
+Substitua no projeto estes arquivos:
+- agente.js
+- groq.js
+- server.js
+
+O que foi corrigido:
+1. Groq: o modelo llama-3.1-8b-instant estava retornando 404 na sua conta.
+   Agora o bot tenta modelos atuais do Groq e usa como principal:
+   openai/gpt-oss-20b
+   Se um modelo retornar model_not_found, ele troca automaticamente.
+
+2. Gemini: a chamada agora usa a API nativa do Gemini com o cabecalho
+   x-goog-api-key. Isso evita o erro de autenticacao que apareceu na camada
+   OpenAI-compatible. O modelo padrao e gemini-3.5-flash-lite.
+
+3. Menos tokens:
+   - perguntas comuns viram SQL direto no Node, sem IA;
+   - SQL gerado por IA tem saida curta;
+   - historico enviado para IA e pequeno;
+   - respostas comuns sao formatadas pelo Node, sem segunda chamada de IA.
+
+4. Contexto corrigido:
+   Exemplo:
+   "Tem quantas obras concluidas?" -> COUNT das concluidas
+   "Quais sao?" -> lista as mesmas obras concluidas, sem IA
+   "Quais os engenheiros dessas obras?" -> lista obra + engenheiro, sem IA
+
+5. Local/bairro corrigido:
+   "Qual o valor investido no Centro?" -> soma somente Centro
+   "Quais obras no Centro?" -> lista somente Centro
+   "Quantas obras no Centro?" -> conta somente Centro
+
+VARIAVEIS RECOMENDADAS NO RENDER
+---------------------------------
+GROQ_API_KEY=<sua chave Groq>
+GROQ_MODEL=openai/gpt-oss-20b
+GEMINI_API_KEY=<chave criada no Google AI Studio>
+GEMINI_MODEL=gemini-3.5-flash-lite
+USAR_AGENTE_SQL=true
+
+IMPORTANTE:
+- Nao coloque aspas nas chaves no Render.
+- Nao coloque espacos antes/depois da chave.
+- Se GEMINI_API_KEY continuar retornando 401, gere uma chave nova no Google
+  AI Studio e substitua a variavel no Render. Depois faca redeploy.
+- O codigo tambem aceita GOOGLE_API_KEY ou GOOGLE_GENAI_API_KEY como alternativa.
+
+TESTES DEPOIS DO DEPLOY
+-----------------------
+1. Oi
+2. Tem quantas obras concluida?
+3. Quais sao?
+4. Quais os engenheiros dessas obras?
+5. Qual o valor investido no Centro?
+6. Quais obras no Centro?
+
+Nos testes 2 a 6 acima, o caminho rapido evita IA na maior parte dos casos.

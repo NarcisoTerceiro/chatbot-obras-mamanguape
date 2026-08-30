@@ -216,7 +216,7 @@ function resumoHistorico(historico = []) {
 // ------------------------------------------------------------
 function normalizarTexto(s = "") {
   return s.toString().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase().replace(/\s+/g, " ").trim();
+    .toLowerCase().replace(/[!?.,;:]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function ultimaSQLDoHistorico(historico = []) {
@@ -246,31 +246,80 @@ function filtroStatusDaPergunta(p) {
   return "";
 }
 
+function condicaoLocalDaPergunta(p) {
+  // Captura locais escritos de forma natural no fim da pergunta:
+  // "no Centro", "na Bela Vista", "em Barra de Mamanguape" e "bairro Centro".
+  // Termos de status/quantidade sao rejeitados para nao confundir "em andamento"
+  // ou "no total" com bairro.
+  let local = "";
+  const mb = p.match(/\bbairro\s+(?:de\s+|do\s+|da\s+)?([a-z0-9][a-z0-9 -]{1,48})(?:$|\b(?:concluid|andamento|paralis|licit|projeto|homolog|valor|engenheir|empresa)\b)/i);
+  if (mb) local = mb[1].trim();
+
+  if (!local) {
+    // Primeiro remove um status no final para aceitar "no Centro concluidas".
+    const base = p.replace(/\s+\b(concluidas?|concluidos?|prontas?|prontos?|finalizadas?|finalizados?|terminadas?|terminados?|em andamento|paralisadas?|paralisados?|em licitacao|homologadas?|homologados?)\b.*$/i, "").trim();
+    const m = base.match(/\b(?:no|na|em)\s+([a-z0-9][a-z0-9 -]{1,48})$/i);
+    if (m) local = m[1].trim();
+  }
+
+  local = local
+    .replace(/^(?:bairro|distrito)\s+(?:de\s+|do\s+|da\s+)?/i, "")
+    .replace(/[^a-z0-9 -]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!local || local.length < 2 || local.length > 48) return "";
+  if (/^(andamento|licitacao|projeto|total|geral|tudo|cidade|mamanguape|obras?)$/i.test(local)) return "";
+
+  // O texto ja foi normalizado e a limpeza acima remove apostrofos/%/_;
+  // por isso pode entrar com seguranca no literal LIKE.
+  return `(unaccent(COALESCE(bairro,'')) ILIKE unaccent('%${local}%') OR unaccent(objeto) ILIKE unaccent('%${local}%'))`;
+}
+
 function gerarSQLRapida(pergunta, historico = []) {
   const p = normalizarTexto(pergunta);
   if (!p) return null;
 
   const sqlAnterior = ultimaSQLDoHistorico(historico);
   const whereAnterior = whereDaSQL(sqlAnterior);
-  const referenciaAnterior = /\b(dess[ae]s?|dest[ae]s?|ness[ae]s?|nest[ae]s?|del[ae]s?|ess[ae]s?|anteriores?|acima|mesm[ao]s?|isso)\b/.test(p);
-  const curtaDeAcompanhamento = p.split(" ").length <= 6 &&
-    /\b(engenheir[oa]s?|responsaveis?|empresas?|executoras?|valor|custo|bairro|status|situacao|nomes?)\b/.test(p);
-  const usarAnterior = !!whereAnterior && (referenciaAnterior || curtaDeAcompanhamento);
+  const condAnterior = whereAnterior.replace(/^WHERE\s+/i, "").trim();
 
-  const filtroAtual = filtroStatusDaPergunta(p);
-  let where = filtroAtual ? `WHERE ${filtroAtual}` : (usarAnterior ? whereAnterior : "");
+  const referenciaAnterior = /\b(dessas?|destas?|nessas?|nestas?|delas?|essas?|elas?|anteriores?|acima|mesmas?|isso)\b/.test(p);
+  const perguntaCurtaLista = /^(?:e\s+)?quais(?:\s+sao)?$|^(?:lista|liste|mostra|mostre)(?:\s+(?:elas|essas|as obras))?$/.test(p);
+  const curtaDeAcompanhamento = p.split(" ").length <= 7 && (
+    /\b(engenheiros?|engenheiras?|responsaveis?|empresas?|executoras?|valor|valores|custo|bairro|status|situacao|nomes?)\b/.test(p) ||
+    perguntaCurtaLista
+  );
 
-  const pedeEng = /\b(engenheir[oa]s?|responsavel tecnico|responsaveis tecnicos)\b/.test(p);
+  const filtroStatus = filtroStatusDaPergunta(p);
+  const filtroLocal = condicaoLocalDaPergunta(p);
+  const temFiltroNovo = !!(filtroStatus || filtroLocal);
+
+  // Se a pessoa diz explicitamente "dessas" + um novo filtro, refinamos a
+  // consulta anterior. Se apenas faz uma pergunta curta, herdamos o filtro.
+  const condicoes = [];
+  if (condAnterior && referenciaAnterior) condicoes.push(condAnterior);
+  if (filtroStatus) condicoes.push(filtroStatus);
+  if (filtroLocal) condicoes.push(filtroLocal);
+  if (!condicoes.length && condAnterior && curtaDeAcompanhamento) condicoes.push(condAnterior);
+
+  const usarAnterior = !!condAnterior && (referenciaAnterior || curtaDeAcompanhamento) && !temFiltroNovo;
+  const where = condicoes.length ? `WHERE ${condicoes.join(" AND ")}` : "";
+
+  const pedeEng = /\b(engenheiros?|engenheiras?|responsavel tecnico|responsaveis tecnicos)\b/.test(p);
   const pedeEmpresa = /\b(empresas?|executoras?|construtoras?)\b/.test(p);
   const pedeBairro = /\bbairros?\b/.test(p);
   const pedeStatus = /\b(status|situacao)\b/.test(p);
   const pedePercentual = /\b(percentual|porcentagem|% executad)\b/.test(p);
   const pedeExecutado = /\b(valor executado|quanto executou|ja executado|executad[oa])\b/.test(p);
-  const pedeValor = pedeExecutado || /\b(valor|custo|custou|investid|investimento|quanto foi)\b/.test(p);
+  const pedeValor = pedeExecutado || /\b(valor|valores|custo|custou|investid|investimento|quanto foi)\b/.test(p);
   const pedeContagem = /\b(quantos|quantas|numero de|qtd|quantidade de)\b/.test(p);
-  const pedeSoma = pedeValor && /\b(total|soma|somando|ao todo|quanto foi investido|quanto custou tudo)\b/.test(p);
+  const pedeSoma = pedeValor && (
+    /\b(total|soma|somando|ao todo|quanto foi investido|quanto custou tudo|investid|investimento)\b/.test(p) ||
+    (!!filtroLocal && /\bqual(?: e| o)? valor\b/.test(p))
+  );
 
-  // Nao usa caminho rapido para campos livres de dados_extras.
+  // Campos livres de dados_extras continuam indo para IA.
   if (/\b(recurso|contrato|convenio|aditivo|prazo|data da|ordem de servico)\b/.test(p)) return null;
 
   if (pedeContagem) {
@@ -286,13 +335,11 @@ function gerarSQLRapida(pergunta, historico = []) {
   }
 
   if (pedeEng) {
-    if (usarAnterior || filtroAtual) {
-      return `SELECT objeto, engenheiro FROM obras ${where} ORDER BY objeto`;
-    }
+    if (where || usarAnterior) return `SELECT objeto, engenheiro FROM obras ${where} ORDER BY objeto`;
     return "SELECT DISTINCT engenheiro FROM obras WHERE engenheiro IS NOT NULL AND BTRIM(engenheiro) <> '' ORDER BY engenheiro";
   }
   if (pedeEmpresa) {
-    if (usarAnterior || filtroAtual) return `SELECT objeto, empresa FROM obras ${where} ORDER BY objeto`;
+    if (where || usarAnterior) return `SELECT objeto, empresa FROM obras ${where} ORDER BY objeto`;
     return "SELECT DISTINCT empresa FROM obras WHERE empresa IS NOT NULL AND BTRIM(empresa) <> '' ORDER BY empresa";
   }
   if (pedeBairro && !/\bobra/.test(p)) {
@@ -303,15 +350,21 @@ function gerarSQLRapida(pergunta, historico = []) {
     const campo = pedeExecutado ? "valor_executado" : "valor_total";
     return `SELECT objeto, ${campo} FROM obras ${where} ORDER BY objeto`;
   }
-  if (pedeStatus && (usarAnterior || filtroAtual)) return `SELECT objeto, status FROM obras ${where} ORDER BY objeto`;
+  if (pedeStatus && where) return `SELECT objeto, status FROM obras ${where} ORDER BY objeto`;
 
-  // Listagens simples por status sao extremamente frequentes.
-  if (filtroAtual && /\b(obras?|quais|liste|lista|nomes?)\b/.test(p)) {
+  // "Quais sao?" logo apos "quantas concluidas?" deve listar as mesmas obras,
+  // sem depender da IA.
+  if (condAnterior && perguntaCurtaLista) {
+    return `SELECT objeto FROM obras WHERE ${condAnterior} ORDER BY objeto`;
+  }
+
+  // Listagens simples com filtro explicito (status ou local).
+  if (where && /\b(obras?|quais|liste|lista|nomes?|mostra|mostre)\b/.test(p)) {
     return `SELECT objeto FROM obras ${where} ORDER BY objeto`;
   }
 
-  // "quais sao elas?", "lista essas" etc. reaproveitam o filtro anterior.
-  if (usarAnterior && /\b(quais|lista|liste|nomes?|obras?|elas|essas)\b/.test(p)) {
+  // Acompanhamento curto usando o filtro anterior.
+  if (usarAnterior && /\b(quais|lista|liste|nomes?|obras?|elas|essas|mostra|mostre)\b/.test(p)) {
     return `SELECT objeto FROM obras ${where} ORDER BY objeto`;
   }
 
@@ -354,7 +407,7 @@ ${blocoCorrecao}`;
     const resposta = await chamarIAbruta([
       { role: "system", content: instrucao },
       { role: "user", content: (pergunta || "").toString().slice(0, 800) },
-    ], { max_tokens: tentativa === 1 ? 300 : 420, temperature: 0 });
+    ], { max_tokens: tentativa === 1 ? 180 : 240, temperature: 0, reasoning_effort: "low" });
 
     let sql = resposta.replace(/```sql/gi, "").replace(/```/g, "").trim();
     const m = sql.match(/select[\s\S]+/i);
@@ -440,8 +493,8 @@ OUTRAS REGRAS:
 ${listaGigante ? `- ATENCAO: existem ${totalLinhas} obras no total, mas voce recebeu so as primeiras ${LIMITE_LISTA} como amostra. Liste essas ${LIMITE_LISTA} e diga claramente: "Estas sao as primeiras ${LIMITE_LISTA} de ${totalLinhas} obras. Para ver melhor, me diga um bairro ou status especifico." NAO diga que sao so ${LIMITE_LISTA} no total - o total real e ${totalLinhas}.` : ""}
 ${muitasLinhas ? "- A lista e LONGA: UMA linha por obra: '• Nome — R$ valor'. Se o valor for 'valor nao informado', escreva assim mesmo (nao invente). SEM introducao. Termine com 'Total: N obras' onde N e a quantidade EXATA de itens listados. Se algumas obras nao tem valor, acrescente uma linha curta explicando: 'Obs.: algumas obras ainda nao tem valor cadastrado.'" : "- Responda de forma completa mas objetiva. Se o valor for 'valor nao informado', diga isso - nao invente numero."}`;
 
-  const limite = muitasLinhas ? 900 : 600;
-  return await chamarIAbruta([{ role: "user", content: prompt }], { max_tokens: limite });
+  const limite = muitasLinhas ? 520 : 360;
+  return await chamarIAbruta([{ role: "user", content: prompt }], { max_tokens: limite, reasoning_effort: "low" });
 }
 
 // Resposta deterministica para quando os provedores de IA estiverem fora do

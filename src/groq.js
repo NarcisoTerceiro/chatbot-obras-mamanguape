@@ -1,45 +1,44 @@
 // ============================================================
 //  groq.js
-//  Modulo de IA otimizado para o chatbot de obras.
+//  IA do chatbot: SOMENTE Groq + Gemini.
 //
-//  PROVEDORES (somente dois):
-//    1. Groq   -> principal, rapido e barato.
-//    2. Gemini -> fallback quando Groq estiver em limite/erro.
+//  Estrategia:
+//    1) Groq primeiro, usando modelo leve/atual.
+//    2) Se o modelo configurado nao existir, tenta outro modelo Groq atual.
+//    3) Em 429/erro, cai imediatamente para Gemini.
+//    4) Gemini usa a API nativa + x-goog-api-key (mais robusto que a camada
+//       OpenAI-compatible para chaves do Google AI Studio).
 //
-//  Objetivo desta versao:
-//  - usar somente Groq e Gemini;
-//  - reduzir tokens de entrada/saida;
-//  - nao insistir em provedor que acabou de devolver 429;
-//  - manter respostas rapidas no WhatsApp.
-//
-//  Variaveis:
+//  Variaveis de ambiente:
 //    GROQ_API_KEY
-//    GROQ_MODEL      (padrao: llama-3.1-8b-instant)
-//    GEMINI_API_KEY
-//    GEMINI_MODEL    (padrao: gemini-3.5-flash-lite)
+//    GROQ_MODEL       opcional; padrao openai/gpt-oss-20b
+//    GEMINI_API_KEY   (tambem aceita GOOGLE_API_KEY / GOOGLE_GENAI_API_KEY)
+//    GEMINI_MODEL     opcional; padrao gemini-3.5-flash-lite
 // ============================================================
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_KEY = process.env.GROQ_API_KEY;
-// Se o Render ainda estiver com openai/gpt-oss-120b, troca automaticamente pelo
-// modelo leve. Foi exatamente o 120B que bateu TPM no log enviado.
+const GROQ_KEY = (process.env.GROQ_API_KEY || "").trim();
 const GROQ_MODEL_ENV = (process.env.GROQ_MODEL || "").trim();
-const GROQ_MODEL = /gpt-oss-120b/i.test(GROQ_MODEL_ENV)
-  ? "llama-3.1-8b-instant"
-  : (GROQ_MODEL_ENV || "llama-3.1-8b-instant");
+// 20B primeiro: menor custo/latencia. 120B fica somente como reserva dentro
+// do proprio Groq. Se o Render ainda tiver um modelo antigo, ele e tentado
+// primeiro; se vier model_not_found/404, o codigo troca sozinho.
+const GROQ_MODELOS = [...new Set([
+  GROQ_MODEL_ENV,
+  "openai/gpt-oss-20b",
+  "openai/gpt-oss-120b",
+].filter(Boolean))];
 
-const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
-const GEMINI_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
+const GEMINI_KEY = (
+  process.env.GEMINI_API_KEY ||
+  process.env.GOOGLE_API_KEY ||
+  process.env.GOOGLE_GENAI_API_KEY ||
+  ""
+).trim();
+const GEMINI_MODEL = (process.env.GEMINI_MODEL || "gemini-3.5-flash-lite").trim();
 
 const PROVEDORES = [];
-if (GROQ_KEY) {
-  PROVEDORES.push({ nome: "groq", url: GROQ_URL, key: GROQ_KEY, model: GROQ_MODEL });
-}
-if (GEMINI_KEY) {
-  PROVEDORES.push({ nome: "gemini", url: GEMINI_URL, key: GEMINI_KEY, model: GEMINI_MODEL });
-}
-
+if (GROQ_KEY) PROVEDORES.push({ nome: "groq" });
+if (GEMINI_KEY) PROVEDORES.push({ nome: "gemini" });
 if (PROVEDORES.length === 0) {
   console.warn("AVISO: configure GROQ_API_KEY e/ou GEMINI_API_KEY.");
 }
@@ -47,12 +46,10 @@ if (PROVEDORES.length === 0) {
 // Contato para escalar quando o bot nao resolve (opcional, via .env).
 const CONTATO_SECRETARIA = process.env.CONTATO_SECRETARIA || "";
 
-// Quantas mensagens do historico enviar (ida + volta = 2). 6 = ~3 trocas.
+// Mantem contexto pequeno para economizar TPM.
 const MAX_HISTORICO_ENVIO = 4;
-// Corta cada mensagem antiga pra nao estourar tokens.
-const MAX_CHARS_HISTORICO = 240;
+const MAX_CHARS_HISTORICO = 220;
 
-// Operacoes de agregacao que o SISTEMA sabe executar (agregacao.js).
 const OPERACOES_VALIDAS = new Set([
   "maior_valor",
   "menor_valor",
@@ -62,13 +59,15 @@ const OPERACOES_VALIDAS = new Set([
   "contar_total",
 ]);
 
-// ------------------------------------------------------------
-//  Chamada generica com fallback Groq -> Gemini.
-// ------------------------------------------------------------
-const provedorDescansando = new Map(); // nome -> timestamp
+const provedorDescansando = new Map();
 const DESCANSO_PADRAO_MS = 15 * 1000;
-const TIMEOUT_IA_MS = 12000;
-const MAX_SAIDA_GLOBAL = 1200;
+const TIMEOUT_IA_MS = 18 * 1000;
+const MAX_SAIDA_GLOBAL = 700;
+
+function limiteSaida(body) {
+  const pedido = Number(body.max_completion_tokens ?? body.max_tokens ?? 384);
+  return Math.max(48, Math.min(Number.isFinite(pedido) ? pedido : 384, MAX_SAIDA_GLOBAL));
+}
 
 function retryDepoisMs(resp, corpoErro = "") {
   const cab = resp.headers?.get?.("retry-after");
@@ -76,9 +75,125 @@ function retryDepoisMs(resp, corpoErro = "") {
     const seg = Number(cab);
     if (Number.isFinite(seg) && seg > 0) return Math.min(seg * 1000, 60_000);
   }
-  const m = (corpoErro || "").match(/try again in\s+([0-9.]+)s/i);
+  const m = String(corpoErro).match(/try again in\s+([0-9.]+)s/i);
   if (m) return Math.min(Math.ceil(Number(m[1]) * 1000) + 500, 60_000);
   return DESCANSO_PADRAO_MS;
+}
+
+async function fetchComTimeout(url, opcoes) {
+  const controlador = new AbortController();
+  const timer = setTimeout(() => controlador.abort(), TIMEOUT_IA_MS);
+  try {
+    return await fetch(url, { ...opcoes, signal: controlador.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const modelosGroqIndisponiveis = new Set();
+
+async function chamarGroq(body) {
+  let ultimoErro = null;
+  const limite = limiteSaida(body);
+
+  for (const model of GROQ_MODELOS) {
+    if (modelosGroqIndisponiveis.has(model)) continue;
+    const corpo = { ...body, model };
+    delete corpo.max_tokens;
+    corpo.max_completion_tokens = limite;
+    if (corpo.reasoning_effort && !["low", "medium", "high"].includes(corpo.reasoning_effort)) {
+      delete corpo.reasoning_effort;
+    }
+
+    const resp = await fetchComTimeout(GROQ_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${GROQ_KEY}`,
+      },
+      body: JSON.stringify(corpo),
+    });
+
+    if (!resp.ok) {
+      const erroTxt = await resp.text();
+      const ehModeloInexistente = resp.status === 404 || /model_not_found|does not exist|do not have access/i.test(erroTxt);
+      if (ehModeloInexistente) {
+        modelosGroqIndisponiveis.add(model);
+        ultimoErro = new Error(`groq modelo ${model} indisponivel (${resp.status})`);
+        ultimoErro.status = resp.status;
+        console.warn(`DEBUG Groq: modelo ${model} indisponivel; tentando outro modelo.`);
+        continue;
+      }
+      const err = new Error(`groq respondeu ${resp.status}: ${erroTxt.slice(0, 320)}`);
+      err.status = resp.status;
+      if (resp.status === 429) err.retryAfterMs = retryDepoisMs(resp, erroTxt);
+      throw err;
+    }
+
+    const data = await resp.json();
+    const texto = data.choices?.[0]?.message?.content?.trim() || "";
+    if (!texto) throw new Error(`groq (${model}) devolveu resposta vazia`);
+    console.log(`DEBUG IA usada: Groq (principal) | modelo: ${model}`);
+    return texto;
+  }
+
+  throw ultimoErro || new Error("Nenhum modelo Groq disponivel para esta conta.");
+}
+
+function corpoGeminiNativo(body) {
+  const mensagens = Array.isArray(body.messages) ? body.messages : [];
+  const sistemas = mensagens
+    .filter((m) => m?.role === "system")
+    .map((m) => String(m.content || ""))
+    .filter(Boolean);
+
+  const contents = mensagens
+    .filter((m) => m?.role !== "system" && m?.content)
+    .map((m) => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: String(m.content) }],
+    }));
+
+  const generationConfig = { maxOutputTokens: limiteSaida(body) };
+  if (body.temperature !== undefined && Number.isFinite(Number(body.temperature))) {
+    generationConfig.temperature = Number(body.temperature);
+  }
+  if (body.response_format?.type === "json_object") {
+    generationConfig.responseMimeType = "application/json";
+  }
+
+  const payload = { contents, generationConfig };
+  if (sistemas.length) {
+    payload.system_instruction = { parts: [{ text: sistemas.join("\n") }] };
+  }
+  return payload;
+}
+
+async function chamarGemini(body) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const resp = await fetchComTimeout(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": GEMINI_KEY,
+    },
+    body: JSON.stringify(corpoGeminiNativo(body)),
+  });
+
+  if (!resp.ok) {
+    const erroTxt = await resp.text();
+    const err = new Error(`gemini respondeu ${resp.status}: ${erroTxt.slice(0, 320)}`);
+    err.status = resp.status;
+    if (resp.status === 429) err.retryAfterMs = retryDepoisMs(resp, erroTxt);
+    throw err;
+  }
+
+  const data = await resp.json();
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const texto = parts.map((p) => typeof p?.text === "string" ? p.text : "").join("").trim();
+  if (!texto) throw new Error("gemini devolveu resposta vazia");
+  console.log(`DEBUG IA usada: Gemini (fallback) | modelo: ${GEMINI_MODEL}`);
+  return texto;
 }
 
 async function chamarIA(body) {
@@ -87,73 +202,19 @@ async function chamarIA(body) {
   }
 
   const agora = Date.now();
-  // Nao martela um provedor que acabou de devolver 429.
   const ordem = PROVEDORES.filter((p) => (provedorDescansando.get(p.nome) || 0) <= agora);
   if (ordem.length === 0) {
     const proximo = Math.min(...PROVEDORES.map((p) => provedorDescansando.get(p.nome) || agora));
-    const erro = new Error(`Provedores em limite temporario. Tente novamente em ${Math.max(1, Math.ceil((proximo - agora) / 1000))}s.`);
+    const erro = new Error(`Provedores temporariamente indisponiveis. Tente novamente em ${Math.max(1, Math.ceil((proximo - agora) / 1000))}s.`);
     erro.status = 429;
     throw erro;
   }
 
   let ultimoErro = null;
-
   for (const prov of ordem) {
     try {
-      const corpo = { ...body, model: prov.model };
-
-      // Evita saidas enormes por engano.
-      const pedido = Number(corpo.max_completion_tokens ?? corpo.max_tokens ?? 512);
-      const limite = Math.max(64, Math.min(Number.isFinite(pedido) ? pedido : 512, MAX_SAIDA_GLOBAL));
-
-      if (prov.nome === "gemini") {
-        // Mantem max_tokens, que ja era usado com sucesso neste projeto.
-        // O OpenAI-compatible atual do Gemini aceita reasoning_effort; "low"
-        // reduz thinking e ajuda a economizar cota.
-        delete corpo.max_completion_tokens;
-        corpo.max_tokens = limite;
-        corpo.reasoning_effort = ["minimal", "low", "medium", "high"].includes(corpo.reasoning_effort)
-          ? corpo.reasoning_effort
-          : "low";
-        delete corpo.top_k;
-      } else if (prov.nome === "groq") {
-        delete corpo.max_tokens;
-        corpo.max_completion_tokens = limite;
-        const validos = ["low", "medium", "high"];
-        if (!validos.includes(corpo.reasoning_effort)) delete corpo.reasoning_effort;
-      }
-
-      const controlador = new AbortController();
-      const timer = setTimeout(() => controlador.abort(), TIMEOUT_IA_MS);
-      let resp;
-      try {
-        resp = await fetch(prov.url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${prov.key}`,
-          },
-          body: JSON.stringify(corpo),
-          signal: controlador.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-
-      if (!resp.ok) {
-        const erroTxt = await resp.text();
-        const err = new Error(`${prov.nome} respondeu ${resp.status}: ${erroTxt.slice(0, 280)}`);
-        err.status = resp.status;
-        if (resp.status === 429) err.retryAfterMs = retryDepoisMs(resp, erroTxt);
-        throw err;
-      }
-
-      const data = await resp.json();
-      const texto = data.choices?.[0]?.message?.content?.trim() || "";
-      if (!texto) throw new Error(`${prov.nome} devolveu resposta vazia`);
-
+      const texto = prov.nome === "groq" ? await chamarGroq(body) : await chamarGemini(body);
       provedorDescansando.delete(prov.nome);
-      console.log(`DEBUG IA usada: ${prov.nome === "groq" ? "Groq (principal)" : "Gemini (fallback)"} | modelo: ${prov.model}`);
       return texto;
     } catch (e) {
       ultimoErro = e;
@@ -163,8 +224,12 @@ async function chamarIA(body) {
         const pausa = Math.max(5_000, Math.min(e.retryAfterMs || DESCANSO_PADRAO_MS, 60_000));
         provedorDescansando.set(prov.nome, Date.now() + pausa);
         console.log(`DEBUG ${prov.nome} em limite - ignorando por ${Math.ceil(pausa / 1000)}s`);
+      } else if (prov.nome === "gemini" && (e.status === 401 || e.status === 403)) {
+        // Credencial errada nao melhora tentando a cada mensagem. No proximo deploy
+        // (apos corrigir a chave no Render) este estado e zerado automaticamente.
+        provedorDescansando.set(prov.nome, Date.now() + 10 * 60 * 1000);
+        console.error("DEBUG Gemini: confira GEMINI_API_KEY no Render (chave do Google AI Studio).");
       }
-      // Sem sleep: passa imediatamente para o outro provedor.
     }
   }
 
@@ -474,7 +539,7 @@ export async function redigirResposta(pergunta, obras, detalhe, historico = [], 
 //  esta funcao vai lancar erro e o server.js cai no formatador local.
 // ============================================================
 
-const GEMINI_KEY_CE = process.env.GEMINI_API_KEY;
+const GEMINI_KEY_CE = GEMINI_KEY;
 const GEMINI_MODEL_CE = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
 const SYSTEM_PROMPT_CODE_EXEC = `Voce e o assistente de obras publicas da Prefeitura de
@@ -497,7 +562,7 @@ export async function calcularComCodeExecution(pergunta, obras) {
 
   const url =
     "https://generativelanguage.googleapis.com/v1beta/models/" +
-    `${GEMINI_MODEL_CE}:generateContent?key=${GEMINI_KEY_CE}`;
+    `${GEMINI_MODEL_CE}:generateContent`;
 
   const body = {
     system_instruction: { parts: [{ text: SYSTEM_PROMPT_CODE_EXEC }] },
@@ -594,9 +659,10 @@ export async function gerarCodigoPython(pergunta, colunas) {
 // ============================================================
 export async function chamarIAbruta(mensagens, opcoes = {}) {
   const body = {
-    max_tokens: Math.min(Number(opcoes.max_tokens) || 512, 1200),
+    max_tokens: Math.min(Number(opcoes.max_tokens) || 384, MAX_SAIDA_GLOBAL),
     messages: mensagens,
   };
   if (opcoes.temperature !== undefined) body.temperature = opcoes.temperature;
+  if (opcoes.reasoning_effort !== undefined) body.reasoning_effort = opcoes.reasoning_effort;
   return await chamarIA(body);
 }
