@@ -1,13 +1,13 @@
 // ============================================================
 //  agente.js
-//  O CORACAO do sistema novo. Fluxo (padrao de 2 chamadas):
+//  Agente conversacional de analytics. Fluxo padrao de 2 chamadas:
 //    1) IA recebe a PERGUNTA + o schema da tabela -> gera SQL
 //    2) Validamos a SQL (so SELECT, bloqueia comandos perigosos)
 //    3) Executamos no banco
 //    4) IA recebe o RESULTADO -> escreve a resposta em portugues
 //
-//  Na primeira chamada a IA ve apenas schema/pergunta e produz a consulta.
-//  Na segunda, recebe somente as linhas retornadas para redigir a resposta.
+//  Na primeira chamada a IA ve schema REAL + metadados + memoria e produz a consulta.
+//  Na segunda, recebe pergunta + memoria + SQL + linhas retornadas e interpreta a resposta.
 //  Os calculos continuam sendo feitos pelo PostgreSQL.
 // ============================================================
 
@@ -242,17 +242,20 @@ export function comLimite(sql, max = 200) {
   return `${s} LIMIT ${teto}`;
 }
 
-// Monta um resumo curto das ultimas trocas, para dar contexto ao gerar SQL.
-// So as ultimas 2-3 trocas importam para perguntas de acompanhamento.
+// Monta o contexto conversacional para a IA, no estilo do chatbot do artigo.
+// Envia as ultimas 6 mensagens e preserva a SQL usada nas respostas anteriores.
+// Isso permite follow-ups como "quais sao?", "e dessas, qual o valor?" e
+// "agora so as do Centro" sem depender de regex fixa para entender a conversa.
 function resumoHistorico(historico = []) {
-  if (!Array.isArray(historico) || historico.length === 0) return "(sem contexto)";
-  return historico.slice(-2).map((m) => {
-    const quem = m.role === "user" ? "U" : "A";
-    const txt = (m.content || "").toString().replace(/\s+/g, " ").slice(0, 120);
+  if (!Array.isArray(historico) || historico.length === 0) return "(sem contexto anterior)";
+
+  return historico.slice(-6).map((m) => {
+    const quem = m.role === "user" ? "USUARIO" : "ASSISTENTE";
+    const txt = (m.content || "").toString().replace(/\s+/g, " ").trim().slice(0, 260);
     const sqlAnterior = m.role === "assistant" && m.sql
-      ? ` | SQL=${(m.sql || "").toString().replace(/\s+/g, " ").slice(0, 260)}`
+      ? `\nSQL_USADA: ${(m.sql || "").toString().replace(/\s+/g, " ").trim().slice(0, 500)}`
       : "";
-    return `${quem}:${txt}${sqlAnterior}`;
+    return `${quem}: ${txt}${sqlAnterior}`;
   }).join("\n");
 }
 
@@ -433,42 +436,60 @@ function gerarSQLRapida(pergunta, historico = []) {
 }
 
 // --- CHAMADA 1: pergunta -> SQL ---
+// MODO "CONVERSATIONAL ANALYTICS": toda pergunta de dados passa pela IA.
+// A IA recebe schema + metadados REAIS do banco + memoria recente, gera a SQL,
+// e o Node apenas valida/executa. E o mesmo padrao de agente SQL do artigo.
 async function gerarSQL(pergunta, historico = [], correcao = null) {
-  if (!correcao) {
-    const rapida = gerarSQLRapida(pergunta, historico);
-    if (rapida) {
-      console.log("AGENTE: SQL rapida (sem IA):", rapida);
-      return rapida;
-    }
-  }
+  const contextoBanco = await contextoAtualDoBanco();
 
   const blocoCorrecao = correcao
-    ? `\nA consulta anterior falhou/rejeitou. SQL=${JSON.stringify((correcao.sql || "").slice(0, 450))} ERRO=${JSON.stringify((correcao.erro || "").slice(0, 180))}. Corrija.`
+    ? `\nA consulta anterior falhou/rejeitou. SQL=${JSON.stringify((correcao.sql || "").slice(0, 600))} ERRO=${JSON.stringify((correcao.erro || "").slice(0, 220))}. Corrija a consulta sem mudar a intencao da pergunta.`
     : "";
 
-  const instrucao = `Converta pergunta sobre obras publicas em UMA SQL PostgreSQL.
+  const instrucao = `Voce e um ANALISTA DE DADOS especialista em obras publicas.
+Sua funcao e transformar a pergunta do cidadao em UMA consulta PostgreSQL precisa.
+
+SCHEMA DE NEGOCIO:
 ${SCHEMA}
-REGRAS:
-- Somente SELECT na tabela obras. Sem JOIN, comentarios ou outras tabelas.
-- Para status use unaccent(status) ILIKE unaccent('%trecho%') para tolerar acentos.
-- "quantas obras"=COUNT(*); "quantos engenheiros"=COUNT(DISTINCT engenheiro);
-  "quantas empresas"=COUNT(DISTINCT empresa); soma de valor=SUM(valor_total).
-- Pergunta de acompanhamento herda o WHERE da consulta anterior.
-- Bairro/local deve procurar em bairro OU objeto com unaccent/ILIKE.
-- Para recurso/contrato/convenio/aditivo/prazo selecione objeto,dados_extras.
-- Termos de busca devem ser curtos.
-- Se for apenas oi/ok/obrigado sem pedido de informacao, responda SEM_CONSULTA.
-- Saida: somente SQL, sem markdown e sem ponto-e-virgula.
-Contexto curto:
+
+METADADOS ATUAIS DO DATASET:
+${contextoBanco}
+
+MEMORIA RECENTE DA CONVERSA:
 ${resumoHistorico(historico)}
+
+COMO TRABALHAR:
+1. Entenda a pergunta em linguagem natural, inclusive erros de digitacao e follow-ups.
+2. Use SOMENTE colunas/chaves que realmente existem no schema/metadados acima.
+3. Gere UMA SQL SELECT que responda exatamente o que foi perguntado.
+4. Para pergunta de acompanhamento, use a conversa e a SQL anterior para manter/refinar o recorte.
+5. Se houver ambiguidade pequena, faca a interpretacao mais razoavel com base nos valores reais do banco.
+6. Se a pergunta nao puder ser respondida com este dataset, responda SEM_CONSULTA.
+
+REGRAS SQL:
+- Somente SELECT na tabela obras. Sem JOIN, comentarios, CTE, subconsultas desnecessarias ou outras tabelas.
+- Nunca INSERT, UPDATE, DELETE, DROP, ALTER, CREATE ou qualquer escrita.
+- Para texto, prefira unaccent(campo) ILIKE unaccent('%termo%').
+- Para categorias, escolha valores REAIS listados nos metadados; nao invente categoria.
+- "quantas obras" = COUNT(*).
+- "quantos engenheiros" = COUNT(DISTINCT engenheiro).
+- "quantas empresas" = COUNT(DISTINCT empresa).
+- soma/investimento = SUM(valor_total), salvo se a pergunta pedir valor executado.
+- Para recurso/contrato/convenio/aditivo/prazo/data, consulte dados_extras usando apenas chaves reais listadas nos metadados. Se nao tiver certeza da chave, selecione objeto,dados_extras.
+- Bairro/local pode procurar em bairro e, quando fizer sentido, no objeto da obra.
+- Saida: SOMENTE a SQL, sem markdown, explicacao ou ponto-e-virgula.
 ${blocoCorrecao}`;
 
   let ultimo = "";
   for (let tentativa = 1; tentativa <= 2; tentativa++) {
     const resposta = await chamarIAbruta([
       { role: "system", content: instrucao },
-      { role: "user", content: (pergunta || "").toString().slice(0, 800) },
-    ], { max_tokens: tentativa === 1 ? 180 : 240, temperature: 0, reasoning_effort: "low" });
+      { role: "user", content: (pergunta || "").toString().slice(0, 1200) },
+    ], {
+      max_tokens: tentativa === 1 ? 260 : 340,
+      temperature: 0,
+      reasoning_effort: "low",
+    });
 
     let sql = resposta.replace(/```sql/gi, "").replace(/```/g, "").trim();
     const m = sql.match(/select[\s\S]+/i);
@@ -483,7 +504,7 @@ ${blocoCorrecao}`;
 }
 
 // --- CHAMADA 2: resultado -> resposta natural ---
-async function redigir(pergunta, linhas, ehInicio = false) {
+async function redigir(pergunta, linhas, ehInicio = false, historico = [], sqlUsada = "") {
   // Achata dados_extras E pre-formata valores em reais NO CODIGO. Assim os
   // numeros ja chegam prontos ("R$ 1.408.500,00") e a IA so COPIA - nunca
   // recalcula nem redigita, o que elimina o erro de valor mudar entre respostas.
@@ -524,8 +545,13 @@ async function redigir(pergunta, linhas, ehInicio = false) {
   const muitasLinhas = amostra.length > 8;
   const prompt = `Voce e o Assistente de Obras da Prefeitura de Mamanguape no WhatsApp.
 O cidadao perguntou: "${pergunta}"
+Consulta usada neste turno: ${sqlUsada || "(consulta nao informada)"}
+Contexto recente da conversa:
+${resumoHistorico(historico)}
+
 O sistema consultou o banco e retornou EXATAMENTE estes dados (JSON): ${dados}
 
+Interprete o resultado para responder exatamente a pergunta atual, levando em conta o contexto recente.
 Escreva uma resposta clara e cordial em portugues, formato WhatsApp.
 
 REGRAS ABSOLUTAS DE EXATIDAO (o mais importante - nunca quebre):
@@ -543,6 +569,8 @@ REGRAS ABSOLUTAS DE EXATIDAO (o mais importante - nunca quebre):
 - NAO concorde com o cidadao sem conferir. A verdade e o JSON, nao a pergunta.
 - Se o JSON vier vazio, diga que nao encontrou e peca para reformular. NUNCA
   invente numero para preencher.
+- Se a pergunta puder ter mais de uma interpretacao e a consulta adotou uma interpretacao
+  razoavel, deixe essa suposicao clara em UMA frase curta (ex.: "Considerei Centro como bairro").
 - ${ehInicio
     ? "Esta e a PRIMEIRA mensagem: pode cumprimentar uma vez (Ola/Bom dia)."
     : "NAO cumprimente. A conversa JA comecou - va DIRETO a resposta."}
@@ -818,22 +846,13 @@ export async function responderPergunta(pergunta, historico = []) {
   }
   console.log(`AGENTE: ${linhas.length} linha(s) retornada(s).`);
 
-  // 4. Redige resposta.
-  // Para consultas comuns nao chama IA de novo: economiza aproximadamente metade
-  // das chamadas e evita estourar TPM em conversas seguidas.
-  if (!precisaRedacaoIA(pergunta, linhas)) {
-    return {
-      resposta: redigirLocal(pergunta, linhas),
-      sql,
-      linhas: linhas.length,
-      respostaLocal: true,
-    };
-  }
-
+  // 4. CHAMADA 2: resultado SQL -> resposta natural.
+  // No modo do artigo, TODA consulta de dados passa por esta interpretacao da IA.
+  // Se Groq/Gemini estiverem indisponiveis, existe fallback deterministico local.
   try {
     const ehInicio = !Array.isArray(historico) || historico.length === 0;
-    const resposta = await redigir(pergunta, linhas, ehInicio);
-    return { resposta, sql, linhas: linhas.length };
+    const resposta = await redigir(pergunta, linhas, ehInicio, historico, sql);
+    return { resposta, sql, linhas: linhas.length, modoAgente: "duas_chamadas" };
   } catch (e) {
     console.error("AGENTE: redacao por IA falhou; usando resposta local:", e.message);
     return {
