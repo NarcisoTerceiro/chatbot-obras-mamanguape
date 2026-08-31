@@ -359,15 +359,29 @@ function gerarSQLRapida(pergunta, historico = []) {
   const pedeStatus = /\b(status|situacao)\b/.test(p);
   const pedePercentual = /\b(percentual|porcentagem|% executad)\b/.test(p);
   const pedeExecutado = /\b(valor executado|quanto executou|ja executado|executad[oa])\b/.test(p);
-  const pedeValor = pedeExecutado || /\b(valor|valores|custo|custou|investid|investimento|quanto foi)\b/.test(p);
+  const pedeValor = pedeExecutado || /\b(valor|valores|custos?|custou|investid|investimento|quanto foi|orcamento)\b/.test(p);
   const pedeContagem = /\b(quantos|quantas|numero de|qtd|quantidade de)\b/.test(p);
   const pedeSoma = pedeValor && (
     /\b(total|soma|somando|ao todo|quanto foi investido|quanto custou tudo|investid|investimento)\b/.test(p) ||
     (!!filtroLocal && /\bqual(?: e| o)? valor\b/.test(p))
   );
 
-  // Campos livres de dados_extras continuam indo para IA.
-  if (/\b(recurso|contrato|convenio|aditivo|prazo|data da|ordem de servico)\b/.test(p)) return null;
+  // Campos livres de dados_extras (recurso, contrato, convenio, prazo...).
+  // ATENCAO ao plural: "recursos"/"contratos" precisam casar tambem, senao a
+  // pergunta escapa para o atalho generico e volta so a lista de nomes.
+  const pedeExtras = /\b(recursos?|fontes?|contratos?|convenios?|aditivos?|prazos?|data da|datas? de|ordem de servico|licitac(?:ao|oes))\b/.test(p);
+  if (pedeExtras) {
+    // Se JA sabemos o filtro (herdado da conversa ou dito agora), montamos a
+    // SQL aqui mesmo: traz a gaveta dados_extras inteira e o sistema extrai o
+    // campo certo na redacao. Assim a CONSULTA nao depende da IA (que pode
+    // estar lenta/instavel); so a redacao usa IA.
+    if (where || usarAnterior) {
+      return `SELECT objeto, dados_extras FROM obras ${where} ORDER BY objeto`;
+    }
+    // Sem filtro nenhum (ex.: "qual o recurso da praca da bandeira") a IA
+    // precisa entender de qual obra se trata - entao deixamos com ela.
+    return null;
+  }
 
   if (pedeContagem) {
     if (pedeEng) return `SELECT COUNT(DISTINCT engenheiro)::int AS quantidade_engenheiros FROM obras ${where} ${where ? "AND" : "WHERE"} engenheiro IS NOT NULL AND BTRIM(engenheiro) <> ''`;
@@ -669,7 +683,8 @@ function redigirLocal(pergunta, linhas) {
 
 function precisaRedacaoIA(pergunta, linhas) {
   const p = normalizarTexto(pergunta);
-  const pedeExtra = /\b(recurso|contrato|convenio|aditivo|prazo|data da|ordem de servico)\b/.test(p);
+  // Plural incluido: "recursos", "contratos" etc. tambem precisam de redacao IA.
+  const pedeExtra = /\b(recursos?|fontes?|contratos?|convenios?|aditivos?|prazos?|data da|datas? de|ordem de servico)\b/.test(p);
   const temExtras = (linhas || []).some((l) => l?.dados_extras && typeof l.dados_extras === "object");
   return pedeExtra && temExtras;
 }
