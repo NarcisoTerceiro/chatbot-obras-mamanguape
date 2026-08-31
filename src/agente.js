@@ -43,40 +43,87 @@ async function contextoAtualDoBanco() {
   }
 
   try {
-    const [colunas, status, extras] = await Promise.all([
+    // Colunas de texto que valem como CATEGORIA filtravel. Listamos os valores
+    // reais de cada uma para a IA nao precisar adivinhar (ex.: saber que existe
+    // o bairro "Cristo Rei" evita WHERE bairro ILIKE '%cristo do rei%").
+    const COLUNAS_CATEGORICAS = ["status", "categoria", "bairro", "engenheiro", "empresa", "aba_origem"];
+    const consultaValores = COLUNAS_CATEGORICAS
+      .map((c) =>
+        `SELECT '${c}' AS coluna, ${c}::text AS valor, COUNT(*)::int AS quantidade ` +
+        `FROM obras WHERE ${c} IS NOT NULL AND BTRIM(${c}::text) <> '' GROUP BY ${c}`
+      )
+      .join(" UNION ALL ");
+
+    const [colunas, valores, extras, totais] = await Promise.all([
       queryReadOnly(
         "SELECT column_name, data_type, is_nullable " +
         "FROM information_schema.columns " +
         "WHERE table_schema = current_schema() AND table_name = 'obras' " +
         "ORDER BY ordinal_position"
       ),
-      queryReadOnly(
-        "SELECT status, COUNT(*)::int AS quantidade FROM obras " +
-        "WHERE status IS NOT NULL AND BTRIM(status) <> '' " +
-        "GROUP BY status ORDER BY quantidade DESC LIMIT 30"
-      ),
+      queryReadOnly(`SELECT * FROM (${consultaValores}) v ORDER BY coluna, quantidade DESC`),
       queryReadOnly(
         "SELECT chave FROM (" +
         "SELECT DISTINCT jsonb_object_keys(COALESCE(dados_extras, '{}'::jsonb)) AS chave " +
         "FROM obras) x ORDER BY chave LIMIT 80"
       ),
+      queryReadOnly(
+        "SELECT COUNT(*)::int AS total, " +
+        "COUNT(valor_total)::int AS com_valor, " +
+        "COALESCE(SUM(valor_total),0)::numeric AS soma_valor FROM obras"
+      ),
     ]);
 
-    const textoColunas = colunas.rows
-      .map((c) => `- ${c.column_name}: ${c.data_type}; nulo=${c.is_nullable}`)
-      .join("\n");
-    const textoStatus = status.rows
-      .map((s) => `${s.status} (${s.quantidade})`)
-      .join(", ");
+    // --- CLASSIFICADOR DE COLUNAS ---
+    // Separa o que e NUMERO (agregavel com SUM/AVG) do que e CATEGORIA
+    // (filtravel com ILIKE/=). Isso torna a geracao de SQL bem mais precisa.
+    const TIPOS_NUMERICOS = ["integer", "bigint", "numeric", "double precision", "real", "smallint"];
+    const porColuna = new Map();
+    for (const linha of valores.rows) {
+      if (!porColuna.has(linha.coluna)) porColuna.set(linha.coluna, []);
+      porColuna.get(linha.coluna).push(linha);
+    }
+
+    const linhasColunas = colunas.rows.map((c) => {
+      const nome = c.column_name;
+      const ehNumero = TIPOS_NUMERICOS.includes((c.data_type || "").toLowerCase());
+      if (ehNumero) {
+        return `- ${nome} [NUMERO - use SUM/AVG/MIN/MAX, nunca ILIKE]`;
+      }
+      if (nome === "dados_extras") {
+        return `- ${nome} [JSONB - campos livres; leia com dados_extras->>'CHAVE']`;
+      }
+      const lista = porColuna.get(nome);
+      if (lista && lista.length) {
+        const totalDistintos = lista.length;
+        const amostra = lista
+          .slice(0, 25)
+          .map((v) => `${v.valor} (${v.quantidade})`)
+          .join(", ");
+        const reticencias = totalDistintos > 25 ? `, ... (+${totalDistintos - 25})` : "";
+        return `- ${nome} [CATEGORIA - ${totalDistintos} valores distintos] valores reais: ${amostra}${reticencias}`;
+      }
+      return `- ${nome} [TEXTO LIVRE - use unaccent+ILIKE com termo curto]`;
+    });
+
     const textoExtras = extras.rows.map((e) => e.chave).join(" | ");
+    const t = totais.rows[0] || {};
 
     const texto = `
-METADADOS REAIS DO BANCO (gerados automaticamente):
-Colunas atuais:
-${textoColunas || "(nenhuma coluna encontrada)"}
-Status existentes: ${textoStatus || "(nenhum status preenchido)"}
-Chaves encontradas em dados_extras: ${textoExtras || "(nenhuma chave encontrada)"}
-Use estes metadados para confirmar nomes e valores. Continue consultando SOMENTE obras.`;
+METADADOS REAIS DO BANCO (gerados automaticamente a cada leitura):
+Total de obras cadastradas: ${t.total ?? "?"} (com valor preenchido: ${t.com_valor ?? "?"})
+
+CLASSIFICACAO DAS COLUNAS:
+${linhasColunas.join("\n") || "(nenhuma coluna encontrada)"}
+
+Chaves disponiveis em dados_extras: ${textoExtras || "(nenhuma)"}
+
+COMO USAR ESTES METADADOS:
+- Para filtrar CATEGORIA, use EXATAMENTE um dos valores reais listados acima.
+  Se o cidadao escrever diferente (ex.: "Cristo do Rei"), escolha o valor real
+  mais parecido da lista (ex.: "Cristo Rei"). Nao invente valor que nao esta la.
+- Para NUMERO use SUM/AVG/COUNT; nunca compare numero com ILIKE.
+- Consulte SOMENTE a tabela obras.`;
 
     cacheSchemaBanco = { texto, quando: agora };
     return texto;
