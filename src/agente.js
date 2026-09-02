@@ -334,6 +334,24 @@ function gerarSQLRapida(pergunta, historico = []) {
   const whereAnterior = whereDaSQL(sqlAnterior);
   const condAnterior = whereAnterior.replace(/^WHERE\s+/i, "").trim();
 
+  // PAGINACAO: "mostrar mais", "mais 10", "proximas", "ver mais obras".
+  // Reaproveita o filtro da consulta anterior e pula as que ja foram mostradas.
+  // Conta quantas ja apareceram somando os blocos de 10 pedidos antes.
+  const pedeMais = /\b(mais\s+\d*\s*obras?|mostrar? mais|ver mais|proxim|seguintes?|continua|continuar|mais 10|outras? 10)\b/.test(p);
+  if (pedeMais && condAnterior) {
+    // conta quantas vezes o cidadao ja pediu "mais" nesta sequencia
+    let jaMostrou = 10; // o primeiro bloco (as 10 primeiras)
+    for (let i = historico.length - 1; i >= 0; i--) {
+      const h = historico[i];
+      if (h?.role === "user") {
+        const t = normalizarTexto(h.content || "");
+        if (/\b(mais|mostrar? mais|ver mais|proxim|seguintes?|continua)\b/.test(t)) jaMostrou += 10;
+        else if (!/\b(primeir|todas|todos)\b/.test(t)) break;
+      }
+    }
+    return `SELECT objeto, valor_total FROM obras WHERE ${condAnterior} ORDER BY objeto LIMIT 10 OFFSET ${jaMostrou}`;
+  }
+
   const referenciaAnterior = /\b(dessas?|destas?|nessas?|nestas?|delas?|essas?|elas?|anteriores?|acima|mesmas?|isso)\b/.test(p);
   const perguntaCurtaLista = /^(?:e\s+)?quais(?:\s+sao)?$|^(?:lista|liste|mostra|mostre)(?:\s+(?:elas|essas|as obras))?$/.test(p);
   const curtaDeAcompanhamento = p.split(" ").length <= 7 && (
@@ -631,7 +649,33 @@ function redigirLocal(pergunta, linhas) {
     }
   }
 
-  const LIMITE = 30;
+  const LIMITE = 10;
+
+  // O cidadao pediu explicitamente pra ver a lista mesmo sendo grande?
+  // ("as 10 primeiras", "liste todas", "mostrar tudo", "lista completa")
+  const querListarMesmoAssim = /\bprimeir\w*|\btodas?\b|\btodos?\b|\btudo\b|\bcompleta\b|liste? todas|pode listar|mostrar? tudo/.test(p);
+
+  // OPCAO A - listas grandes nao sao despejadas. Se passar de 10 obras, o bot
+  // resume e pede um filtro (bairro/status), em vez de jogar dezenas de linhas
+  // no WhatsApp. Vale para as listagens de OBRAS (que tem objeto).
+  const ehListaDeObras = linhas.length > 0 &&
+    linhas.every((l) => l && Object.prototype.hasOwnProperty.call(l, "objeto"));
+  if (ehListaDeObras && linhas.length > LIMITE && !querListarMesmoAssim) {
+    const bairros = [...new Set(
+      linhas.map((l) => (l.bairro || "").toString().trim()).filter(Boolean)
+    )].slice(0, 6);
+    // Mostra as 10 primeiras JA, e oferece continuar (ver mais) ou filtrar.
+    const itens = linhas.slice(0, LIMITE).map(
+      (l) => `• ${texto(l.objeto, "Obra sem nome")} — ${moeda(l.valor_total)}`
+    );
+    const dicaBairro = bairros.length
+      ? `filtrar por bairro (ex.: ${bairros.slice(0, 3).join(", ")})`
+      : "filtrar por bairro ou status";
+    return `${itens.join("\n")}\n\n` +
+      `Estas são as ${LIMITE} primeiras de ${linhas.length} obras.\n` +
+      `Para continuar, responda "ver mais" — ou peça para ${dicaBairro}. 🙂`;
+  }
+
   const amostra = linhas.slice(0, LIMITE);
 
   // Obra + engenheiro: caso exato do acompanhamento "dessas obras".
