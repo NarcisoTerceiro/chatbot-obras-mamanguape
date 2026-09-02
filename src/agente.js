@@ -414,22 +414,24 @@ function gerarSQLRapida(pergunta, historico = []) {
     const campo = pedeExecutado ? "valor_executado" : "valor_total";
     return `SELECT objeto, ${campo} FROM obras ${where} ORDER BY objeto`;
   }
-  if (pedeStatus && where) return `SELECT objeto, status FROM obras ${where} ORDER BY objeto`;
+  if (pedeStatus && where) return `SELECT objeto, status, valor_total FROM obras ${where} ORDER BY objeto`;
 
   // "Quais sao?" logo apos "quantas concluidas?" deve listar as mesmas obras,
-  // sem depender da IA.
+  // sem depender da IA. Traz o valor junto para nao mostrar "nao informado"
+  // quando na verdade o valor existe (so nao tinha sido consultado).
   if (condAnterior && perguntaCurtaLista) {
-    return `SELECT objeto FROM obras WHERE ${condAnterior} ORDER BY objeto`;
+    return `SELECT objeto, valor_total FROM obras WHERE ${condAnterior} ORDER BY objeto`;
   }
 
-  // Listagens simples com filtro explicito (status ou local).
+  // Listagens simples com filtro explicito (status ou local). Inclui valor_total
+  // para que a lista mostre o valor real de cada obra quando cadastrado.
   if (where && /\b(obras?|quais|liste|lista|nomes?|mostra|mostre)\b/.test(p)) {
-    return `SELECT objeto FROM obras ${where} ORDER BY objeto`;
+    return `SELECT objeto, valor_total FROM obras ${where} ORDER BY objeto`;
   }
 
   // Acompanhamento curto usando o filtro anterior.
   if (usarAnterior && /\b(quais|lista|liste|nomes?|obras?|elas|essas|mostra|mostre)\b/.test(p)) {
-    return `SELECT objeto FROM obras ${where} ORDER BY objeto`;
+    return `SELECT objeto, valor_total FROM obras ${where} ORDER BY objeto`;
   }
 
   return null;
