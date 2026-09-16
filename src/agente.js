@@ -363,11 +363,25 @@ function gerarSQLRapida(pergunta, historico = []) {
   const filtroLocal = condicaoLocalDaPergunta(p);
   const temFiltroNovo = !!(filtroStatus || filtroLocal);
 
+  // Distingue OBRA concluida de PROJETO concluido.
+  // A planilha possui itens da aba EM_PROJETO que podem ter status "Concluída",
+  // mas eles nao devem entrar na contagem quando o cidadao pergunta por obras
+  // concluidas. Se ele pedir explicitamente projetos concluidos, fazemos o inverso.
+  const pedeProjeto = /\bprojetos?\b/.test(p);
+  const filtroConcluida = /%conclu%/i.test(filtroStatus || "");
+  const condicaoProjeto =
+    "(unaccent(COALESCE(categoria,'')) ILIKE unaccent('%projeto%') " +
+    "OR unaccent(COALESCE(aba_origem,'')) ILIKE unaccent('%projeto%'))";
+
   // Se a pessoa diz explicitamente "dessas" + um novo filtro, refinamos a
   // consulta anterior. Se apenas faz uma pergunta curta, herdamos o filtro.
   const condicoes = [];
   if (condAnterior && referenciaAnterior) condicoes.push(condAnterior);
   if (filtroStatus) condicoes.push(filtroStatus);
+  if (filtroConcluida) {
+    if (pedeProjeto) condicoes.push(condicaoProjeto);
+    else condicoes.push(`NOT ${condicaoProjeto}`);
+  }
   if (filtroLocal) condicoes.push(filtroLocal);
   if (!condicoes.length && condAnterior && curtaDeAcompanhamento) condicoes.push(condAnterior);
 
@@ -491,6 +505,9 @@ REGRAS SQL:
 - Nunca INSERT, UPDATE, DELETE, DROP, ALTER, CREATE ou qualquer escrita.
 - Para texto, prefira unaccent(campo) ILIKE unaccent('%termo%').
 - Para categorias, escolha valores REAIS listados nos metadados; nao invente categoria.
+- IMPORTANTE: "obra(s) concluida(s)" NAO inclui itens de projeto. Para obras concluidas,
+  filtre status de concluida E exclua categoria/aba_origem de projeto.
+- "projeto(s) concluido(s)" deve filtrar status de concluida E restringir categoria/aba_origem a projeto.
 - "quantas obras" = COUNT(*).
 - "quantos engenheiros" = COUNT(DISTINCT engenheiro).
 - "quantas empresas" = COUNT(DISTINCT empresa).
