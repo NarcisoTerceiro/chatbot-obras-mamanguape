@@ -52,16 +52,17 @@ function pegar(obra, campo) {
 function padronizarStatus(txt) {
   const s = norm(txt);
   if (!s) return "";
-  // ORDEM IMPORTA. Casos especificos primeiro, para evitar que uma palavra
-  // solta ("concluido" numa observacao) classifique errado.
-  // "Em elaboracao" / "em projeto" tem prioridade - sao status de projeto,
-  // nao de obra concluida, mesmo que o texto tenha "conclu" em outra parte.
+  // ORDEM IMPORTA. Primeiro identificamos ETAPAS ESPECIFICAS.
+  // Ex.: "Habilitacao em andamento" e uma etapa de LICITACAO, nao uma obra
+  // fisicamente em andamento. Antes a palavra "andamento" era testada primeiro
+  // e esses processos eram somados indevidamente como obras em execucao.
   if (s.includes("elabora") || s.includes("em projeto") || s.includes("estudo")) return "Em projeto";
-  if (s.includes("andamento") || s.includes("em obra") || s.includes("execu")) return "Em andamento";
   if (s.includes("licita") || s.includes("edital") || s.includes("propost") || s.includes("habilita")) return "Em licitação";
-  if (s.includes("parad") || s.includes("paralis") || s.includes("suspens")) return "Paralisada";
   if (s.includes("homolog")) return "Homologada";
+  if (s.includes("parad") || s.includes("paralis") || s.includes("suspens")) return "Paralisada";
   if (s.includes("iniciar")) return "A iniciar";
+  // Somente depois das etapas especificas tratamos execucao fisica.
+  if (s.includes("andamento") || s.includes("em obra") || s.includes("execu")) return "Em andamento";
   // Concluida por ultimo: so classifica assim se o status for claramente isso
   // (comeca com "conclu"/"finaliz" ou e exatamente a palavra), nao se "conclu"
   // aparecer perdido no meio de uma frase.
@@ -138,15 +139,25 @@ function limpar(obra) {
   const objeto = pegar(obra, "objeto");
   if (!objeto) return null; // sem nome, ignora
   const categoria = categoriaDaAba(obra._aba);
+  const statusOriginal = (pegar(obra, "status") || "").toString().trim();
+  const statusNormalizado = padronizarStatus(statusOriginal) || categoria;
+
   // bairro: primeiro tenta a coluna; se vazia, tenta extrair do nome.
   let bairro = (pegar(obra, "bairro") || "").toString().trim();
   if (!bairro) {
     bairro = bairroDoNome(objeto) || "";
   }
+
+  // Mantemos tambem o texto ORIGINAL do status dentro de dados_extras.
+  // Isso permite respostas detalhadas como "Habilitacao em andamento" sem
+  // confundir essa etapa com uma obra fisicamente em andamento.
+  const extras = coletarExtras(obra) || {};
+  if (statusOriginal) extras["STATUS ORIGINAL"] = statusOriginal;
+
   return {
     objeto: objeto.toString().trim(),
     bairro: bairro || null,
-    status: padronizarStatus(pegar(obra, "status")) || categoria,
+    status: statusNormalizado,
     categoria,
     valor_total: parseValor(pegar(obra, "valor_total")),
     valor_executado: parseValor(pegar(obra, "valor_executado")),
@@ -154,7 +165,7 @@ function limpar(obra) {
     engenheiro: (pegar(obra, "engenheiro") || "").toString().trim() || null,
     empresa: (pegar(obra, "empresa") || "").toString().trim() || null,
     aba_origem: obra._aba || null,
-    dados_extras: coletarExtras(obra), // TODAS as outras colunas da planilha
+    dados_extras: Object.keys(extras).length ? extras : null,
   };
 }
 

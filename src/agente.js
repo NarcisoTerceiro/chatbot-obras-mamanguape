@@ -25,6 +25,9 @@ Regras de dados:
 - valor_total/valor_executado sao numeros e podem ser NULL.
 - Para texto, prefira unaccent(campo) ILIKE unaccent('%termo%').
 - Status pode variar em acentos; filtre por trecho com unaccent/ILIKE.
+- aba_origem/categoria distinguem OBRAS, PROJETOS, PAVIMENTACAO e LICITACAO.
+- "obra em andamento" NAO e a mesma coisa que "habilitacao em andamento".
+- dados_extras pode conter "STATUS ORIGINAL", preservando a etapa exata escrita na planilha.
 - RECURSO, CONTRATO, CONVENIO, ADITIVO, PRAZO, DATAS e campos nao listados ficam
   em dados_extras. Para esses casos selecione objeto, dados_extras; nao invente
   chaves JSON.
@@ -296,6 +299,25 @@ function filtroStatusDaPergunta(p) {
   return "";
 }
 
+function filtroEscopoDaPergunta(p) {
+  // O tipo pedido pelo cidadao precisa respeitar a origem da planilha.
+  // Isso evita misturar projeto/licitacao com obra fisica so porque o texto do
+  // status contem palavras parecidas.
+  if (/\bprojetos?\b/.test(p)) return "aba_origem = 'EM_PROJETO'";
+  if (/\b(licitacoes?|licitacao|processos? licitatorios?)\b/.test(p)) return "aba_origem = 'EM_LICITAÇÃO'";
+  if (/\bpaviment(?:acao|acoes|ar|ada|adas|ado|ados)?\b/.test(p)) return "aba_origem = 'PAVIMENTAÇÃO'";
+  return "";
+}
+
+function ehPerguntaGenericaObrasEmAndamento(p) {
+  return /\b(quantos|quantas|numero de|qtd|quantidade de)\b/.test(p) &&
+    /\bobras?\b/.test(p) &&
+    /\b(em andamento|andamento)\b/.test(p) &&
+    !/\bprojetos?\b/.test(p) &&
+    !/\b(licitacoes?|licitacao)\b/.test(p) &&
+    !/\bpaviment/.test(p);
+}
+
 function condicaoLocalDaPergunta(p) {
   // Captura locais escritos de forma natural no fim da pergunta:
   // "no Centro", "na Bela Vista", "em Barra de Mamanguape" e "bairro Centro".
@@ -359,30 +381,48 @@ function gerarSQLRapida(pergunta, historico = []) {
     perguntaCurtaLista
   );
 
+  // Caso importante: "quantas obras estao em andamento?" precisa responder
+  // o TOTAL PRINCIPAL da aba EM_ANDAMENTO e, ao mesmo tempo, explicar os grupos
+  // parecidos sem mistura-los. A consulta devolve os tres numeros em uma linha,
+  // para a redacao detalhar com transparencia.
+  if (ehPerguntaGenericaObrasEmAndamento(p)) {
+    return `SELECT ` +
+      `SUM(CASE WHEN aba_origem = 'EM_ANDAMENTO' THEN 1 ELSE 0 END)::int AS obras_em_andamento, ` +
+      `SUM(CASE WHEN aba_origem = 'PAVIMENTAÇÃO' AND unaccent(status) ILIKE unaccent('%andamento%') THEN 1 ELSE 0 END)::int AS pavimentacoes_em_execucao, ` +
+      `SUM(CASE WHEN aba_origem = 'EM_LICITAÇÃO' AND (` +
+        `unaccent(status) ILIKE unaccent('%andamento%') OR ` +
+        `unaccent(COALESCE(dados_extras->>'STATUS ORIGINAL','')) ILIKE unaccent('%andamento%')` +
+      `) THEN 1 ELSE 0 END)::int AS licitacoes_com_etapa_em_andamento ` +
+      `FROM obras`;
+  }
+
   const filtroStatus = filtroStatusDaPergunta(p);
   const filtroLocal = condicaoLocalDaPergunta(p);
-  const temFiltroNovo = !!(filtroStatus || filtroLocal);
+  let filtroEscopo = filtroEscopoDaPergunta(p);
 
-  // Distingue OBRA concluida de PROJETO concluido.
-  // A planilha possui itens da aba EM_PROJETO que podem ter status "Concluída",
-  // mas eles nao devem entrar na contagem quando o cidadao pergunta por obras
-  // concluidas. Se ele pedir explicitamente projetos concluidos, fazemos o inverso.
-  const pedeProjeto = /\bprojetos?\b/.test(p);
-  const filtroConcluida = /%conclu%/i.test(filtroStatus || "");
-  const condicaoProjeto =
-    "(unaccent(COALESCE(categoria,'')) ILIKE unaccent('%projeto%') " +
-    "OR unaccent(COALESCE(aba_origem,'')) ILIKE unaccent('%projeto%'))";
+  // Mesmo quando nao e uma contagem (ex.: "quais obras estao em andamento?"),
+  // a expressao generica "obras em andamento" aponta para a area EM_ANDAMENTO.
+  // Pavimentacoes em execucao e etapas de licitacao ficam como grupos separados.
+  if (!filtroEscopo && /\bobras?\b/.test(p) && /\b(em andamento|andamento)\b/.test(p)) {
+    filtroEscopo = "aba_origem = 'EM_ANDAMENTO'";
+  }
+
+  const temFiltroNovo = !!(filtroStatus || filtroLocal || filtroEscopo);
 
   // Se a pessoa diz explicitamente "dessas" + um novo filtro, refinamos a
   // consulta anterior. Se apenas faz uma pergunta curta, herdamos o filtro.
   const condicoes = [];
   if (condAnterior && referenciaAnterior) condicoes.push(condAnterior);
+  if (filtroEscopo) condicoes.push(filtroEscopo);
   if (filtroStatus) condicoes.push(filtroStatus);
-  if (filtroConcluida) {
-    if (pedeProjeto) condicoes.push(condicaoProjeto);
-    else condicoes.push(`NOT ${condicaoProjeto}`);
-  }
   if (filtroLocal) condicoes.push(filtroLocal);
+
+  // Quando a pessoa fala genericamente em "obras concluidas", projetos e
+  // processos licitatorios nao entram no total de obras fisicas.
+  if (!filtroEscopo && filtroStatus && /\bobras?\b/.test(p) &&
+      /\b(concluid|pront|finaliz|terminad)/.test(p)) {
+    condicoes.push("aba_origem NOT IN ('EM_PROJETO','EM_LICITAÇÃO')");
+  }
   if (!condicoes.length && condAnterior && curtaDeAcompanhamento) condicoes.push(condAnterior);
 
   const usarAnterior = !!condAnterior && (referenciaAnterior || curtaDeAcompanhamento) && !temFiltroNovo;
@@ -400,6 +440,16 @@ function gerarSQLRapida(pergunta, historico = []) {
     /\b(total|soma|somando|ao todo|quanto foi investido|quanto custou tudo|investid|investimento)\b/.test(p) ||
     (!!filtroLocal && /\bqual(?: e| o)? valor\b/.test(p))
   );
+  const pedeDetalhes = /\b(detalh\w*|informacoes?|completo|completa|tudo sobre|me fale sobre|explique|como esta|como ta|situacao completa)\b/.test(p);
+
+  // Se o cidadao pediu detalhes de um recorte ja identificado, traz o conjunto
+  // completo de campos uteis + dados_extras. A IA decide o que e relevante e
+  // organiza a resposta; campos vazios nao precisam ser exibidos.
+  if (pedeDetalhes && (where || usarAnterior)) {
+    return `SELECT objeto, status, categoria, bairro, engenheiro, empresa, ` +
+      `valor_total, valor_executado, percentual_executado, aba_origem, dados_extras ` +
+      `FROM obras ${where} ORDER BY objeto`;
+  }
 
   // Campos livres de dados_extras (recurso, contrato, convenio, prazo...).
   // ATENCAO ao plural: "recursos"/"contratos" precisam casar tambem, senao a
@@ -458,12 +508,12 @@ function gerarSQLRapida(pergunta, historico = []) {
   // Listagens simples com filtro explicito (status ou local). Inclui valor_total
   // para que a lista mostre o valor real de cada obra quando cadastrado.
   if (where && /\b(obras?|quais|liste|lista|nomes?|mostra|mostre)\b/.test(p)) {
-    return `SELECT objeto, valor_total FROM obras ${where} ORDER BY objeto`;
+    return `SELECT objeto, status, categoria, bairro, engenheiro, empresa, valor_total, percentual_executado, aba_origem FROM obras ${where} ORDER BY objeto`;
   }
 
   // Acompanhamento curto usando o filtro anterior.
   if (usarAnterior && /\b(quais|lista|liste|nomes?|obras?|elas|essas|mostra|mostre)\b/.test(p)) {
-    return `SELECT objeto, valor_total FROM obras ${where} ORDER BY objeto`;
+    return `SELECT objeto, status, categoria, bairro, engenheiro, empresa, valor_total, percentual_executado, aba_origem FROM obras ${where} ORDER BY objeto`;
   }
 
   return null;
@@ -474,6 +524,17 @@ function gerarSQLRapida(pergunta, historico = []) {
 // A IA recebe schema + metadados REAIS do banco + memoria recente, gera a SQL,
 // e o Node apenas valida/executa. E o mesmo padrao de agente SQL do artigo.
 async function gerarSQL(pergunta, historico = [], correcao = null) {
+  // Perguntas comuns passam primeiro pelo caminho deterministico. Alem de gastar
+  // menos tokens, ele aplica regras de negocio importantes (obra != projeto !=
+  // licitacao) e evita que a IA misture categorias so por palavras parecidas.
+  if (!correcao) {
+    const rapida = gerarSQLRapida(pergunta, historico);
+    if (rapida) {
+      console.log("AGENTE: usando SQL rapida/deterministica.");
+      return rapida;
+    }
+  }
+
   const contextoBanco = await contextoAtualDoBanco();
 
   const blocoCorrecao = correcao
@@ -505,10 +566,14 @@ REGRAS SQL:
 - Nunca INSERT, UPDATE, DELETE, DROP, ALTER, CREATE ou qualquer escrita.
 - Para texto, prefira unaccent(campo) ILIKE unaccent('%termo%').
 - Para categorias, escolha valores REAIS listados nos metadados; nao invente categoria.
-- IMPORTANTE: "obra(s) concluida(s)" NAO inclui itens de projeto. Para obras concluidas,
-  filtre status de concluida E exclua categoria/aba_origem de projeto.
-- "projeto(s) concluido(s)" deve filtrar status de concluida E restringir categoria/aba_origem a projeto.
-- "quantas obras" = COUNT(*).
+- "quantas obras" = COUNT(*), mas RESPEITE o tipo/origem pedido.
+- REGRA DE NEGOCIO: "obras em andamento" = obras da origem/categoria EM_ANDAMENTO. Nao some processos de licitacao cuja etapa se chama "Habilitacao em andamento".
+- PROJETOS: se a pergunta disser projeto/projetos, filtre aba_origem='EM_PROJETO'.
+- LICITACOES: se disser licitacao/licitacoes/processo licitatorio, filtre aba_origem='EM_LICITAÇÃO'.
+- PAVIMENTACAO: se disser pavimentacao/pavimentacoes, filtre aba_origem='PAVIMENTAÇÃO'.
+- "obras concluidas" generico NAO inclui projetos concluidos nem processos licitatorios.
+- Se a pergunta pedir DETALHES/INFORMACOES/SITUACAO de um item, selecione: objeto,status,categoria,bairro,engenheiro,empresa,valor_total,valor_executado,percentual_executado,aba_origem,dados_extras.
+- Se houver uma palavra ambigua de etapa (ex.: "andamento" em habilitacao), use aba_origem/categoria e STATUS ORIGINAL para entender o contexto antes de contar.
 - "quantos engenheiros" = COUNT(DISTINCT engenheiro).
 - "quantas empresas" = COUNT(DISTINCT empresa).
 - soma/investimento = SUM(valor_total), salvo se a pergunta pedir valor executado.
@@ -591,6 +656,17 @@ O sistema consultou o banco e retornou EXATAMENTE estes dados (JSON): ${dados}
 Interprete o resultado para responder exatamente a pergunta atual, levando em conta o contexto recente.
 Escreva uma resposta clara e cordial em portugues, formato WhatsApp.
 
+FORMATO DE RESPOSTA (IMPORTANTE):
+- Comece pela resposta DIRETA em 1 frase (numero, valor, status ou conclusao pedida).
+- Depois, quando o resultado trouxer informacoes que ajudam a pessoa a entender o que esta acontecendo, acrescente uma secao curta de detalhes com marcadores.
+- Em perguntas de contagem, se o JSON trouxer VARIOS contadores/categorias, explique cada um separadamente. NAO some categorias diferentes sem o usuario pedir.
+- Diferencie sempre: OBRA fisica, PROJETO, PAVIMENTACAO e PROCESSO DE LICITACAO. Use o substantivo correto na resposta.
+- Exemplo de distincao: "Habilitacao em andamento" e uma etapa de licitacao; isso NAO significa que a obra esteja em execucao.
+- Para uma obra/projeto especifico, se os campos existirem no JSON, informe os detalhes relevantes: situacao/status, responsavel, empresa, bairro/local, valor total, valor executado, percentual, recurso/convenio/contrato, datas, observacoes e etapa original. Nao esconda um detalhe util que esteja disponivel.
+- Nao despeje campos tecnicos. Traduza aba_origem/categoria em linguagem humana quando isso ajudar a explicar a origem do registro.
+- Omita campos vazios. Nao invente o que nao veio no JSON.
+- Se houver uma diferenca que possa confundir o cidadao, EXPLIQUE o criterio usado em uma frase curta.
+
 REGRAS ABSOLUTAS DE EXATIDAO (o mais importante - nunca quebre):
 - COPIE os numeros e valores EXATAMENTE como aparecem no JSON, digito por digito.
   Se o JSON diz "R$ 1.408.500,00", escreva "R$ 1.408.500,00" - NAO troque nenhum
@@ -644,9 +720,31 @@ function redigirLocal(pergunta, linhas) {
   // Agregacoes: COUNT/SUM etc.
   if (linhas.length === 1) {
     const l = linhas[0] || {};
+
+    // Resposta explicativa para a pergunta "quantas obras estao em andamento?".
+    // O primeiro numero e o total principal; os outros sao contextos relacionados
+    // que NAO devem ser somados automaticamente.
+    if ("obras_em_andamento" in l) {
+      const obras = Number(l.obras_em_andamento) || 0;
+      const pav = Number(l.pavimentacoes_em_execucao) || 0;
+      const lic = Number(l.licitacoes_com_etapa_em_andamento) || 0;
+      return `Existem ${obras} obras em andamento.\n\n` +
+        `Para nao misturar etapas diferentes, a planilha tambem registra:\n` +
+        `• ${pav} pavimentacao${pav === 1 ? "" : "oes"} em execucao;\n` +
+        `• ${lic} processo${lic === 1 ? "" : "s"} de licitacao com alguma etapa em andamento.\n\n` +
+        `Esses grupos ficam separados do total principal de obras em andamento.`;
+    }
+
     if ("quantidade_obras" in l) {
       const n = Number(l.quantidade_obras) || 0;
-      return `Total: ${n} obra${n === 1 ? "" : "s"}.`;
+      const ehProjeto = /\bprojetos?\b/.test(p);
+      const ehLicitacao = /\b(licitacoes?|licitacao|processos? licitatorios?)\b/.test(p);
+      const ehPav = /\bpaviment/.test(p);
+      const nome = ehProjeto ? (n === 1 ? "projeto" : "projetos")
+        : ehLicitacao ? (n === 1 ? "processo de licitação" : "processos de licitação")
+        : ehPav ? (n === 1 ? "pavimentação" : "pavimentações")
+        : (n === 1 ? "obra" : "obras");
+      return `Total: ${n} ${nome}.`;
     }
     if ("quantidade_engenheiros" in l) {
       const n = Number(l.quantidade_engenheiros) || 0;
