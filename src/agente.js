@@ -477,7 +477,13 @@ function gerarSQLRapida(pergunta, historico = []) {
 
   if (pedeSoma) {
     const campo = pedeExecutado ? "valor_executado" : "valor_total";
-    return `SELECT COALESCE(SUM(${campo}),0) AS valor_total FROM obras ${where}`;
+    // Para perguntas de soma/investimento, NAO devolvemos apenas o SUM.
+    // Trazemos os registros que compoem o total para o Node calcular a soma
+    // com precisao e explicar ao cidadao de onde veio cada parcela.
+    // Registros sem valor tambem voltam, para o bot avisar que existem mas
+    // nao entram na soma.
+    return `SELECT objeto, ${campo}, status, categoria, bairro, aba_origem ` +
+      `FROM obras ${where} ORDER BY ${campo} DESC NULLS LAST, objeto`;
   }
 
   if (pedeEng) {
@@ -605,6 +611,70 @@ ${blocoCorrecao}`;
   return ultimo;
 }
 
+// Resume perguntas financeiras de SOMA usando os registros individuais.
+// O Node faz a conta; a IA apenas explica o resultado ja calculado.
+function montarResumoSomaDetalhada(pergunta, linhas) {
+  if (!Array.isArray(linhas) || linhas.length === 0) return null;
+
+  const p = normalizarTexto(pergunta);
+  const pedeExecutado = /\b(valor executado|quanto executou|ja executado|executad[oa])\b/.test(p);
+  const pedeValor = pedeExecutado || /\b(valor|valores|custos?|custou|investid|investimento|quanto foi|orcamento)\b/.test(p);
+  const consultaTemContextoDeComposicao = linhas.some((l) => l &&
+    Object.prototype.hasOwnProperty.call(l, "aba_origem") &&
+    Object.prototype.hasOwnProperty.call(l, "categoria"));
+  const pedeSoma = pedeValor && (
+    /\b(total|soma|somando|ao todo|quanto foi investido|quanto custou tudo|investid|investimento)\b/.test(p) ||
+    (consultaTemContextoDeComposicao && /\bqual(?: e| o)? valor\b/.test(p))
+  );
+  if (!pedeSoma) return null;
+
+  const campo = pedeExecutado ? "valor_executado" : "valor_total";
+  if (!linhas.some((l) => l && Object.prototype.hasOwnProperty.call(l, "objeto"))) return null;
+  if (!linhas.some((l) => l && Object.prototype.hasOwnProperty.call(l, campo))) return null;
+
+  const tipoRegistro = (l) => {
+    const origem = `${l?.aba_origem || ""} ${l?.categoria || ""}`
+      .normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+    if (origem.includes("projeto")) return "projeto";
+    if (origem.includes("licit")) return "processo de licitação";
+    if (origem.includes("paviment")) return "pavimentação";
+    return "obra";
+  };
+
+  let total = 0;
+  const comValor = [];
+  const semValor = [];
+  for (const l of linhas) {
+    const bruto = l?.[campo];
+    const n = bruto === null || bruto === undefined || bruto === "" ? NaN : Number(bruto);
+    const item = {
+      objeto: l?.objeto || "Registro sem nome",
+      valor: Number.isFinite(n) ? n : null,
+      tipo: tipoRegistro(l),
+      status: l?.status || null,
+      bairro: l?.bairro || null,
+    };
+    if (Number.isFinite(n)) {
+      total += n;
+      comValor.push(item);
+    } else {
+      semValor.push(item);
+    }
+  }
+
+  const semValorPorTipo = {};
+  for (const i of semValor) semValorPorTipo[i.tipo] = (semValorPorTipo[i.tipo] || 0) + 1;
+
+  return {
+    campo,
+    total,
+    encontrados: linhas.length,
+    comValor,
+    semValor,
+    semValorPorTipo,
+  };
+}
+
 // --- CHAMADA 2: resultado -> resposta natural ---
 async function redigir(pergunta, linhas, ehInicio = false, historico = [], sqlUsada = "") {
   // Achata dados_extras E pre-formata valores em reais NO CODIGO. Assim os
@@ -636,15 +706,55 @@ async function redigir(pergunta, linhas, ehInicio = false, historico = [], sqlUs
     }
     return junto;
   });
+  // Para SOMAS, o Node calcula o total e entrega a composicao pronta para a IA.
+  // Assim a resposta pode explicar de onde veio o valor sem pedir que o modelo
+  // faca aritmetica ou invente itens.
+  const resumoSoma = montarResumoSomaDetalhada(pergunta, linhas);
+  const moedaResumo = (v) => "R$ " + Number(v).toLocaleString("pt-BR", {
+    minimumFractionDigits: 2, maximumFractionDigits: 2,
+  });
+
   // Protecao para listas GIGANTES (planilha grande, ex: 500+ obras).
   // Nao da pra despejar 500 obras num WhatsApp (o app corta, fica caro e lento).
-  // Se vier muita coisa, mostramos uma AMOSTRA e avisamos o total real.
   const totalLinhas = linhasLimpas.length;
   const LIMITE_LISTA = 12; // IA so redige extras; mantem payload pequeno
-  const listaGigante = totalLinhas > LIMITE_LISTA;
+  const listaGigante = !resumoSoma && totalLinhas > LIMITE_LISTA;
   const amostra = listaGigante ? linhasLimpas.slice(0, LIMITE_LISTA) : linhasLimpas;
-  const dados = JSON.stringify(amostra.slice(0, 15));
-  const muitasLinhas = amostra.length > 8;
+
+  let dadosObjeto;
+  if (resumoSoma) {
+    const itensComValor = resumoSoma.comValor.slice(0, LIMITE_LISTA).map((i) => ({
+      objeto: i.objeto,
+      valor: moedaResumo(i.valor),
+      tipo: i.tipo,
+      status: i.status,
+      bairro: i.bairro,
+    }));
+    const itensSemValor = resumoSoma.semValor.slice(0, LIMITE_LISTA).map((i) => ({
+      objeto: i.objeto,
+      tipo: i.tipo,
+      status: i.status,
+      bairro: i.bairro,
+    }));
+    dadosObjeto = {
+      tipo_resposta: "soma_detalhada",
+      campo_somado: resumoSoma.campo === "valor_executado" ? "valor executado" : "valor total cadastrado",
+      total: moedaResumo(resumoSoma.total),
+      registros_encontrados: resumoSoma.encontrados,
+      registros_com_valor: resumoSoma.comValor.length,
+      registros_sem_valor: resumoSoma.semValor.length,
+      sem_valor_por_tipo: resumoSoma.semValorPorTipo,
+      itens_com_valor: itensComValor,
+      itens_sem_valor: itensSemValor,
+      itens_com_valor_omitidos: Math.max(0, resumoSoma.comValor.length - itensComValor.length),
+      itens_sem_valor_omitidos: Math.max(0, resumoSoma.semValor.length - itensSemValor.length),
+    };
+  } else {
+    dadosObjeto = amostra.slice(0, 15);
+  }
+
+  const dados = JSON.stringify(dadosObjeto);
+  const muitasLinhas = !resumoSoma && amostra.length > 8;
   const prompt = `Voce e o Assistente de Obras da Prefeitura de Mamanguape no WhatsApp.
 O cidadao perguntou: "${pergunta}"
 Consulta usada neste turno: ${sqlUsada || "(consulta nao informada)"}
@@ -660,6 +770,8 @@ FORMATO DE RESPOSTA (IMPORTANTE):
 - Comece pela resposta DIRETA em 1 frase (numero, valor, status ou conclusao pedida).
 - Depois, quando o resultado trouxer informacoes que ajudam a pessoa a entender o que esta acontecendo, acrescente uma secao curta de detalhes com marcadores.
 - Em perguntas de contagem, se o JSON trouxer VARIOS contadores/categorias, explique cada um separadamente. NAO some categorias diferentes sem o usuario pedir.
+- Se o JSON tiver tipo_resposta="soma_detalhada": comece pelo TOTAL ja calculado; depois diga quantos registros possuem valor e liste CADA item_com_valor com nome + valor. Se houver registros_sem_valor, explique quantos ficaram fora da soma; quando forem poucos, cite tambem os nomes e os tipos (projeto, licitacao etc.). Se itens_com_valor_omitidos ou itens_sem_valor_omitidos for maior que zero, avise quantos registros adicionais nao foram listados. NUNCA some novamente os valores: copie o campo total.
+- Quando a pergunta usar "investido" mas o campo_somado for "valor total cadastrado", prefira dizer "valor total cadastrado" ou "valor total das obras/pavimentacoes" para nao confundir com dinheiro ja pago/executado. Se o usuario pedir quanto ja foi executado/pago, use somente o campo correspondente.
 - Diferencie sempre: OBRA fisica, PROJETO, PAVIMENTACAO e PROCESSO DE LICITACAO. Use o substantivo correto na resposta.
 - Exemplo de distincao: "Habilitacao em andamento" e uma etapa de licitacao; isso NAO significa que a obra esteja em execucao.
 - Para uma obra/projeto especifico, se os campos existirem no JSON, informe os detalhes relevantes: situacao/status, responsavel, empresa, bairro/local, valor total, valor executado, percentual, recurso/convenio/contrato, datas, observacoes e etapa original. Nao esconda um detalhe util que esteja disponivel.
@@ -716,6 +828,41 @@ function redigirLocal(pergunta, linhas) {
   };
   const texto = (v, vazio = "não informado") =>
     v === null || v === undefined || v === "" ? vazio : String(v);
+
+  // Soma detalhada: mostra o total E a composicao, inclusive registros sem valor.
+  const resumoSoma = montarResumoSomaDetalhada(pergunta, linhas);
+  if (resumoSoma) {
+    if (resumoSoma.comValor.length === 0) {
+      return `Encontrei ${resumoSoma.encontrados} registro${resumoSoma.encontrados === 1 ? "" : "s"}, ` +
+        `mas nenhum possui ${resumoSoma.campo === "valor_executado" ? "valor executado" : "valor total"} cadastrado.`;
+    }
+
+    const itens = resumoSoma.comValor.slice(0, 12).map((i) =>
+      `• ${texto(i.objeto, "Registro sem nome")} — ${moeda(i.valor)}`
+    );
+    let resposta = `${resumoSoma.campo === "valor_executado" ? "Total executado" : "Valor total cadastrado"}: ${moeda(resumoSoma.total)}.\n\n` +
+      `Esse total e composto por ${resumoSoma.comValor.length} registro${resumoSoma.comValor.length === 1 ? "" : "s"} com valor informado:\n` +
+      itens.join("\n");
+
+    if (resumoSoma.comValor.length > 12) {
+      resposta += `\n• ... e mais ${resumoSoma.comValor.length - 12} registro${resumoSoma.comValor.length - 12 === 1 ? "" : "s"}.`;
+    }
+
+    if (resumoSoma.semValor.length > 0) {
+      const tipos = Object.entries(resumoSoma.semValorPorTipo)
+        .map(([tipo, n]) => {
+          if (n === 1) return `1 ${tipo}`;
+          if (tipo === "projeto") return `${n} projetos`;
+          if (tipo === "pavimentação") return `${n} pavimentações`;
+          if (tipo === "processo de licitação") return `${n} processos de licitação`;
+          return `${n} obras`;
+        })
+        .join(", ");
+      resposta += `\n\nHa ainda ${resumoSoma.semValor.length} registro${resumoSoma.semValor.length === 1 ? "" : "s"} sem valor cadastrado` +
+        `${tipos ? ` (${tipos})` : ""}; por isso ${resumoSoma.semValor.length === 1 ? "ele nao entra" : "eles nao entram"} nessa soma.`;
+    }
+    return resposta;
+  }
 
   // Agregacoes: COUNT/SUM etc.
   if (linhas.length === 1) {
