@@ -962,7 +962,7 @@ FORMATO DE RESPOSTA (IMPORTANTE):
 - Comece pela resposta DIRETA em 1 frase (numero, valor, status ou conclusao pedida).
 - Depois, quando o resultado trouxer informacoes que ajudam a pessoa a entender o que esta acontecendo, acrescente uma secao curta de detalhes com marcadores.
 - Em perguntas de contagem, se o JSON trouxer VARIOS contadores/categorias, explique cada um separadamente. NAO some categorias diferentes sem o usuario pedir.
-- Se o JSON tiver tipo_resposta="contagem_por_tipo": trate obras + pavimentacoes como o conjunto fisico e projetos/licitacoes como etapas separadas. Comece pelo numero de obras_e_pavimentacoes quando o usuario perguntou genericamente por "obras"; depois explique a composicao (obras, pavimentacoes, projetos e licitacoes) e, se total_registros_relacionados for maior, diga que esse e o total de registros relacionados, NAO o total de obras fisicas. Nunca chame projeto ou processo de licitacao de obra executada.
+- Se o JSON tiver tipo_resposta="contagem_por_tipo" e o usuario perguntou genericamente por "obras", a RESPOSTA PRINCIPAL e SEMPRE obras_e_pavimentacoes. Chame esse numero simplesmente de "obras" para o cidadao e, nos detalhes, explique a composicao entre obras fisicas e pavimentacoes. Projetos e processos de licitacao sao categorias SEPARADAS e NAO entram nessa contagem. Se existirem, voce pode menciona-los em uma frase separada como informacao adicional, deixando claro que nao entram no total de obras. NAO mostre total_registros_relacionados nem some obras + projetos + licitacoes, a menos que o usuario peça explicitamente "total de registros", "incluindo projetos e licitacoes", "tudo junto" ou equivalente. Em perguntas como "quantas obras concluidas?", responda pelo numero obras_e_pavimentacoes, mesmo que existam projetos concluidos separados. Nunca chame projeto ou processo de licitacao de obra executada.
 - Se o JSON tiver tipo_resposta="soma_detalhada": comece pelo TOTAL ja calculado; depois diga quantos registros possuem valor e liste CADA item_com_valor com nome + valor. Se houver registros_sem_valor, explique quantos ficaram fora da soma; quando forem poucos, cite tambem os nomes e os tipos (projeto, licitacao etc.). Se itens_com_valor_omitidos ou itens_sem_valor_omitidos for maior que zero, avise quantos registros adicionais nao foram listados. NUNCA some novamente os valores: copie o campo total.
 - Se o JSON tiver tipo_resposta="engenheiros_detalhados": explique quem sao os RESPONSAVEIS TECNICOS do recorte. Comece dizendo quantos responsaveis foram encontrados e quantos registros eles acompanham. Depois agrupe por pessoa: nome + quantidade de registros e, abaixo, liste os itens associados a ela com o substantivo correto (obra, projeto, pavimentacao ou processo de licitacao), status e bairro quando disponiveis. Se valor_total ou percentual_executado estiverem presentes, inclua-os quando ajudarem a entender a situacao. Se itens_omitidos > 0, diga quantos itens adicionais daquele responsavel nao foram mostrados e ofereca detalhar o nome dele. Se houver nomes com "Arq.", prefira chamar o conjunto de "responsaveis tecnicos" em vez de dizer que todos sao engenheiros. NUNCA atribua um item a outro profissional.
 - Quando a pergunta usar "investido" mas o campo_somado for "valor total cadastrado", prefira dizer "valor total cadastrado" ou "valor total das obras/pavimentacoes" para nao confundir com dinheiro ja pago/executado. Se o usuario pedir quanto ja foi executado/pago, use somente o campo correspondente.
@@ -1025,21 +1025,42 @@ function redigirLocal(pergunta, linhas) {
   const texto = (v, vazio = "não informado") =>
     v === null || v === undefined || v === "" ? vazio : String(v);
 
-  // Contagem por tipo: resposta amigavel sem expor filtros/codigos internos.
+  // Contagem por tipo: para o cidadao, "obras" = obras fisicas + pavimentacoes.
+  // Projetos e licitacoes ficam separados e nao entram no numero principal,
+  // salvo se a pessoa pedir explicitamente para juntar todas as categorias.
   const resumoContagem = montarResumoContagemPorTipo(pergunta, linhas);
   if (resumoContagem) {
     const fisicas = resumoContagem.obras_e_pavimentacoes;
-    const partes = [
-      `${resumoContagem.obras} obra${resumoContagem.obras === 1 ? "" : "s"}`,
-      `${resumoContagem.pavimentacoes} pavimentação${resumoContagem.pavimentacoes === 1 ? "" : "ões"}`,
-    ];
-    let out = `Há ${fisicas} registro${fisicas === 1 ? "" : "s"} de obras/pavimentações físicas nesse recorte (${partes.join(" + ")}).`;
-    if (resumoContagem.projetos || resumoContagem.licitacoes) {
-      out += `\n\nAlém disso, há ${resumoContagem.projetos} projeto${resumoContagem.projetos === 1 ? "" : "s"} ` +
-        `e ${resumoContagem.licitacoes} processo${resumoContagem.licitacoes === 1 ? "" : "s"} de licitação relacionados, tratados separadamente.`;
+    const pNorm = normalizarTexto(pergunta);
+    const pediuTudoJunto = /\b(total de registros|todos os registros|tudo junto|incluindo projetos|incluindo licitacoes|incluindo projetos e licitacoes)\b/.test(pNorm);
+    const concluidas = /\b(concluid|pront|finaliz|terminad)\w*/.test(pNorm);
+
+    if (pediuTudoJunto) {
+      let out = `Ha ${resumoContagem.total_registros_relacionados} registro${resumoContagem.total_registros_relacionados === 1 ? "" : "s"} relacionados.`;
+      out += `\n\n• ${fisicas} obra${fisicas === 1 ? "" : "s"} (incluindo pavimentacoes)`;
+      if (resumoContagem.projetos) out += `\n• ${resumoContagem.projetos} projeto${resumoContagem.projetos === 1 ? "" : "s"}`;
+      if (resumoContagem.licitacoes) out += `\n• ${resumoContagem.licitacoes} processo${resumoContagem.licitacoes === 1 ? "" : "s"} de licitacao`;
+      return out;
     }
-    if (resumoContagem.total_registros_relacionados !== fisicas) {
-      out += `\n\nTotal de registros relacionados: ${resumoContagem.total_registros_relacionados}.`;
+
+    let out = concluidas
+      ? `Existem ${fisicas} obra${fisicas === 1 ? "" : "s"} concluida${fisicas === 1 ? "" : "s"}.`
+      : `Existem ${fisicas} obra${fisicas === 1 ? "" : "s"} nesse recorte.`;
+
+    const detalhes = [];
+    if (resumoContagem.obras > 0) detalhes.push(`${resumoContagem.obras} obra${resumoContagem.obras === 1 ? "" : "s"} fisica${resumoContagem.obras === 1 ? "" : "s"}`);
+    if (resumoContagem.pavimentacoes > 0) detalhes.push(`${resumoContagem.pavimentacoes} pavimentacao${resumoContagem.pavimentacoes === 1 ? "" : "oes"}`);
+    if (concluidas && resumoContagem.obras === 0 && resumoContagem.pavimentacoes > 0) {
+      out += `\n\nAs ${resumoContagem.pavimentacoes} sao pavimentacoes concluidas.`;
+    } else if (detalhes.length > 1) {
+      out += `\n\nDetalhes: ${detalhes.join(" + ")}.`;
+    }
+
+    const extras = [];
+    if (resumoContagem.projetos) extras.push(`${resumoContagem.projetos} projeto${resumoContagem.projetos === 1 ? "" : "s"}`);
+    if (resumoContagem.licitacoes) extras.push(`${resumoContagem.licitacoes} processo${resumoContagem.licitacoes === 1 ? "" : "s"} de licitacao`);
+    if (extras.length) {
+      out += `\n\nHa tambem ${extras.join(" e ")} relacionado${extras.length > 1 || resumoContagem.projetos > 1 || resumoContagem.licitacoes > 1 ? "s" : ""}, tratado${extras.length > 1 || resumoContagem.projetos > 1 || resumoContagem.licitacoes > 1 ? "s" : ""} separadamente e fora dessa contagem de obras.`;
     }
     return out;
   }
