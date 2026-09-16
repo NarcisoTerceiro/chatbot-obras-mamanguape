@@ -290,7 +290,8 @@ function whereDaSQL(sql = "") {
 
 function filtroStatusDaPergunta(p) {
   if (/\b(concluid[ao]s?|pront[ao]s?|finalizad[ao]s?|terminad[ao]s?)\b/.test(p)) return "unaccent(status) ILIKE unaccent('%conclu%')";
-  if (/\b(em andamento|andamento|sendo feit[ao]s?|tocando)\b/.test(p)) return "unaccent(status) ILIKE unaccent('%andamento%')";
+  // A ingestao padroniza "Em execucao" como "Em andamento" para obras/pavimentacoes.
+  if (/\b(em andamento|andamento|em execucao|execucao|executando|sendo feit[ao]s?|tocando)\b/.test(p)) return "unaccent(status) ILIKE unaccent('%andamento%')";
   if (/\b(em licitacao|licitacao|licitando)\b/.test(p)) return "unaccent(status) ILIKE unaccent('%licita%')";
   if (/\b(em projeto)\b/.test(p)) return "unaccent(status) ILIKE unaccent('%projeto%')";
   if (/\b(paralisad[ao]s?|paradas?)\b/.test(p)) return "unaccent(status) ILIKE unaccent('%paralis%')";
@@ -316,6 +317,45 @@ function ehPerguntaGenericaObrasEmAndamento(p) {
     !/\bprojetos?\b/.test(p) &&
     !/\b(licitacoes?|licitacao)\b/.test(p) &&
     !/\bpaviment/.test(p);
+}
+
+// Identifica quando a pessoa esta falando de UM item pelo nome (rua, creche,
+// escola, mercado etc.). Nesses casos, nao devemos reduzir a pergunta ao bairro
+// final do nome (ex.: "Rua do Cruzeiro - Centro" nao significa "todas do Centro").
+function pareceItemEspecifico(p) {
+  const temEntidade = /\b(rua|avenida|creche|escola|mercado|ubs|posto|ponte|praca|quadra|hospital|campo|drenagem|muro|iluminacao|terminal|calcadao|estadio|biblioteca|galpao|passarela|ciclovia|orla|estacao|cemiterio)\b/.test(p);
+  const pedeCampo = /\b(valor|quanto|responsavel|engenheir|arquit|empresa|contrato|convenio|recurso|status|situacao|percentual|executad|prazo|data|detalh|informac)\b/.test(p);
+  return temEntidade && pedeCampo;
+}
+
+// Extrai um nome de profissional quando a pergunta usa algo como
+// "obras do engenheiro Ricardo Sousa". O filtro e dinamico: nenhum nome fica
+// fixo no codigo.
+function condicaoEngenheiroDaPergunta(p) {
+  const m = p.match(/\b(?:engenheir[oa]|eng|arquiteto|arquiteta|arq|responsavel(?: tecnico)?)\s+([a-z][a-z .'-]{2,60}?)(?=$|\b(?:no|na|em|com|que|das?|dos?|pel[oa]|responsavel|obras?|projetos?|pavimentacoes?|licitacoes?|status|valor)\b)/i);
+  if (!m) return "";
+  const nome = (m[1] || "")
+    .replace(/\b(?:das?|dos?|de)\s*$/i, "")
+    .replace(/[^a-z .'-]/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!nome || nome.length < 3) return "";
+  const seguro = nome.replace(/'/g, "''");
+  return `unaccent(COALESCE(engenheiro,'')) ILIKE unaccent('%${seguro}%')`;
+}
+
+// Contagem generica por TIPO. Serve para perguntas como "quantas obras no
+// Centro?" ou "quantas obras concluidas?" sem chamar projeto/licitacao de obra.
+function sqlContagemPorTipo(filtroLocal = "", filtroStatus = "") {
+  const globais = [filtroLocal, filtroStatus].filter(Boolean);
+  const where = globais.length ? `WHERE ${globais.join(" AND ")}` : "";
+  return `SELECT ` +
+    `SUM(CASE WHEN aba_origem = 'EM_ANDAMENTO' THEN 1 ELSE 0 END)::int AS obras, ` +
+    `SUM(CASE WHEN aba_origem = 'PAVIMENTAÇÃO' THEN 1 ELSE 0 END)::int AS pavimentacoes, ` +
+    `SUM(CASE WHEN aba_origem = 'EM_PROJETO' THEN 1 ELSE 0 END)::int AS projetos, ` +
+    `SUM(CASE WHEN aba_origem = 'EM_LICITAÇÃO' THEN 1 ELSE 0 END)::int AS licitacoes, ` +
+    `SUM(CASE WHEN aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO') THEN 1 ELSE 0 END)::int AS obras_e_pavimentacoes, ` +
+    `COUNT(*)::int AS total_registros_relacionados FROM obras ${where}`;
 }
 
 function condicaoLocalDaPergunta(p) {
@@ -381,6 +421,12 @@ function gerarSQLRapida(pergunta, historico = []) {
     perguntaCurtaLista
   );
 
+  // Se a pessoa nomeou um item concreto e pediu um campo dele, deixamos a IA
+  // montar a busca exata pelo objeto. Isso evita o erro de interpretar apenas o
+  // bairro no fim do nome (ex.: "valor da Creche ... no Centro").
+  const itemEspecificoSemContexto = pareceItemEspecifico(p) && !referenciaAnterior;
+  if (itemEspecificoSemContexto) return null;
+
   // Caso importante: "quantas obras estao em andamento?" precisa responder
   // o TOTAL PRINCIPAL da aba EM_ANDAMENTO e, ao mesmo tempo, explicar os grupos
   // parecidos sem mistura-los. A consulta devolve os tres numeros em uma linha,
@@ -398,6 +444,7 @@ function gerarSQLRapida(pergunta, historico = []) {
 
   const filtroStatus = filtroStatusDaPergunta(p);
   const filtroLocal = condicaoLocalDaPergunta(p);
+  const filtroEngenheiro = condicaoEngenheiroDaPergunta(p);
   let filtroEscopo = filtroEscopoDaPergunta(p);
 
   // Mesmo quando nao e uma contagem (ex.: "quais obras estao em andamento?"),
@@ -407,7 +454,7 @@ function gerarSQLRapida(pergunta, historico = []) {
     filtroEscopo = "aba_origem = 'EM_ANDAMENTO'";
   }
 
-  const temFiltroNovo = !!(filtroStatus || filtroLocal || filtroEscopo);
+  const temFiltroNovo = !!(filtroStatus || filtroLocal || filtroEscopo || filtroEngenheiro);
 
   // Se a pessoa diz explicitamente "dessas" + um novo filtro, refinamos a
   // consulta anterior. Se apenas faz uma pergunta curta, herdamos o filtro.
@@ -416,6 +463,7 @@ function gerarSQLRapida(pergunta, historico = []) {
   if (filtroEscopo) condicoes.push(filtroEscopo);
   if (filtroStatus) condicoes.push(filtroStatus);
   if (filtroLocal) condicoes.push(filtroLocal);
+  if (filtroEngenheiro) condicoes.push(filtroEngenheiro);
 
   // Quando a pessoa fala genericamente em "obras concluidas", projetos e
   // processos licitatorios nao entram no total de obras fisicas.
@@ -428,7 +476,7 @@ function gerarSQLRapida(pergunta, historico = []) {
   const usarAnterior = !!condAnterior && (referenciaAnterior || curtaDeAcompanhamento) && !temFiltroNovo;
   const where = condicoes.length ? `WHERE ${condicoes.join(" AND ")}` : "";
 
-  const pedeEng = /\b(engenheiros?|engenheiras?|responsavel tecnico|responsaveis tecnicos)\b/.test(p);
+  const pedeEng = /\b(engenheiros?|engenheiras?|arquitetos?|arquitetas?|responsavel|responsaveis|responsavel tecnico|responsaveis tecnicos)\b/.test(p);
   const pedeEmpresa = /\b(empresas?|executoras?|construtoras?)\b/.test(p);
   const pedeBairro = /\bbairros?\b/.test(p);
   const pedeStatus = /\b(status|situacao)\b/.test(p);
@@ -441,6 +489,31 @@ function gerarSQLRapida(pergunta, historico = []) {
     (!!filtroLocal && /\bqual(?: e| o)? valor\b/.test(p))
   );
   const pedeDetalhes = /\b(detalh\w*|informacoes?|completo|completa|tudo sobre|me fale sobre|explique|como esta|como ta|situacao completa)\b/.test(p);
+  const pedeExistencia = /\b(existe|existem|ha|tem|algum|alguma|alguns|algumas)\b/.test(p);
+  const pedeMaiorValor = /\b(maior valor|maior custo|mais cara|mais caro|maior investimento)\b/.test(p);
+  const pedeMenorValor = /\b(menor valor|menor custo|mais barata|mais barato|menor investimento)\b/.test(p);
+  const pedeMaisAvancada = /\b(mais avancad[ao]|maior percentual|maior execucao|mais executad[ao])\b/.test(p);
+  const pedeMenosAvancada = /\b(menos avancad[ao]|menor percentual|menor execucao|menos executad[ao])\b/.test(p);
+
+  // Perguntas genericas de quantidade de "obras" recebem uma separacao por
+  // tipo. Assim "10 registros no Centro" nao vira incorretamente "10 obras"
+  // quando parte deles sao projetos ou processos de licitacao.
+  if (pedeContagem && /\bobras?\b/.test(p) && !filtroEscopo && !ehPerguntaGenericaObrasEmAndamento(p)) {
+    return sqlContagemPorTipo(filtroLocal, filtroStatus);
+  }
+
+  // Rankings/superlativos: devolve o item vencedor com contexto suficiente para
+  // explicar POR QUE ele e o maior/menor/mais avancado.
+  if (pedeMaiorValor || pedeMenorValor || pedeMaisAvancada || pedeMenosAvancada) {
+    const campoOrdem = (pedeMaisAvancada || pedeMenosAvancada) ? "percentual_executado" : "valor_total";
+    const direcao = (pedeMenorValor || pedeMenosAvancada) ? "ASC" : "DESC";
+    const whereRanking = where || (/\bobras?\b/.test(p) && !filtroEscopo
+      ? "WHERE aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO')" : "");
+    return `SELECT objeto, status, categoria, bairro, engenheiro, empresa, valor_total, ` +
+      `valor_executado, percentual_executado, aba_origem, dados_extras FROM obras ` +
+      `${whereRanking} ${whereRanking ? "AND" : "WHERE"} ${campoOrdem} IS NOT NULL ` +
+      `ORDER BY ${campoOrdem} ${direcao} NULLS LAST LIMIT 1`;
+  }
 
   // Se o cidadao pediu detalhes de um recorte ja identificado, traz o conjunto
   // completo de campos uteis + dados_extras. A IA decide o que e relevante e
@@ -461,15 +534,44 @@ function gerarSQLRapida(pergunta, historico = []) {
     // campo certo na redacao. Assim a CONSULTA nao depende da IA (que pode
     // estar lenta/instavel); so a redacao usa IA.
     if (where || usarAnterior) {
-      return `SELECT objeto, dados_extras FROM obras ${where} ORDER BY objeto`;
+      return `SELECT objeto, status, categoria, bairro, engenheiro, empresa, valor_total, ` +
+        `valor_executado, percentual_executado, aba_origem, dados_extras FROM obras ${where} ORDER BY objeto`;
     }
     // Sem filtro nenhum (ex.: "qual o recurso da praca da bandeira") a IA
     // precisa entender de qual obra se trata - entao deixamos com ela.
     return null;
   }
 
+  // Perguntas sobre engenheiros/responsaveis tecnicos precisam de contexto, nao
+  // apenas de um COUNT. Trazemos os registros relacionados para o Node agrupar
+  // por responsavel e explicar quais obras/projetos cada pessoa acompanha.
+  // Isso vale tambem para "quantos engenheiros?" quando ha um recorte claro.
+  if (pedeEng && (where || usarAnterior)) {
+    return `SELECT objeto, engenheiro, status, categoria, bairro, valor_total, ` +
+      `percentual_executado, aba_origem FROM obras ${where} ` +
+      `${where ? "AND" : "WHERE"} engenheiro IS NOT NULL AND BTRIM(engenheiro) <> '' ` +
+      `ORDER BY engenheiro, objeto`;
+  }
+
+  // Pergunta geral, sem obra/local especifico: permite explicar quem sao os
+  // responsaveis e quantos registros cada um acompanha. Se a frase parecer
+  // apontar para uma obra especifica ("engenheiro da creche..."), deixamos a
+  // IA gerar a SQL para localizar o objeto corretamente.
+  const pedeEngGeral = pedeEng && !where && !usarAnterior &&
+    /\b(quais|liste|lista|todos|todas|quantos|quantas|engenheiros|responsaveis tecnicos)\b/.test(p) &&
+    !/\b(da|do|de)\s+(obra|projeto|rua|creche|escola|praca|mercado|ubs|posto|pavimentacao|ponte|quadra)\b/.test(p);
+  if (pedeEngGeral) {
+    return `SELECT objeto, engenheiro, status, categoria, bairro, valor_total, ` +
+      `percentual_executado, aba_origem FROM obras ` +
+      `WHERE engenheiro IS NOT NULL AND BTRIM(engenheiro) <> '' ORDER BY engenheiro, objeto`;
+  }
+
+  if (pedeExistencia && (where || usarAnterior)) {
+    return `SELECT objeto, status, categoria, bairro, engenheiro, empresa, valor_total, ` +
+      `valor_executado, percentual_executado, aba_origem, dados_extras FROM obras ${where} ORDER BY objeto`;
+  }
+
   if (pedeContagem) {
-    if (pedeEng) return `SELECT COUNT(DISTINCT engenheiro)::int AS quantidade_engenheiros FROM obras ${where} ${where ? "AND" : "WHERE"} engenheiro IS NOT NULL AND BTRIM(engenheiro) <> ''`;
     if (pedeEmpresa) return `SELECT COUNT(DISTINCT empresa)::int AS quantidade_empresas FROM obras ${where} ${where ? "AND" : "WHERE"} empresa IS NOT NULL AND BTRIM(empresa) <> ''`;
     if (pedeBairro) return `SELECT COUNT(DISTINCT bairro)::int AS quantidade_bairros FROM obras ${where} ${where ? "AND" : "WHERE"} bairro IS NOT NULL AND BTRIM(bairro) <> ''`;
     return `SELECT COUNT(*)::int AS quantidade_obras FROM obras ${where}`;
@@ -487,22 +589,23 @@ function gerarSQLRapida(pergunta, historico = []) {
   }
 
   if (pedeEng) {
-    if (where || usarAnterior) return `SELECT objeto, engenheiro FROM obras ${where} ORDER BY objeto`;
-    return "SELECT DISTINCT engenheiro FROM obras WHERE engenheiro IS NOT NULL AND BTRIM(engenheiro) <> '' ORDER BY engenheiro";
+    // Casos especificos sem filtro reconhecido acima (ex.: "engenheiro da Creche X")
+    // ficam para a IA localizar o objeto pelo nome, em vez de listar todos.
+    return null;
   }
   if (pedeEmpresa) {
-    if (where || usarAnterior) return `SELECT objeto, empresa FROM obras ${where} ORDER BY objeto`;
+    if (where || usarAnterior) return `SELECT objeto, empresa, status, categoria, bairro, engenheiro, valor_total, percentual_executado, aba_origem FROM obras ${where} ORDER BY objeto`;
     return "SELECT DISTINCT empresa FROM obras WHERE empresa IS NOT NULL AND BTRIM(empresa) <> '' ORDER BY empresa";
   }
   if (pedeBairro && !/\bobra/.test(p)) {
     return `SELECT DISTINCT bairro FROM obras ${where} ${where ? "AND" : "WHERE"} bairro IS NOT NULL AND BTRIM(bairro) <> '' ORDER BY bairro`;
   }
-  if (pedePercentual) return `SELECT objeto, percentual_executado FROM obras ${where} ORDER BY objeto`;
+  if (pedePercentual) return `SELECT objeto, percentual_executado, valor_executado, valor_total, status, categoria, bairro, engenheiro, empresa, aba_origem FROM obras ${where} ORDER BY objeto`;
   if (pedeValor) {
     const campo = pedeExecutado ? "valor_executado" : "valor_total";
-    return `SELECT objeto, ${campo} FROM obras ${where} ORDER BY objeto`;
+    return `SELECT objeto, ${campo}, valor_total, valor_executado, percentual_executado, status, categoria, bairro, engenheiro, empresa, aba_origem FROM obras ${where} ORDER BY objeto`;
   }
-  if (pedeStatus && where) return `SELECT objeto, status, valor_total FROM obras ${where} ORDER BY objeto`;
+  if (pedeStatus && where) return `SELECT objeto, status, categoria, bairro, engenheiro, empresa, valor_total, valor_executado, percentual_executado, aba_origem FROM obras ${where} ORDER BY objeto`;
 
   // "Quais sao?" logo apos "quantas concluidas?" deve listar as mesmas obras,
   // sem depender da IA. Traz o valor junto para nao mostrar "nao informado"
@@ -578,7 +681,10 @@ REGRAS SQL:
 - LICITACOES: se disser licitacao/licitacoes/processo licitatorio, filtre aba_origem='EM_LICITAÇÃO'.
 - PAVIMENTACAO: se disser pavimentacao/pavimentacoes, filtre aba_origem='PAVIMENTAÇÃO'.
 - "obras concluidas" generico NAO inclui projetos concluidos nem processos licitatorios.
-- Se a pergunta pedir DETALHES/INFORMACOES/SITUACAO de um item, selecione: objeto,status,categoria,bairro,engenheiro,empresa,valor_total,valor_executado,percentual_executado,aba_origem,dados_extras.
+- Se a pergunta for sobre UM item identificavel pelo nome/rua/contrato, mesmo que o cidadao pergunte so valor, responsavel, empresa ou status, selecione contexto completo: objeto,status,categoria,bairro,engenheiro,empresa,valor_total,valor_executado,percentual_executado,aba_origem,dados_extras. A resposta destacara primeiro o campo pedido e depois os detalhes uteis.
+- Se a pergunta pedir DETALHES/INFORMACOES/SITUACAO, use esse mesmo conjunto completo de campos.
+- Para LISTAGENS ("quais", "liste") selecione pelo menos objeto,status,categoria,bairro,engenheiro,empresa,valor_total,percentual_executado,aba_origem; acrescente dados_extras quando a pergunta envolver recurso, contrato, convenio, prazo, data ou observacao.
+- Para MAIOR/MENOR/MAIS AVANCADA, use ORDER BY no campo correto + LIMIT 1 e traga o contexto completo do item vencedor.
 - Se houver uma palavra ambigua de etapa (ex.: "andamento" em habilitacao), use aba_origem/categoria e STATUS ORIGINAL para entender o contexto antes de contar.
 - "quantos engenheiros" = COUNT(DISTINCT engenheiro).
 - "quantas empresas" = COUNT(DISTINCT empresa).
@@ -609,6 +715,23 @@ ${blocoCorrecao}`;
     console.warn(`AGENTE: SQL incompleto na tentativa ${tentativa}/2.`);
   }
   return ultimo;
+}
+
+// Resume uma contagem generica separando obra/pavimentacao de projeto/licitacao.
+// Evita frases enganosas como "10 obras" quando o total inclui outros tipos.
+function montarResumoContagemPorTipo(pergunta, linhas) {
+  if (!Array.isArray(linhas) || linhas.length !== 1) return null;
+  const l = linhas[0] || {};
+  const chaves = ["obras", "pavimentacoes", "projetos", "licitacoes", "obras_e_pavimentacoes", "total_registros_relacionados"];
+  if (!chaves.every((k) => Object.prototype.hasOwnProperty.call(l, k))) return null;
+  return {
+    obras: Number(l.obras) || 0,
+    pavimentacoes: Number(l.pavimentacoes) || 0,
+    projetos: Number(l.projetos) || 0,
+    licitacoes: Number(l.licitacoes) || 0,
+    obras_e_pavimentacoes: Number(l.obras_e_pavimentacoes) || 0,
+    total_registros_relacionados: Number(l.total_registros_relacionados) || 0,
+  };
 }
 
 // Resume perguntas financeiras de SOMA usando os registros individuais.
@@ -675,6 +798,60 @@ function montarResumoSomaDetalhada(pergunta, linhas) {
   };
 }
 
+
+// Agrupa respostas sobre engenheiros/responsaveis tecnicos. O agrupamento e feito
+// no Node para a IA nao precisar adivinhar contagens nem associar uma obra ao
+// profissional errado.
+function montarResumoEngenheiros(pergunta, linhas) {
+  const p = normalizarTexto(pergunta);
+  if (!/\b(engenheiros?|engenheiras?|responsavel tecnico|responsaveis tecnicos)\b/.test(p)) return null;
+  if (!Array.isArray(linhas) || linhas.length === 0) return null;
+  if (!linhas.some((l) => l && Object.prototype.hasOwnProperty.call(l, "engenheiro"))) return null;
+
+  const tipoRegistro = (l) => {
+    const origem = `${l?.aba_origem || ""} ${l?.categoria || ""}`
+      .normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+    if (origem.includes("projeto")) return "projeto";
+    if (origem.includes("licit")) return "processo de licitação";
+    if (origem.includes("paviment")) return "pavimentação";
+    return "obra";
+  };
+
+  const grupos = new Map();
+  let semResponsavel = 0;
+  for (const l of linhas) {
+    const nome = (l?.engenheiro || "").toString().trim();
+    if (!nome) {
+      semResponsavel += 1;
+      continue;
+    }
+    if (!grupos.has(nome)) grupos.set(nome, []);
+    grupos.get(nome).push({
+      objeto: l?.objeto || "Registro sem nome",
+      tipo: tipoRegistro(l),
+      status: l?.status || null,
+      bairro: l?.bairro || null,
+      valor_total: l?.valor_total ?? null,
+      percentual_executado: l?.percentual_executado ?? null,
+    });
+  }
+
+  const limitePorResponsavel = linhas.length <= 20 ? 20 : 4;
+  const responsaveis = [...grupos.entries()].map(([nome, itens]) => ({
+    nome,
+    quantidade_registros: itens.length,
+    itens: itens.slice(0, limitePorResponsavel),
+    itens_omitidos: Math.max(0, itens.length - limitePorResponsavel),
+  }));
+
+  return {
+    total_responsaveis: responsaveis.length,
+    total_registros: [...grupos.values()].reduce((acc, itens) => acc + itens.length, 0),
+    sem_responsavel: semResponsavel,
+    responsaveis,
+  };
+}
+
 // --- CHAMADA 2: resultado -> resposta natural ---
 async function redigir(pergunta, linhas, ehInicio = false, historico = [], sqlUsada = "") {
   // Achata dados_extras E pre-formata valores em reais NO CODIGO. Assim os
@@ -709,7 +886,9 @@ async function redigir(pergunta, linhas, ehInicio = false, historico = [], sqlUs
   // Para SOMAS, o Node calcula o total e entrega a composicao pronta para a IA.
   // Assim a resposta pode explicar de onde veio o valor sem pedir que o modelo
   // faca aritmetica ou invente itens.
+  const resumoContagem = montarResumoContagemPorTipo(pergunta, linhas);
   const resumoSoma = montarResumoSomaDetalhada(pergunta, linhas);
+  const resumoEngenheiros = montarResumoEngenheiros(pergunta, linhasLimpas);
   const moedaResumo = (v) => "R$ " + Number(v).toLocaleString("pt-BR", {
     minimumFractionDigits: 2, maximumFractionDigits: 2,
   });
@@ -718,11 +897,16 @@ async function redigir(pergunta, linhas, ehInicio = false, historico = [], sqlUs
   // Nao da pra despejar 500 obras num WhatsApp (o app corta, fica caro e lento).
   const totalLinhas = linhasLimpas.length;
   const LIMITE_LISTA = 12; // IA so redige extras; mantem payload pequeno
-  const listaGigante = !resumoSoma && totalLinhas > LIMITE_LISTA;
+  const listaGigante = !resumoContagem && !resumoSoma && !resumoEngenheiros && totalLinhas > LIMITE_LISTA;
   const amostra = listaGigante ? linhasLimpas.slice(0, LIMITE_LISTA) : linhasLimpas;
 
   let dadosObjeto;
-  if (resumoSoma) {
+  if (resumoContagem) {
+    dadosObjeto = {
+      tipo_resposta: "contagem_por_tipo",
+      ...resumoContagem,
+    };
+  } else if (resumoSoma) {
     const itensComValor = resumoSoma.comValor.slice(0, LIMITE_LISTA).map((i) => ({
       objeto: i.objeto,
       valor: moedaResumo(i.valor),
@@ -749,12 +933,20 @@ async function redigir(pergunta, linhas, ehInicio = false, historico = [], sqlUs
       itens_com_valor_omitidos: Math.max(0, resumoSoma.comValor.length - itensComValor.length),
       itens_sem_valor_omitidos: Math.max(0, resumoSoma.semValor.length - itensSemValor.length),
     };
+  } else if (resumoEngenheiros) {
+    dadosObjeto = {
+      tipo_resposta: "engenheiros_detalhados",
+      total_responsaveis: resumoEngenheiros.total_responsaveis,
+      total_registros: resumoEngenheiros.total_registros,
+      sem_responsavel: resumoEngenheiros.sem_responsavel,
+      responsaveis: resumoEngenheiros.responsaveis,
+    };
   } else {
     dadosObjeto = amostra.slice(0, 15);
   }
 
   const dados = JSON.stringify(dadosObjeto);
-  const muitasLinhas = !resumoSoma && amostra.length > 8;
+  const muitasLinhas = !resumoContagem && !resumoSoma && !resumoEngenheiros && amostra.length > 8;
   const prompt = `Voce e o Assistente de Obras da Prefeitura de Mamanguape no WhatsApp.
 O cidadao perguntou: "${pergunta}"
 Consulta usada neste turno: ${sqlUsada || "(consulta nao informada)"}
@@ -770,10 +962,13 @@ FORMATO DE RESPOSTA (IMPORTANTE):
 - Comece pela resposta DIRETA em 1 frase (numero, valor, status ou conclusao pedida).
 - Depois, quando o resultado trouxer informacoes que ajudam a pessoa a entender o que esta acontecendo, acrescente uma secao curta de detalhes com marcadores.
 - Em perguntas de contagem, se o JSON trouxer VARIOS contadores/categorias, explique cada um separadamente. NAO some categorias diferentes sem o usuario pedir.
+- Se o JSON tiver tipo_resposta="contagem_por_tipo": trate obras + pavimentacoes como o conjunto fisico e projetos/licitacoes como etapas separadas. Comece pelo numero de obras_e_pavimentacoes quando o usuario perguntou genericamente por "obras"; depois explique a composicao (obras, pavimentacoes, projetos e licitacoes) e, se total_registros_relacionados for maior, diga que esse e o total de registros relacionados, NAO o total de obras fisicas. Nunca chame projeto ou processo de licitacao de obra executada.
 - Se o JSON tiver tipo_resposta="soma_detalhada": comece pelo TOTAL ja calculado; depois diga quantos registros possuem valor e liste CADA item_com_valor com nome + valor. Se houver registros_sem_valor, explique quantos ficaram fora da soma; quando forem poucos, cite tambem os nomes e os tipos (projeto, licitacao etc.). Se itens_com_valor_omitidos ou itens_sem_valor_omitidos for maior que zero, avise quantos registros adicionais nao foram listados. NUNCA some novamente os valores: copie o campo total.
+- Se o JSON tiver tipo_resposta="engenheiros_detalhados": explique quem sao os RESPONSAVEIS TECNICOS do recorte. Comece dizendo quantos responsaveis foram encontrados e quantos registros eles acompanham. Depois agrupe por pessoa: nome + quantidade de registros e, abaixo, liste os itens associados a ela com o substantivo correto (obra, projeto, pavimentacao ou processo de licitacao), status e bairro quando disponiveis. Se valor_total ou percentual_executado estiverem presentes, inclua-os quando ajudarem a entender a situacao. Se itens_omitidos > 0, diga quantos itens adicionais daquele responsavel nao foram mostrados e ofereca detalhar o nome dele. Se houver nomes com "Arq.", prefira chamar o conjunto de "responsaveis tecnicos" em vez de dizer que todos sao engenheiros. NUNCA atribua um item a outro profissional.
 - Quando a pergunta usar "investido" mas o campo_somado for "valor total cadastrado", prefira dizer "valor total cadastrado" ou "valor total das obras/pavimentacoes" para nao confundir com dinheiro ja pago/executado. Se o usuario pedir quanto ja foi executado/pago, use somente o campo correspondente.
 - Diferencie sempre: OBRA fisica, PROJETO, PAVIMENTACAO e PROCESSO DE LICITACAO. Use o substantivo correto na resposta.
 - Exemplo de distincao: "Habilitacao em andamento" e uma etapa de licitacao; isso NAO significa que a obra esteja em execucao.
+- REGRA GERAL PARA QUALQUER PERGUNTA: responda primeiro exatamente o que foi pedido e, em seguida, use os outros campos retornados para dar contexto util. Ex.: se pediram valor, acrescente status/percentual/responsavel quando existirem; se pediram responsavel, mostre tambem quais itens ele acompanha; se pediram uma lista, indique tipo, status e valor quando disponiveis. Nao transforme toda resposta em relatorio enorme: priorize os detalhes que ajudam a entender a situacao.
 - Para uma obra/projeto especifico, se os campos existirem no JSON, informe os detalhes relevantes: situacao/status, responsavel, empresa, bairro/local, valor total, valor executado, percentual, recurso/convenio/contrato, datas, observacoes e etapa original. Nao esconda um detalhe util que esteja disponivel.
 - Nao despeje campos tecnicos. Traduza aba_origem/categoria em linguagem humana quando isso ajudar a explicar a origem do registro.
 - Omita campos vazios. Nao invente o que nao veio no JSON.
@@ -802,12 +997,13 @@ REGRAS ABSOLUTAS DE EXATIDAO (o mais importante - nunca quebre):
 
 OUTRAS REGRAS:
 - Os valores JA VEM formatados como "R$ ..." no JSON - use-os como estao.
-- Nao mencione "banco", "SQL", "dados" nem que voce e uma IA.
-- No maximo um emoji sutil. Seja objetivo e direto, sem floreio.
+- NUNCA exponha funcionamento interno. Nao mencione banco, SQL, consulta, query, filtro, tabela, coluna, ILIKE, unaccent, JSON, aba_origem, nem codigos internos como EM_PROJETO/EM_LICITAÇÃO. Nao diga frases como "o status contem conclu" ou "a consulta busca bairro/objeto". Explique apenas em linguagem de cidadao, por exemplo: "projetos e licitacoes sao contabilizados separadamente".
+- Nao diga que voce e uma IA.
+- No maximo um emoji sutil. Seja objetivo, claro e informativo, sem floreio.
 ${listaGigante ? `- ATENCAO: existem ${totalLinhas} obras no total, mas voce recebeu so as primeiras ${LIMITE_LISTA} como amostra. Liste essas ${LIMITE_LISTA} e diga claramente: "Estas sao as primeiras ${LIMITE_LISTA} de ${totalLinhas} obras. Para ver melhor, me diga um bairro ou status especifico." NAO diga que sao so ${LIMITE_LISTA} no total - o total real e ${totalLinhas}.` : ""}
 ${muitasLinhas ? "- A lista e LONGA: UMA linha por obra: '• Nome — R$ valor'. Se o valor for 'valor nao informado', escreva assim mesmo (nao invente). SEM introducao. Termine com 'Total: N obras' onde N e a quantidade EXATA de itens listados. Se algumas obras nao tem valor, acrescente uma linha curta explicando: 'Obs.: algumas obras ainda nao tem valor cadastrado.'" : "- Responda de forma completa mas objetiva. Se o valor for 'valor nao informado', diga isso - nao invente numero."}`;
 
-  const limite = muitasLinhas ? 520 : 360;
+  const limite = resumoEngenheiros ? 900 : (resumoSoma ? 900 : (muitasLinhas ? 760 : 600));
   return await chamarIAbruta([{ role: "user", content: prompt }], { max_tokens: limite, reasoning_effort: "low" });
 }
 
@@ -828,6 +1024,25 @@ function redigirLocal(pergunta, linhas) {
   };
   const texto = (v, vazio = "não informado") =>
     v === null || v === undefined || v === "" ? vazio : String(v);
+
+  // Contagem por tipo: resposta amigavel sem expor filtros/codigos internos.
+  const resumoContagem = montarResumoContagemPorTipo(pergunta, linhas);
+  if (resumoContagem) {
+    const fisicas = resumoContagem.obras_e_pavimentacoes;
+    const partes = [
+      `${resumoContagem.obras} obra${resumoContagem.obras === 1 ? "" : "s"}`,
+      `${resumoContagem.pavimentacoes} pavimentação${resumoContagem.pavimentacoes === 1 ? "" : "ões"}`,
+    ];
+    let out = `Há ${fisicas} registro${fisicas === 1 ? "" : "s"} de obras/pavimentações físicas nesse recorte (${partes.join(" + ")}).`;
+    if (resumoContagem.projetos || resumoContagem.licitacoes) {
+      out += `\n\nAlém disso, há ${resumoContagem.projetos} projeto${resumoContagem.projetos === 1 ? "" : "s"} ` +
+        `e ${resumoContagem.licitacoes} processo${resumoContagem.licitacoes === 1 ? "" : "s"} de licitação relacionados, tratados separadamente.`;
+    }
+    if (resumoContagem.total_registros_relacionados !== fisicas) {
+      out += `\n\nTotal de registros relacionados: ${resumoContagem.total_registros_relacionados}.`;
+    }
+    return out;
+  }
 
   // Soma detalhada: mostra o total E a composicao, inclusive registros sem valor.
   const resumoSoma = montarResumoSomaDetalhada(pergunta, linhas);
@@ -939,6 +1154,27 @@ function redigirLocal(pergunta, linhas) {
   }
 
   const amostra = linhas.slice(0, LIMITE);
+
+  // Perguntas sobre engenheiros: agrupa por responsavel e mostra quais registros
+  // cada profissional acompanha, mesmo se a IA de redacao estiver indisponivel.
+  const resumoEng = montarResumoEngenheiros(pergunta, linhas);
+  if (resumoEng) {
+    const blocos = resumoEng.responsaveis.map((r) => {
+      const itens = r.itens.map((i) => {
+        const detalhes = [i.tipo, i.status, i.bairro].filter(Boolean).join("; ");
+        const valor = i.valor_total !== null && i.valor_total !== undefined && i.valor_total !== ""
+          ? `; ${moeda(i.valor_total)}` : "";
+        const percentual = i.percentual_executado !== null && i.percentual_executado !== undefined && i.percentual_executado !== ""
+          ? `; ${texto(i.percentual_executado)}% executado` : "";
+        return `  - ${texto(i.objeto, "Registro sem nome")}${detalhes ? ` — ${detalhes}` : ""}${valor}${percentual}`;
+      });
+      const omitidos = r.itens_omitidos > 0 ? `\n  - ... e mais ${r.itens_omitidos} registro${r.itens_omitidos === 1 ? "" : "s"}.` : "";
+      return `• ${r.nome} — ${r.quantidade_registros} registro${r.quantidade_registros === 1 ? "" : "s"}\n${itens.join("\n")}${omitidos}`;
+    });
+    const rotuloResp = resumoEng.total_responsaveis === 1 ? "responsável técnico" : "responsáveis técnicos";
+    return `Encontrei ${resumoEng.total_responsaveis} ${rotuloResp} ` +
+      `em ${resumoEng.total_registros} registro${resumoEng.total_registros === 1 ? "" : "s"}:\n\n${blocos.join("\n\n")}`;
+  }
 
   // Obra + engenheiro: caso exato do acompanhamento "dessas obras".
   if (amostra.some((l) => Object.prototype.hasOwnProperty.call(l || {}, "engenheiro")) &&
