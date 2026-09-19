@@ -343,7 +343,13 @@ function validarSemanticaSQL(pergunta, sql) {
       return falha(`campo pedido (${nome}) nao foi selecionado`);
     }
   }
-  if (/\b(recursos?|fontes? do recurso|contratos?|convenios?|aditivos?|prazos?|datas?|observacoes?)\b/.test(p)) {
+  if (/\b(recursos?|fontes? do recurso|fonte de recurso)\b/.test(p)) {
+    // O nome da chave de recurso varia por aba. Exigimos o JSON inteiro e o
+    // Node cria o campo canonico "recurso" depois da consulta.
+    const extrasInteiro = /(?:^|,)\s*(?:obras\.)?dados_extras(?:\s+as\s+[a-z_][a-z0-9_]*)?\s*(?=,|$)/i.test(select);
+    if (!extrasInteiro) return falha("recurso/fonte exige selecionar dados_extras inteiro para normalizacao entre abas");
+  }
+  if (/\b(contratos?|convenios?|aditivos?|prazos?|datas?|observacoes?)\b/.test(p)) {
     if (!/\bdados_extras\b|->>/i.test(select)) return falha("campo livre pedido exige dados_extras ou chave JSON real");
   }
 
@@ -397,10 +403,150 @@ function resumoHistorico(historico = []) {
 //  Isso evita gastar tokens para coisas simples e preserva o contexto.
 // ------------------------------------------------------------
 function normalizarTexto(s = "") {
-  return s.toString().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+  let t = s.toString().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
     .toLowerCase().replace(/[!?.,;:]+/g, " ").replace(/\s+/g, " ").trim();
+
+  // Corrige erros de digitacao muito comuns apenas em palavras de comando/campo.
+  // Nomes de obras, bairros, empresas e pessoas nao sao alterados.
+  const trocas = [
+    [/\bexite\b/g, "existe"],
+    [/\brecuso\b/g, "recurso"],
+    [/\brecusos\b/g, "recursos"],
+    [/\brecusso\b/g, "recurso"],
+    [/\brecussos\b/g, "recursos"],
+    [/\bengenhero\b/g, "engenheiro"],
+    [/\bengenheros\b/g, "engenheiros"],
+  ];
+  for (const [rx, valor] of trocas) t = t.replace(rx, valor);
+  return t;
 }
 
+// Campos livres mudam de nome conforme a aba da planilha. Ex.: recurso pode
+// aparecer como RECURSO, CONVENIO/RECURSO ou FONTE DO RECURSO. Normalizamos
+// esses nomes depois da consulta para que a IA receba um campo canonico.
+function normalizarChaveExtra(s = "") {
+  return s.toString().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase().replace(/[^A-Z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function valorExtraPorPrioridade(extras, prioridades = []) {
+  if (!extras || typeof extras !== "object") return null;
+  const entradas = Object.entries(extras).map(([k, v]) => [normalizarChaveExtra(k), v]);
+  for (const alvo of prioridades) {
+    const a = normalizarChaveExtra(alvo);
+    const achou = entradas.find(([k, v]) => k === a && v !== null && v !== undefined && String(v).trim() !== "");
+    if (achou) return achou[1];
+  }
+  return null;
+}
+
+function enriquecerLinhaParaIA(linha = {}) {
+  if (!linha || typeof linha !== "object") return linha;
+  const out = { ...linha };
+  const ex = linha.dados_extras && typeof linha.dados_extras === "object" ? linha.dados_extras : null;
+  if (!ex) return out;
+
+  if (out.recurso === null || out.recurso === undefined || String(out.recurso).trim() === "") {
+    out.recurso = valorExtraPorPrioridade(ex, [
+      "RECURSO",
+      "CONVENIO/RECURSO",
+      "FONTE DO RECURSO",
+      "FONTE RECURSO",
+      "TIPO_RECURSO",
+      "TIPO RECURSO",
+    ]);
+  }
+  if (out.convenio === null || out.convenio === undefined || String(out.convenio).trim() === "") {
+    out.convenio = valorExtraPorPrioridade(ex, [
+      "N DO CONVENIO/ PROPOSTA",
+      "Nº DO CONVENIO/ PROPOSTA",
+      "NUMERO DO CONVENIO",
+      "CONVENIO",
+      "PROPOSTA",
+    ]);
+  }
+  if (out.contrato === null || out.contrato === undefined || String(out.contrato).trim() === "") {
+    out.contrato = valorExtraPorPrioridade(ex, [
+      "N DO CONTRATO",
+      "Nº DO CONTRATO",
+      "NUMERO DO CONTRATO",
+      "CONTRATO",
+    ]);
+  }
+  if (out.observacoes === null || out.observacoes === undefined || String(out.observacoes).trim() === "") {
+    out.observacoes = valorExtraPorPrioridade(ex, ["OBSERVACOES", "OBSERVACAO"]);
+  }
+  return out;
+}
+
+function termosLivresCandidatos(pergunta = "") {
+  const p = normalizarTexto(pergunta);
+  // Remove apenas palavras funcionais e nomes de CAMPOS/OPERACOES. O que sobra
+  // sao candidatos livres (siglas, equipamentos, nomes, trechos do objeto,
+  // locais etc.). Nao existe lista de entidades como UBS/escola/praca aqui.
+  const stop = new Set([
+    "a","o","as","os","um","uma","uns","umas","de","do","da","dos","das",
+    "no","na","nos","nas","em","e","ou","que","qual","quais","quem","como",
+    "me","fala","fale","diga","mostre","liste","listar","existe","existem","tem",
+    "tenho","temos","sao","ser","esta","estao","foi","foram","com","sem","por",
+    "para","pra","seu","sua","seus","suas","dele","dela","deles","delas","essas",
+    "esses","essa","esse","isso","isto","aquilo","mais","menos","maior","menor",
+    "quantas","quantos","quanto","total","geral","todos","todas","cada","entre",
+    "obra","obras","projeto","projetos","pavimentacao","pavimentacoes","licitacao",
+    "licitacoes","processo","processos","registro","registros","bairro","bairros",
+    "engenheiro","engenheiros","arquiteto","arquitetos","responsavel","responsaveis",
+    "empresa","empresas","executora","executoras","recurso","recursos","fonte","fontes",
+    "valor","valores","investido","investimento","custo","custos","status","situacao",
+    "percentual","porcentagem","contrato","contratos","convenio","convenios","data","datas",
+    "prazo","prazos","observacao","observacoes","concluida","concluidas","concluido",
+    "concluidos","andamento","execucao","executada","executado","atual","cadastrado",
+    "cadastradas","cadastrados","municipio","prefeitura"
+  ]);
+  const tokens = p.split(/\s+/).filter((t) =>
+    t.length >= 2 && !stop.has(t) && !/^\d+(?:[.,]\d+)?$/.test(t)
+  );
+  return [...new Set(tokens)].slice(0, 12);
+}
+
+function pistasInterpretacaoPergunta(pergunta = "") {
+  const p = normalizarTexto(pergunta);
+  const campos = [];
+  if (/\b(recursos?|fontes? do recurso|fonte de recurso)\b/.test(p)) campos.push("recurso/fonte do recurso");
+  if (/\b(engenheiros?|responsaveis?|arquitetos?)\b/.test(p)) campos.push("responsavel tecnico");
+  if (/\b(empresas?|executoras?|construtoras?)\b/.test(p)) campos.push("empresa executora");
+  if (/\b(valores?|investido|investimento|custo|custos)\b/.test(p)) campos.push("valor");
+  if (/\b(percentual|porcentagem)\b/.test(p)) campos.push("percentual executado");
+  if (/\b(bairros?|localizacao|local)\b/.test(p)) campos.push("bairro/local");
+  if (/\b(status|situacao)\b/.test(p)) campos.push("status/situacao");
+
+  return {
+    pergunta_normalizada: p,
+    campos_detectados: campos,
+    // Estes termos NAO sao categorias pre-cadastradas. Sao simplesmente as
+    // palavras significativas que sobraram da pergunta e que o planejador pode
+    // procurar em objeto ou confrontar com os metadados reais.
+    termos_livres_candidatos: termosLivresCandidatos(pergunta),
+  };
+}
+
+function sqlDescobertaUniversal(pergunta = "") {
+  const p = normalizarTexto(pergunta);
+  const precisaExtras = /\b(recursos?|fontes? do recurso|fonte de recurso|contratos?|convenios?|aditivos?|prazos?|datas?|observacoes?)\b/.test(p);
+  return "SELECT objeto, status, categoria, bairro, engenheiro, empresa, aba_origem" +
+    (precisaExtras ? ", dados_extras" : "") +
+    " FROM obras WHERE objeto IS NOT NULL ORDER BY objeto LIMIT 80";
+}
+
+async function executarDescobertaUniversal(pergunta = "") {
+  const sql = sqlDescobertaUniversal(pergunta);
+  const r = await queryReadOnly(sql);
+  return {
+    objetivo: "descoberta de nomes e tipos existentes na base para interpretar termo livre",
+    sql,
+    linhas: r.rows || [],
+    descoberta: true,
+  };
+}
 
 // Resolve apenas o ESCOPO DE NEGOCIO antes de validar/executar a SQL.
 // A IA continua livre para entender a frase, nomes, filtros e campos, mas o Node
@@ -1126,8 +1272,9 @@ COMO TRABALHAR:
 1.1. Antes de escrever a SQL, resolva mentalmente: (a) o que o cidadao quer saber, (b) qual conjunto de registros ele quer, (c) quais filtros citou, (d) quais campos/metricas pediu. Nao exponha esse raciocinio.
 2. Use SOMENTE colunas/chaves que realmente existem no schema/metadados acima. Os metadados sao referencia; a resposta final deve vir da CONSULTA, nunca de memoria ou suposicao.
 3. Gere UMA SQL SELECT que responda exatamente o que foi perguntado. Nao invente dado ausente e nao substitua um campo por outro parecido.
-3.1. Se o cidadao fizer DUAS OU MAIS perguntas/campos na mesma mensagem (ex.: "qual o recurso e o engenheiro da UBS X?" ou "valor, empresa e percentual da obra Y?"), a MESMA SQL deve trazer TODOS os campos pedidos. Nunca responda apenas uma parte.
-3.2. Palavras como recurso, engenheiro, empresa, bairro, contrato, valor, percentual e status podem ser CAMPOS solicitados. Nao trate essas palavras nem o nome da obra que vem depois delas como valor de filtro de outro campo. Ex.: em "recurso e engenheiro da Reforma da UBS do Cristo Rei", "engenheiro" e campo pedido; o filtro deve localizar a obra pelo objeto, nao procurar um engenheiro chamado "Reforma da UBS...".
+3.1. Se o cidadao fizer DUAS OU MAIS perguntas/campos na mesma mensagem, a MESMA SQL deve trazer TODOS os campos pedidos. Nunca responda apenas uma parte.
+3.2. Palavras como recurso, engenheiro, empresa, bairro, contrato, valor, percentual e status podem ser CAMPOS solicitados. Nao trate essas palavras nem o nome/termo que vem depois delas como valor de filtro de outro campo.
+3.3. Qualquer sigla, apelido, tipo de equipamento, nome parcial ou termo livre pode estar no campo objeto. Nao use uma lista fixa de entidades: procure o termo no objeto e, se a busca direta falhar, descubra os nomes reais antes de desistir.
 4. Para pergunta de acompanhamento, use a conversa e a SQL anterior para manter/refinar o recorte.
 4.1. PRIORIDADE DE CONTEXTO: pronomes/referencias como "essas obras", "elas", "delas", "ele", "essa" e "desses" apontam para o ASSUNTO DO TURNO IMEDIATAMENTE ANTERIOR, salvo se o cidadao mudar explicitamente o alvo. Nunca ressuscite engenheiro, obra, status ou filtro de varios turnos atras quando a pergunta anterior ja mudou o assunto.
 4.2. Se o turno imediatamente anterior usou uma SQL com WHERE e a pergunta atual apenas pede "quais sao", "quanto vale", "quem e o responsavel" ou outro detalhe dessas mesmas linhas, reutilize/refine aquele WHERE antes de considerar qualquer contexto mais antigo.
@@ -1162,7 +1309,7 @@ REGRAS SQL:
 - "quantos engenheiros" = COUNT(DISTINCT engenheiro).
 - "quantas empresas" = COUNT(DISTINCT empresa).
 - soma/investimento = SUM(valor_total), salvo se a pergunta pedir valor executado.
-- Para recurso/contrato/convenio/aditivo/prazo/data, consulte dados_extras usando apenas chaves reais listadas nos metadados. Se nao tiver certeza da chave, selecione objeto,dados_extras.
+- Para recurso/fonte do recurso, selecione dados_extras INTEIRO, porque o nome da chave varia entre abas e sera normalizado pelo Node. Para contrato/convenio/aditivo/prazo/data, use dados_extras/chaves reais dos metadados.
 - Bairro/local pode procurar em bairro e, quando fizer sentido, no objeto da obra.
 - A SQL sera validada por um guardrail independente. Se ela misturar categorias, omitir um campo pedido, usar palavra comum como nome de engenheiro ou contrariar o escopo do cidadao, sera rejeitada e voce tera que corrigi-la.
 - Saida: SOMENTE a SQL, sem markdown, explicacao ou ponto-e-virgula.
@@ -2015,6 +2162,33 @@ function auditarRespostaNumerica(resposta, linhas) {
 }
 
 
+function auditarCamposTextuaisSolicitados(pergunta, resposta, linhas) {
+  const p = normalizarTexto(pergunta);
+  const txt = normalizarTexto(resposta);
+  if (!txt) return { ok: false, motivo: "resposta vazia" };
+
+  const enriquecidas = (linhas || []).map(enriquecerLinhaParaIA);
+
+  if (/\b(recursos?|fontes? do recurso|fonte de recurso)\b/.test(p)) {
+    const recursos = [...new Set(enriquecidas
+      .map((l) => l?.recurso)
+      .filter((v) => v !== null && v !== undefined && String(v).trim() !== "")
+      .map((v) => String(v).trim()))];
+
+    if (recursos.length) {
+      if (/nao informad|sem informacao|nao consta|nao especificad/.test(txt)) {
+        return { ok: false, motivo: "a resposta disse que o recurso nao existe, mas ha recurso preenchido nos dados" };
+      }
+      const citouAlgum = recursos.some((r) => txt.includes(normalizarTexto(r)));
+      if (!citouAlgum) {
+        return { ok: false, motivo: "a resposta omitiu os recursos reais retornados pela consulta" };
+      }
+    }
+  }
+
+  return { ok: true };
+}
+
 // ============================================================
 // MODO AGENTE COM FERRAMENTAS
 // ============================================================
@@ -2101,8 +2275,9 @@ function serializarConsultasFerramenta(consultas = []) {
     sql: c.sql,
     quantidade_linhas: c.linhas.length,
     // O dataset atual e pequeno; ainda assim limitamos o material enviado ao LLM
-    // para manter custo/latencia previsiveis.
-    dados: c.linhas.slice(0, 80),
+    // para manter custo/latencia previsiveis. Campos livres recebem aliases
+    // canonicos (recurso, convenio, contrato...) antes da redacao.
+    dados: c.linhas.slice(0, 80).map(enriquecerLinhaParaIA),
   }));
 }
 
@@ -2110,6 +2285,7 @@ async function planejarPassoFerramenta(pergunta, historico, consultas = [], erro
   const contextoBanco = await contextoAtualDoBanco();
   const prioritario = contextoPrioritario(historico);
   const resultados = serializarConsultasFerramenta(consultas);
+  const pistas = pistasInterpretacaoPergunta(pergunta);
 
   const prompt = `Voce e o PLANEJADOR de um assistente que conversa livremente com uma base de obras publicas.
 Voce NAO responde usando conhecimento proprio. Voce possui uma unica ferramenta: CONSULTAR_BANCO, que executa SELECT somente leitura na tabela obras.
@@ -2129,6 +2305,9 @@ ${resumoHistorico(historico)}
 CONSULTAS JA FEITAS NESTE TURNO:
 ${JSON.stringify(resultados)}
 
+PISTAS DE INTERPRETACAO GERADAS PELO NODE (apoio; nao sao resposta):
+${JSON.stringify(pistas)}
+
 REGRAS DE COMPORTAMENTO:
 - Entenda linguagem natural, sinonimos, erros de digitacao e perguntas nunca vistas. Nao dependa de frases cadastradas.
 - Referencias como ela/ele/dela/dele/dessas/deles/essas/esses devem apontar primeiro para o turno imediatamente anterior.
@@ -2139,7 +2318,12 @@ REGRAS DE COMPORTAMENTO:
 - Se o usuario pedir explicitamente projeto, pavimentacao ou licitacao, use a origem correspondente.
 - Se pedir \"tudo/todas as categorias/todos os registros\", ai sim pode considerar todas as origens.
 - Para valores: valor_total, valor_executado e valores pagos sao conceitos diferentes. Nao substitua um pelo outro.
-- Para campos livres (recurso, contrato, convenio, aditivo, prazo, datas, observacoes), use dados_extras ou uma chave real listada nos metadados.
+- Para campos livres (recurso, contrato, convenio, aditivo, prazo, datas, observacoes), use dados_extras.
+- RECURSO/FONTE DO RECURSO muda de nome conforme a aba (por exemplo RECURSO, CONVENIO/RECURSO ou FONTE DO RECURSO). Quando recurso for pedido, selecione SEMPRE dados_extras inteiro; o Node cria um campo canonico "recurso" depois. Nao escolha uma unica chave JSON para varias origens.
+- Qualquer palavra, sigla, apelido, tipo de equipamento, nome parcial ou termo que nao seja um campo conhecido pode ser um valor do campo objeto. Trate-o como termo livre e procure nos dados; NAO dependa de uma lista cadastrada de entidades.
+- Se o usuario citar uma entidade/termo novo sem dizer obra/projeto/licitacao, procure em TODAS as categorias e diferencie os tipos na resposta. So herde filtros antigos quando houver referencia clara (ela, ele, essas, delas, desse etc.).
+- Se uma busca direta por um termo retornar 0 linhas, antes de concluir que nao existe, faca uma descoberta dos nomes existentes em objeto e tente reconhecer abreviacao, sinonimo ou grafia aproximada.
+- Erros simples de digitacao devem ser entendidos pelo significado normalizado fornecido nas pistas.
 - Para ranking/contagem/soma/comparacao, deixe o PostgreSQL calcular. Nao faca contas de cabeca.
 - Para uma pergunta com varios pedidos, obtenha dados suficientes para responder todos.
 - So use SELECT na tabela obras; sem JOIN, escrita, comentarios ou outras tabelas.
@@ -2153,7 +2337,8 @@ Para consultar:
 {"acao":"consultar","objetivo":"descricao curta","sql":"SELECT ... FROM obras ...","estado":{"escopo":"...","filtros":{},"conjunto":"...","entidade_foco":null}}
 Quando os dados ja forem suficientes:
 {"acao":"finalizar","objetivo":"dados suficientes","estado":{"escopo":"...","filtros":{},"conjunto":"...","entidade_foco":null}}
-Se a pergunta realmente nao puder ser respondida com esta base:
+Use sem_consulta SOMENTE quando a pergunta estiver claramente fora do dominio dos dados. Qualquer termo livre pode ser um nome/trecho de objeto, bairro, pessoa, empresa ou valor textual ainda nao reconhecido; faca ao menos uma SELECT de descoberta antes de desistir.
+Se a pergunta realmente estiver fora desta base:
 {"acao":"sem_consulta","objetivo":"motivo curto","estado":{"escopo":"indefinido","filtros":{},"conjunto":"","entidade_foco":null}}
 ${erroAnterior ? `\nA tentativa anterior foi rejeitada/falhou: ${erroAnterior}. Corrija a proxima acao sem mudar a intencao.` : ""}`;
 
@@ -2197,6 +2382,7 @@ REGRAS:
 - Diferencie obras, pavimentacoes, projetos e licitacoes conforme aba_origem/categoria.
 - Se a pergunta disser \"obras\" genericamente, nao chame projeto ou licitacao de obra.
 - Explique a diferenca entre valor total, executado e pago quando isso for relevante.
+- Quando os dados trouxerem o campo canonico recurso, use esse valor. Nunca diga "recurso nao informado" se recurso estiver preenchido no resultado normalizado.
 - Se a consulta retornou zero linhas, diga que nao encontrou registro correspondente; nao suponha.
 - Nao mencione SQL, banco, JSON, ferramenta ou detalhes internos.
 - Seja conciso, mas liste os itens quando o usuario pedir quais sao.
@@ -2222,6 +2408,23 @@ async function responderComFerramentas(pergunta, historico = []) {
 
     if (decisao.acao === "sem_consulta") {
       if (consultas.length) break;
+
+      // O bot e especializado nesta base. Antes de desistir de uma pergunta
+      // desconhecida, faz UMA descoberta generica dos nomes/tipos existentes.
+      // Assim siglas, apelidos e entidades nunca vistas (nao apenas UBS) podem
+      // ser reconhecidas no passo seguinte sem cadastrar frases no codigo.
+      if (passo < MAX_PASSOS_FERRAMENTAS - 1) {
+        try {
+          const descoberta = await executarDescobertaUniversal(pergunta);
+          consultas.push(descoberta);
+          erroAnterior = "antes de usar sem_consulta, examine a descoberta real da base e tente relacionar os termos livres da pergunta aos objetos/categorias encontrados. Se houver correspondencia, faca uma consulta alvo; se nao houver, finalize informando que nao encontrou";
+          continue;
+        } catch (e) {
+          erroAnterior = `falha na consulta de descoberta: ${e.message}`;
+          continue;
+        }
+      }
+
       return {
         resposta: "Nao encontrei dados suficientes na planilha para responder isso com seguranca. Pode detalhar um pouco mais o que deseja consultar?",
         semConsulta: true,
@@ -2272,6 +2475,21 @@ async function responderComFerramentas(pergunta, historico = []) {
       });
       sqlAnteriorNoTurno = sql;
       console.log(`AGENTE/FERRAMENTAS: passo ${passo + 1}, ${r.rows.length} linha(s).`);
+
+      // Busca alvo sem resultado pode ser apenas abreviacao/sinonimo/grafia.
+      // Em vez de responder "nao sei" imediatamente, carregamos um indice
+      // compacto dos objetos e deixamos a IA relacionar semanticamente no
+      // proximo passo. Isso funciona para QUALQUER entidade nova.
+      const jaDescobriu = consultas.some((c) => c.descoberta);
+      if (r.rows.length === 0 && !jaDescobriu && passo < MAX_PASSOS_FERRAMENTAS - 1) {
+        try {
+          const descoberta = await executarDescobertaUniversal(pergunta);
+          consultas.push(descoberta);
+          erroAnterior = "a busca alvo retornou 0 linhas. Use a descoberta de objetos para reconhecer sinonimos, siglas, grafia aproximada ou outro nome equivalente e faca uma nova consulta alvo antes de concluir que nao existe";
+        } catch (e) {
+          console.warn("AGENTE/FERRAMENTAS: descoberta apos zero linhas falhou:", e.message);
+        }
+      }
     } catch (e) {
       erroAnterior = `erro ao executar: ${e.message}. SQL=${sql.slice(0, 700)}`;
       console.warn("AGENTE/FERRAMENTAS:", erroAnterior);
@@ -2283,24 +2501,28 @@ async function responderComFerramentas(pergunta, historico = []) {
   }
 
   let resposta = await redigirComFerramentas(pergunta, historico, consultas);
-  let auditoria = auditarRespostaNumerica(resposta, linhasParaAuditoria(consultas));
-  if (!auditoria.ok) {
-    console.warn("AGENTE/FERRAMENTAS: redacao rejeitada -", auditoria.motivo);
+  const linhasAuditadas = linhasParaAuditoria(consultas);
+  let auditoria = auditarRespostaNumerica(resposta, linhasAuditadas);
+  let auditoriaTexto = auditarCamposTextuaisSolicitados(pergunta, resposta, linhasAuditadas);
+  if (!auditoria.ok || !auditoriaTexto.ok) {
+    const motivo = !auditoria.ok ? auditoria.motivo : auditoriaTexto.motivo;
+    console.warn("AGENTE/FERRAMENTAS: redacao rejeitada -", motivo);
     resposta = await redigirComFerramentas(
-      `${pergunta}\nATENCAO: use somente numeros literalmente presentes nos resultados das ferramentas; a resposta anterior falhou na auditoria por ${auditoria.motivo}.`,
+      `${pergunta}\nATENCAO: a resposta anterior falhou na auditoria por: ${motivo}. Use somente os dados reais retornados, inclua todos os campos explicitamente pedidos e nunca diga que um campo nao foi informado quando ele estiver preenchido.`,
       historico,
       consultas
     );
-    auditoria = auditarRespostaNumerica(resposta, linhasParaAuditoria(consultas));
+    auditoria = auditarRespostaNumerica(resposta, linhasAuditadas);
+    auditoriaTexto = auditarCamposTextuaisSolicitados(pergunta, resposta, linhasAuditadas);
   }
 
   const ultima = consultas[consultas.length - 1];
   if (!estadoAtual || typeof estadoAtual !== "object") {
     estadoAtual = estadoDaUltimaConsulta([{ role: "assistant", sql: ultima.sql }]);
   }
-  if (!auditoria.ok) {
+  if (!auditoria.ok || !auditoriaTexto.ok) {
     return {
-      resposta: redigirLocal(pergunta, ultima.linhas),
+      resposta: redigirLocal(pergunta, ultima.linhas.map(enriquecerLinhaParaIA)),
       sql: ultima.sql,
       linhas: ultima.linhas.length,
       consultas: consultas.map((c) => c.sql),
