@@ -548,6 +548,68 @@ async function executarDescobertaUniversal(pergunta = "") {
   };
 }
 
+
+// Fallback universal SEM IA para quando Groq/Gemini estiverem indisponiveis.
+// Nao existe lista de entidades (UBS, escola, praca etc.). Pegamos os termos
+// significativos da pergunta e procuramos dinamicamente no campo objeto.
+function escaparLiteralSQL(valor = "") {
+  return String(valor).replace(/'/g, "''");
+}
+
+function condicaoObjetoLivreDaPergunta(pergunta = "") {
+  const termos = termosLivresCandidatos(pergunta)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 2)
+    .slice(0, 6);
+  if (!termos.length) return "";
+
+  // Exige que todos os termos relevantes aparecam no objeto. Para perguntas
+  // curtas como "recursos das UBS", isso vira apenas objeto ILIKE '%ubs%'.
+  // Para nomes maiores, os termos podem aparecer separados no titulo.
+  return termos
+    .map((t) => `unaccent(COALESCE(objeto,'')) ILIKE unaccent('%${escaparLiteralSQL(t)}%')`)
+    .join(" AND ");
+}
+
+function gerarSQLFallbackUniversal(pergunta = "", historico = []) {
+  const p = normalizarTexto(pergunta);
+  if (!p) return null;
+
+  // Primeiro respeita o contexto imediato quando a frase e referencial.
+  const sqlAnterior = ultimaSQLDoHistorico(historico);
+  const condAnterior = whereDaSQL(sqlAnterior).replace(/^WHERE\s+/i, "").trim();
+  const referenciaAnterior = /\b(dessas?|destas?|nessas?|nestas?|delas?|deles?|dele|dela|essas?|esses?|elas?|eles?|nela|nele|anteriores?|anterior|acima|mesmas?|mesmos?|isso|essa|esse)\b/.test(p);
+
+  const condicoes = [];
+  if (condAnterior && referenciaAnterior) condicoes.push(condAnterior);
+
+  const filtroStatus = filtroStatusDaPergunta(p);
+  const filtroLocal = condicaoLocalDaPergunta(p);
+  const filtroEngenheiro = condicaoEngenheiroDaPergunta(p) || condicaoEngenheiroImplicitoDaPergunta(p);
+  const filtroEscopo = filtroEscopoDaPergunta(p);
+  if (filtroEscopo) condicoes.push(filtroEscopo);
+  else if (/\bobras?\b/.test(p)) condicoes.push("aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO')");
+  if (filtroStatus) condicoes.push(filtroStatus);
+  if (filtroLocal) condicoes.push(filtroLocal);
+  if (filtroEngenheiro) condicoes.push(filtroEngenheiro);
+
+  // Se nenhum filtro estrutural identificou o alvo, usa os termos livres como
+  // busca no nome/objeto. Isso resolve QUALQUER entidade literal sem cadastra-la.
+  if (!filtroLocal && !filtroEngenheiro) {
+    const porObjeto = condicaoObjetoLivreDaPergunta(pergunta);
+    if (porObjeto) condicoes.push(porObjeto);
+  }
+
+  if (!condicoes.length) return null;
+
+  const where = `WHERE ${condicoes.join(" AND ")}`;
+  // Traz um conjunto completo e pequeno de campos. Assim a mesma consulta pode
+  // responder quantidade + recurso + status + responsavel + valor, inclusive
+  // quando a frase pede varios campos ao mesmo tempo.
+  return `SELECT objeto, status, categoria, bairro, engenheiro, empresa, valor_total, ` +
+    `valor_executado, percentual_executado, aba_origem, dados_extras FROM obras ${where} ORDER BY objeto`;
+}
+
 // Resolve apenas o ESCOPO DE NEGOCIO antes de validar/executar a SQL.
 // A IA continua livre para entender a frase, nomes, filtros e campos, mas o Node
 // garante deterministicamente que "obra" nao vire projeto/licitacao por engano.
@@ -1959,6 +2021,24 @@ function redigirLocal(pergunta, linhas) {
 
   const amostra = linhas.slice(0, LIMITE);
 
+  // Campos pedidos diretamente precisam ter prioridade sobre os resumos
+  // genericos. Sem isso, uma pergunta como "recursos das UBS" podia cair no
+  // bloco de engenheiro apenas porque a consulta tambem trouxe esse campo.
+  const enriquecidasLocal = linhas.map(enriquecerLinhaParaIA);
+  const pedeRecursoLocal = /\b(recursos?|fontes? do recurso|fonte de recurso)\b/.test(p);
+  const pedeStatusLocal = /\b(status|situacao)\b/.test(p);
+  if (pedeRecursoLocal || pedeStatusLocal) {
+    const itens = enriquecidasLocal.slice(0, LIMITE).map((l) => {
+      const partes = [];
+      if (pedeRecursoLocal) partes.push(`recurso: ${texto(l.recurso, "não informado")}`);
+      if (pedeStatusLocal) partes.push(`status: ${texto(l.status, "não informado")}`);
+      return `• ${texto(l.objeto, "Registro sem nome")} — ${partes.join(" — ")}`;
+    });
+    const total = enriquecidasLocal.length;
+    const resto = total > LIMITE ? `\n• ... e mais ${total - LIMITE} registro${total - LIMITE === 1 ? "" : "s"}.` : "";
+    return `Encontrei ${total} registro${total === 1 ? "" : "s"} relacionado${total === 1 ? "" : "s"}:\n\n${itens.join("\n")}${resto}`;
+  }
+
   // Perguntas sobre engenheiros: agrupa por responsavel e mostra quais registros
   // cada profissional acompanha, mesmo se a IA de redacao estiver indisponivel.
   const resumoEng = montarResumoEngenheiros(pergunta, linhas);
@@ -2542,6 +2622,37 @@ async function responderComFerramentas(pergunta, historico = []) {
   };
 }
 
+async function tentarFallbackLocalUniversal(pergunta, historico = [], motivo = "") {
+  let sql = gerarSQLRapida(pergunta, historico) || gerarSQLFallbackUniversal(pergunta, historico);
+  if (!sql) return null;
+
+  sql = aplicarEscopoNegocioNaSQL(pergunta, sql, historico);
+  const perguntaValidacao = perguntaParaEscopo(pergunta, historico);
+  const check = validarConsulta(perguntaValidacao, sql);
+  if (!check.ok) {
+    console.warn("AGENTE/FALLBACK LOCAL: SQL rejeitada -", check.motivo);
+    return null;
+  }
+
+  try {
+    const r = await queryReadOnly(comLimite(sql));
+    const linhas = (r.rows || []).map(enriquecerLinhaParaIA);
+    const estado = estadoDaUltimaConsulta([{ role: "assistant", sql }]);
+    console.log(`AGENTE/FALLBACK LOCAL: ${linhas.length} linha(s) sem depender da IA.${motivo ? ` Motivo original: ${motivo}` : ""}`);
+    return {
+      resposta: redigirLocal(pergunta, linhas),
+      sql,
+      linhas: linhas.length,
+      estado,
+      fallbackLocal: true,
+      modoAgente: "fallback_universal_sem_ia",
+    };
+  } catch (e) {
+    console.error("AGENTE/FALLBACK LOCAL: consulta falhou:", e.message);
+    return null;
+  }
+}
+
 // --- FLUXO COMPLETO ---
 export async function responderPergunta(pergunta, historico = []) {
   // 0. Saudacao/agradecimento/despedida - responde sem tocar no banco.
@@ -2557,7 +2668,9 @@ export async function responderPergunta(pergunta, historico = []) {
     try {
       return await responderComFerramentas(pergunta, historico);
     } catch (e) {
-      console.error("AGENTE/FERRAMENTAS: falhou; usando fluxo SQL antigo como fallback:", e.message);
+      console.error("AGENTE/FERRAMENTAS: falhou; tentando fallback local antes de chamar a IA novamente:", e.message);
+      const local = await tentarFallbackLocalUniversal(pergunta, historico, e.message);
+      if (local) return local;
     }
   }
 
@@ -2568,7 +2681,7 @@ export async function responderPergunta(pergunta, historico = []) {
     sql = await gerarSQL(pergunta, historico);
   } catch (e) {
     console.error("AGENTE: IA nao conseguiu gerar SQL; tentando fallback rapido:", e.message);
-    const rapida = gerarSQLRapida(pergunta, historico);
+    const rapida = gerarSQLRapida(pergunta, historico) || gerarSQLFallbackUniversal(pergunta, historico);
     if (rapida) sql = rapida;
     else return { resposta: "Desculpe, tive um problema ao entender sua pergunta. Pode reformular?", erro: "gerar_sql: " + e.message };
   }
