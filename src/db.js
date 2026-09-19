@@ -133,60 +133,101 @@ export async function buscarConhecimentoAprovado({ limite = 200, ignorarCache = 
     return cacheConhecimentoAgente.linhas.slice(0, limite);
   }
 
+  const max = Math.max(1, Math.min(Number(limite) || 200, 500));
   try {
-    const r = await queryReadOnly(
-      `SELECT id, pergunta_exemplo, intencao, escopo, regra_negocio, sql_exemplo,
-              campos_envolvidos, tags, origem, vezes_utilizado
-         FROM public.agent_knowledge
-        WHERE status_aprovacao = 'approved'
-        ORDER BY vezes_utilizado DESC, id ASC
-        LIMIT $1`,
-      [Math.max(1, Math.min(Number(limite) || 200, 500))]
-    );
+    let r;
+    try {
+      r = await queryReadOnly(
+        `SELECT id, pergunta_exemplo, intencao, escopo, regra_negocio, sql_exemplo,
+                campos_envolvidos, tags, origem, vezes_utilizado,
+                padrao_chave, padrao, sucessos
+           FROM public.agent_knowledge
+          WHERE status_aprovacao = 'approved'
+          ORDER BY vezes_utilizado DESC, sucessos DESC, id ASC
+          LIMIT $1`,
+        [max]
+      );
+    } catch (e) {
+      if (e?.code !== "42703") throw e;
+      r = await queryReadOnly(
+        `SELECT id, pergunta_exemplo, intencao, escopo, regra_negocio, sql_exemplo,
+                campos_envolvidos, tags, origem, vezes_utilizado
+           FROM public.agent_knowledge
+          WHERE status_aprovacao = 'approved'
+          ORDER BY vezes_utilizado DESC, id ASC
+          LIMIT $1`,
+        [max]
+      );
+    }
     cacheConhecimentoAgente = { quando: agora, linhas: r.rows || [] };
     return cacheConhecimentoAgente.linhas;
   } catch (e) {
-    if (tabelaConhecimentoAusente(e)) {
-      // Permite publicar os arquivos antes de rodar a migracao SQL. O agente
-      // continua com seus exemplos-base embutidos e nao para o atendimento.
-      return [];
-    }
+    if (tabelaConhecimentoAusente(e)) return [];
     console.warn("DB: falha ao ler agent_knowledge:", e.message);
     return [];
   }
 }
 
-function fingerprintConhecimento({ pergunta_exemplo = "", sql_exemplo = "", escopo = "" } = {}) {
-  return createHash("sha256")
-    .update(`${String(pergunta_exemplo).trim().toLowerCase()}|${String(escopo).trim().toLowerCase()}|${String(sql_exemplo).replace(/\\s+/g, " ").trim().toLowerCase()}`)
-    .digest("hex");
+function fingerprintConhecimento({ pergunta_exemplo = "", sql_exemplo = "", escopo = "", padrao_chave = "" } = {}) {
+  const base = padrao_chave
+    ? `padrao|${String(padrao_chave).trim().toLowerCase()}`
+    : `${String(pergunta_exemplo).trim().toLowerCase()}|${String(escopo).trim().toLowerCase()}|${String(sql_exemplo).replace(/\s+/g, " ").trim().toLowerCase()}`;
+  return createHash("sha256").update(base).digest("hex");
 }
 
 export async function registrarConhecimentoCandidato({
   pergunta_exemplo,
   intencao = {},
   escopo = "indefinido",
-  regra_negocio = "Consulta candidata gerada pelo agente; aguarda aprovacao humana.",
+  regra_negocio = "Padrao de consulta candidato; aguarda aprovacao humana.",
   sql_exemplo = null,
   campos_envolvidos = [],
   tags = "",
-  origem = "agente",
+  origem = "agente_padrao",
+  padrao_chave = null,
+  padrao = {},
 } = {}) {
-  if (!adminPool || !pergunta_exemplo || !sql_exemplo) return { ok: false, motivo: "admin_indisponivel" };
+  if (!adminPool || !pergunta_exemplo || !sql_exemplo || !padrao_chave) {
+    return { ok: false, motivo: "admin_ou_padrao_indisponivel" };
+  }
 
-  const fingerprint = fingerprintConhecimento({ pergunta_exemplo, sql_exemplo, escopo });
+  const fingerprint = fingerprintConhecimento({ pergunta_exemplo, sql_exemplo, escopo, padrao_chave });
   try {
     const r = await adminPool.query(
       `INSERT INTO public.agent_knowledge
         (pergunta_exemplo, intencao, escopo, regra_negocio, sql_exemplo,
-         campos_envolvidos, tags, status_aprovacao, origem, fingerprint)
-       VALUES ($1, $2::jsonb, $3, $4, $5, $6::text[], $7, 'candidate', $8, $9)
-       ON CONFLICT (fingerprint) DO UPDATE SET
+         campos_envolvidos, tags, status_aprovacao, origem, fingerprint,
+         padrao_chave, padrao, sucessos, ultima_execucao)
+       VALUES ($1, $2::jsonb, $3, $4, $5, $6::text[], $7, 'candidate', $8, $9,
+               $10, $11::jsonb, 1, now())
+       ON CONFLICT (padrao_chave) DO UPDATE SET
          updated_at = now(),
-         intencao = EXCLUDED.intencao,
-         campos_envolvidos = EXCLUDED.campos_envolvidos,
-         tags = EXCLUDED.tags
-       RETURNING id, status_aprovacao`,
+         ultima_execucao = now(),
+         sucessos = CASE
+           WHEN public.agent_knowledge.status_aprovacao = 'rejected' THEN public.agent_knowledge.sucessos
+           ELSE public.agent_knowledge.sucessos + 1
+         END,
+         intencao = CASE
+           WHEN public.agent_knowledge.status_aprovacao = 'candidate' THEN EXCLUDED.intencao
+           ELSE public.agent_knowledge.intencao
+         END,
+         padrao = CASE
+           WHEN public.agent_knowledge.status_aprovacao = 'candidate' THEN EXCLUDED.padrao
+           ELSE public.agent_knowledge.padrao
+         END,
+         sql_exemplo = CASE
+           WHEN public.agent_knowledge.status_aprovacao = 'candidate' THEN EXCLUDED.sql_exemplo
+           ELSE public.agent_knowledge.sql_exemplo
+         END,
+         campos_envolvidos = CASE
+           WHEN public.agent_knowledge.status_aprovacao = 'candidate' THEN EXCLUDED.campos_envolvidos
+           ELSE public.agent_knowledge.campos_envolvidos
+         END,
+         tags = CASE
+           WHEN public.agent_knowledge.status_aprovacao = 'candidate' THEN EXCLUDED.tags
+           ELSE public.agent_knowledge.tags
+         END
+       RETURNING id, status_aprovacao, sucessos, padrao_chave`,
       [
         String(pergunta_exemplo).slice(0, 1000),
         JSON.stringify(intencao && typeof intencao === "object" ? intencao : {}),
@@ -195,13 +236,19 @@ export async function registrarConhecimentoCandidato({
         String(sql_exemplo).slice(0, 8000),
         Array.isArray(campos_envolvidos) ? campos_envolvidos.map(String).slice(0, 30) : [],
         String(tags || "").slice(0, 1000),
-        String(origem || "agente").slice(0, 80),
+        String(origem || "agente_padrao").slice(0, 80),
         fingerprint,
+        String(padrao_chave).slice(0, 500),
+        JSON.stringify(padrao && typeof padrao === "object" ? padrao : {}),
       ]
     );
     return { ok: true, ...(r.rows?.[0] || {}) };
   } catch (e) {
     if (tabelaConhecimentoAusente(e)) return { ok: false, motivo: "tabela_ausente" };
+    if (e?.code === "42703") {
+      console.warn("DB: estrutura de padroes ainda nao criada. Rode supabase_agent_knowledge_padrao.sql antes de aprender novos padroes.");
+      return { ok: false, motivo: "migracao_padrao_pendente" };
+    }
     console.warn("DB: falha ao registrar conhecimento candidato:", e.message);
     return { ok: false, motivo: e.message };
   }

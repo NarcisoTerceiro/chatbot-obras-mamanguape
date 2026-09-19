@@ -678,9 +678,10 @@ async function exemplosRelevantes(pergunta = "", limite = 4) {
       id: `db:${r.id}`,
       dbId: Number(r.id),
       pergunta: r.pergunta_exemplo || "",
-      tags: `${r.tags || ""} ${(r.campos_envolvidos || []).join(" ")} ${r.escopo || ""}`,
+      tags: `${r.tags || ""} ${(r.campos_envolvidos || []).join(" ")} ${r.escopo || ""} ${r.padrao_chave || ""} ${JSON.stringify(r.padrao || {})}`,
       regra: r.regra_negocio || "",
       sql: r.sql_exemplo || "",
+      padrao: r.padrao || null,
       persistente: true,
     }));
   } catch (e) {
@@ -2810,29 +2811,169 @@ REGRAS:
 }
 
 
+function operacaoCanonicaDoPadrao(plano = {}, sql = "") {
+  let op = Array.isArray(plano?.operacao) ? plano.operacao[0] : plano?.operacao;
+  op = normalizarTexto(op || "");
+  const mapa = {
+    listar: "listar", lista: "listar", contar: "contar", count: "contar",
+    somar: "somar", soma: "somar", sum: "somar", media: "media", avg: "media",
+    ranking: "ranking", comparar: "comparar", detalhar: "detalhar", descobrir: "descobrir",
+  };
+  if (mapa[op]) return mapa[op];
+  if (/\bsum\s*\(/i.test(sql)) return "somar";
+  if (/\bavg\s*\(/i.test(sql)) return "media";
+  if (/\bcount\s*\(/i.test(sql)) return /\bgroup\s+by\b/i.test(sql) ? "ranking" : "contar";
+  if (/\bgroup\s+by\b/i.test(sql)) return "comparar";
+  return "listar";
+}
+
+function listaCanonicaPadrao(v) {
+  const arr = Array.isArray(v) ? v : (v === null || v === undefined || v === "" ? [] : [v]);
+  return [...new Set(arr.map((x) => normalizarTexto(String(x))).filter(Boolean))].sort();
+}
+
+function escopoCanonicoDoPadrao(estado = {}, sql = "") {
+  const declarado = normalizarTexto(estado?.escopo || "").replace(/\s+/g, "_");
+  if (declarado && declarado !== "indefinido") return declarado;
+  const s = normalizarTexto(sql);
+  const tem = (x) => s.includes(normalizarTexto(x));
+  if (tem("EM_PROJETO") && !tem("EM_ANDAMENTO") && !tem("PAVIMENTAÇÃO")) return "projetos";
+  if (tem("EM_LICITAÇÃO") && !tem("EM_ANDAMENTO") && !tem("PAVIMENTAÇÃO")) return "licitacoes";
+  if (tem("PAVIMENTAÇÃO") && !tem("EM_ANDAMENTO")) return "pavimentacoes";
+  if (tem("EM_ANDAMENTO") && tem("PAVIMENTAÇÃO")) return "obras";
+  if (tem("EM_ANDAMENTO")) return "obras_em_andamento";
+  return declarado || "indefinido";
+}
+
+function filtrosEstruturaisDoPadrao(plano = {}, estado = {}, sql = "") {
+  const chaves = new Set();
+  const adicionar = (obj) => {
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+    for (const [k, v] of Object.entries(obj)) {
+      if (v === null || v === undefined || String(v).trim() === "") continue;
+      const nk = normalizarTexto(k).replace(/\s+/g, "_");
+      if (nk && nk !== "aba_origem") chaves.add(nk);
+    }
+  };
+  adicionar(plano?.filtros);
+  adicionar(estado?.filtros);
+
+  const cols = ["bairro", "engenheiro", "empresa", "status", "objeto", "categoria", "valor_total", "valor_executado", "percentual_executado"];
+  for (const c of cols) {
+    const re = new RegExp(`\\b${c}\\b`, "i");
+    const where = String(sql).split(/\border\s+by\b|\bgroup\s+by\b|\blimit\b/i)[0];
+    if (/\bwhere\b/i.test(where) && re.test(where.replace(/^.*?\bwhere\b/i, ""))) chaves.add(c);
+  }
+  return [...chaves].sort();
+}
+
+function agrupamentoDoPadrao(plano = {}, sql = "") {
+  const p = normalizarTexto(plano?.agrupamento || "").replace(/\s+/g, "_");
+  if (p) return p;
+  const m = String(sql).match(/\bgroup\s+by\s+([a-z_][a-z0-9_]*)/i);
+  return m ? normalizarTexto(m[1]).replace(/\s+/g, "_") : null;
+}
+
+function generalizarSQLParaPadrao(sql = "") {
+  const preservar = new Set(["EM_ANDAMENTO", "PAVIMENTAÇÃO", "EM_PROJETO", "EM_LICITAÇÃO"]);
+  return String(sql)
+    .replace(/'((?:''|[^'])*)'/g, (literal, conteudo) => {
+      const valor = String(conteudo).replace(/''/g, "'");
+      if (preservar.has(valor)) return literal;
+      return "'<VALOR>'";
+    })
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function construirPadraoConhecimento(pergunta = "", sql = "", estado = {}, plano = {}) {
+  const operacao = operacaoCanonicaDoPadrao(plano, sql);
+  const escopo = escopoCanonicoDoPadrao(estado, sql);
+  const campos = listaCanonicaPadrao([
+    ...camposSolicitados(pergunta),
+    ...(Array.isArray(plano?.campos) ? plano.campos : []),
+  ]);
+  const filtros = filtrosEstruturaisDoPadrao(plano, estado, sql);
+  const agrupamento = agrupamentoDoPadrao(plano, sql);
+  const p = normalizarTexto(pergunta);
+  const referencia_anterior = /\b(ela|ele|delas?|deles?|essas?|esses?|dessas?|desses?|nessa|nesse|nela|nele)\b/.test(p);
+  const entidade_livre = Boolean(plano?.entidade_livre) || filtros.includes("objeto");
+
+  // Nao guarda o VALOR do bairro, engenheiro, entidade etc. Guarda apenas a
+  // ESTRUTURA que funcionou. Assim "Centro" e "Cristo Rei" viram o mesmo
+  // padrao de filtro por bairro; "UBS" e "escola" viram o mesmo padrao de
+  // entidade livre no objeto.
+  const padrao = {
+    versao: 2,
+    operacao,
+    escopo,
+    campos,
+    filtros,
+    agrupamento,
+    entidade_livre,
+    referencia_anterior,
+  };
+  const chave = [
+    "v2",
+    `op=${operacao}`,
+    `escopo=${escopo}`,
+    `campos=${campos.join(",") || "-"}`,
+    `filtros=${filtros.join(",") || "-"}`,
+    `grupo=${agrupamento || "-"}`,
+    `entidade=${entidade_livre ? 1 : 0}`,
+    `ref=${referencia_anterior ? 1 : 0}`,
+  ].join("|");
+  const descricao = `PADRAO: ${operacao} | escopo=${escopo} | campos=${campos.join(",") || "-"} | filtros=${filtros.join(",") || "-"}${agrupamento ? ` | agrupar=${agrupamento}` : ""}${entidade_livre ? " | entidade_livre" : ""}${referencia_anterior ? " | referencia_anterior" : ""}`;
+  return { padrao, chave, descricao, sqlModelo: generalizarSQLParaPadrao(sql) };
+}
+
 function registrarCandidatoSeguro(pergunta, sql, estado, plano = {}) {
   if (!sql || !/^\s*select\b/i.test(sql)) return;
-  const escopo = estado?.escopo || "indefinido";
-  const campos = camposSolicitados(pergunta);
-  const tags = tokensRelevantes(`${pergunta} ${escopo} ${campos.join(" ")}`).slice(0, 30).join(" ");
-  const intencao = {
-    ...(plano && typeof plano === "object" ? plano : {}),
-    estado: estado && typeof estado === "object" ? estado : {},
-  };
 
-  // CANDIDATE nao e usado pelo planejador. Precisa ser aprovado no Supabase
-  // para virar conhecimento permanente. Assim uma resposta apenas "executavel"
-  // nunca se auto-promove para verdade do sistema.
+  const info = construirPadraoConhecimento(pergunta, sql, estado, plano);
+  // Evita aprender um padrao generico demais, como apenas "listar tudo" sem
+  // escopo/campo/filtro. Isso mantem a base pequena e realmente util.
+  const util = info.padrao.operacao !== "listar" ||
+    info.padrao.escopo !== "indefinido" ||
+    info.padrao.campos.length || info.padrao.filtros.length ||
+    info.padrao.agrupamento || info.padrao.entidade_livre || info.padrao.referencia_anterior;
+  if (!util) return;
+
+  const intencao = {
+    operacao: info.padrao.operacao,
+    escopo: info.padrao.escopo,
+    campos: info.padrao.campos,
+    filtros: info.padrao.filtros,
+    agrupamento: info.padrao.agrupamento,
+    entidade_livre: info.padrao.entidade_livre,
+    referencia_anterior: info.padrao.referencia_anterior,
+  };
+  const tags = [
+    info.padrao.operacao,
+    info.padrao.escopo,
+    ...info.padrao.campos,
+    ...info.padrao.filtros,
+    info.padrao.agrupamento,
+    info.padrao.entidade_livre ? "entidade_livre" : null,
+    info.padrao.referencia_anterior ? "referencia_anterior" : null,
+  ].filter(Boolean).join(" ");
+
+  // So chega aqui DEPOIS que a SQL executou e a resposta passou pelas
+  // auditorias. Mesmo assim entra como CANDIDATE: precisa de aprovacao humana
+  // para ensinar o agente. O banco faz UPSERT por padrao_chave; frases diferentes
+  // com a mesma estrutura incrementam "sucessos" na MESMA linha.
   registrarConhecimentoCandidato({
-    pergunta_exemplo: String(pergunta || "").slice(0, 1000),
+    pergunta_exemplo: info.descricao,
     intencao,
-    escopo,
-    regra_negocio: "Consulta candidata gerada e validada pelos guardrails atuais. Aguardar revisao humana antes de usar como exemplo aprovado.",
-    sql_exemplo: String(sql).slice(0, 8000),
-    campos_envolvidos: campos,
+    escopo: info.padrao.escopo,
+    regra_negocio: `Padrao estrutural validado em execucao: ${info.descricao}. Valores literais da pergunta nao sao armazenados. Aguardar aprovacao humana antes de usar como conhecimento permanente.`,
+    sql_exemplo: info.sqlModelo,
+    campos_envolvidos: info.padrao.campos,
     tags,
-    origem: "agente_validado",
-  }).catch((e) => console.warn("AGENTE: nao foi possivel salvar candidato:", e.message));
+    origem: "agente_padrao_validado",
+    padrao_chave: info.chave,
+    padrao: info.padrao,
+  }).catch((e) => console.warn("AGENTE: nao foi possivel salvar padrao candidato:", e.message));
 }
 
 async function responderComFerramentas(pergunta, historico = []) {
