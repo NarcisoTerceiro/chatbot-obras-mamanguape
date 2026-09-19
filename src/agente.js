@@ -332,7 +332,10 @@ function pareceItemEspecifico(p) {
 // "obras do engenheiro Ricardo Sousa". O filtro e dinamico: nenhum nome fica
 // fixo no codigo.
 function condicaoEngenheiroDaPergunta(p) {
-  const m = p.match(/\b(?:engenheir[oa]|eng|arquiteto|arquiteta|arq|responsavel(?: tecnico)?)\s+([a-z][a-z .'-]{2,60}?)(?=$|\b(?:no|na|em|com|que|das?|dos?|pel[oa]|responsavel|obras?|projetos?|pavimentacoes?|licitacoes?|status|valor)\b)/i);
+  // Captura somente o NOME do profissional. Palavras que descrevem a pergunta
+  // ("tem", "maior percentual", "com", "obras" etc.) nao podem virar parte
+  // do nome pesquisado no banco.
+  const m = p.match(/\b(?:engenheir[oa]|eng|arquiteto|arquiteta|arq|responsavel(?: tecnico)?)\.?\s+([a-z][a-z .'-]{2,60}?)(?=\s+\b(?:tem|possui|acompanha|responsavel|com|que|no|na|em|das?|dos?|pel[oa]|obras?|projetos?|pavimentacoes?|licitacoes?|status|valor|maior|menor|mais|qual|percentual|porcentagem|execucao|executad[oa]?)\b|$)/i);
   if (!m) return "";
   const nome = (m[1] || "")
     .replace(/\b(?:das?|dos?|de)\s*$/i, "")
@@ -359,32 +362,47 @@ function sqlContagemPorTipo(filtroLocal = "", filtroStatus = "") {
 }
 
 function condicaoLocalDaPergunta(p) {
-  // Captura locais escritos de forma natural no fim da pergunta:
+  // Captura locais escritos de forma natural:
   // "no Centro", "na Bela Vista", "em Barra de Mamanguape" e "bairro Centro".
-  // Termos de status/quantidade sao rejeitados para nao confundir "em andamento"
-  // ou "no total" com bairro.
+  // A regra procura o ULTIMO local da frase e trata o status separadamente.
+  // Assim funcionam tanto:
+  //   "obras em andamento existem em Nova Mamanguape"
+  // quanto:
+  //   "obras em Nova Mamanguape em andamento".
   let local = "";
-  const mb = p.match(/\bbairro\s+(?:de\s+|do\s+|da\s+)?([a-z0-9][a-z0-9 -]{1,48})(?:$|\b(?:concluid|andamento|paralis|licit|projeto|homolog|valor|engenheir|empresa)\b)/i);
-  if (mb) local = mb[1].trim();
+  const statusFinal = /\b(concluidas?|concluidos?|prontas?|prontos?|finalizadas?|finalizados?|terminadas?|terminados?|em andamento|paralisadas?|paralisados?|em licitacao|homologadas?|homologados?)\b\s*$/i;
 
-  if (!local) {
-    // Primeiro remove um status no final para aceitar "no Centro concluidas".
-    const base = p.replace(/\s+\b(concluidas?|concluidos?|prontas?|prontos?|finalizadas?|finalizados?|terminadas?|terminados?|em andamento|paralisadas?|paralisados?|em licitacao|homologadas?|homologados?)\b.*$/i, "").trim();
-    const m = base.match(/\b(?:no|na|em)\s+([a-z0-9][a-z0-9 -]{1,48})$/i);
-    if (m) local = m[1].trim();
-  }
-
-  local = local
+  const limparLocal = (valor = "") => valor
+    .replace(statusFinal, "")
     .replace(/^(?:bairro|distrito)\s+(?:de\s+|do\s+|da\s+)?/i, "")
     .replace(/[^a-z0-9 -]/g, "")
     .replace(/\s+/g, " ")
     .trim();
 
-  if (!local || local.length < 2 || local.length > 48) return "";
-  if (/^(andamento|licitacao|projeto|total|geral|tudo|cidade|mamanguape|obras?)$/i.test(local)) return "";
+  // Caso explicito: "bairro Centro", "bairro de Nova Mamanguape" etc.
+  const mb = p.match(/\bbairro\s+(?:de\s+|do\s+|da\s+)?([a-z0-9][a-z0-9 -]{1,60})$/i);
+  if (mb) local = limparLocal(mb[1]);
 
-  // O texto ja foi normalizado e a limpeza acima remove apostrofos/%/_;
-  // por isso pode entrar com seguranca no literal LIKE.
+  const extrairUltimoNoNaEm = (texto) => {
+    // .* e guloso de proposito: escolhe o ULTIMO no/na/em da frase.
+    const m = texto.match(/.*\b(?:no|na|em)\s+([a-z0-9][a-z0-9 -]{1,60})$/i);
+    return m ? limparLocal(m[1]) : "";
+  };
+
+  if (!local) local = extrairUltimoNoNaEm(p);
+
+  // Se o ultimo "em" era o proprio status ("... em andamento"), removemos o
+  // status do fim e tentamos de novo para recuperar o bairro imediatamente antes.
+  if (!local || /^(andamento|execucao|licitacao|projeto|homologada?|paralisada?)$/i.test(local)) {
+    const semStatusFinal = p.replace(/\s+\b(concluidas?|concluidos?|prontas?|prontos?|finalizadas?|finalizados?|terminadas?|terminados?|em andamento|paralisadas?|paralisados?|em licitacao|homologadas?|homologados?)\b\s*$/i, "").trim();
+    local = extrairUltimoNoNaEm(semStatusFinal);
+  }
+
+  if (!local || local.length < 2 || local.length > 60) return "";
+  if (/^(andamento|execucao|licitacao|projeto|total|geral|tudo|cidade|mamanguape|obras?)$/i.test(local)) return "";
+
+  // Para perguntas por LOCAL, o bairro cadastrado e a fonte principal.
+  // O objeto entra como apoio porque algumas abas antigas so trazem o local no nome.
   return `(unaccent(COALESCE(bairro,'')) ILIKE unaccent('%${local}%') OR unaccent(objeto) ILIKE unaccent('%${local}%'))`;
 }
 
@@ -507,8 +525,15 @@ function gerarSQLRapida(pergunta, historico = []) {
   if (pedeMaiorValor || pedeMenorValor || pedeMaisAvancada || pedeMenosAvancada) {
     const campoOrdem = (pedeMaisAvancada || pedeMenosAvancada) ? "percentual_executado" : "valor_total";
     const direcao = (pedeMenorValor || pedeMenosAvancada) ? "ASC" : "DESC";
-    const whereRanking = where || (/\bobras?\b/.test(p) && !filtroEscopo
-      ? "WHERE aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO')" : "");
+    let whereRanking = where;
+
+    // Se a pessoa disse "obra", rankings nao podem incluir projeto ou processo
+    // de licitacao so porque existe outro filtro (ex.: nome do engenheiro).
+    if (/\bobras?\b/.test(p) && !filtroEscopo) {
+      const escopoFisico = "aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO')";
+      whereRanking = whereRanking ? `${whereRanking} AND ${escopoFisico}` : `WHERE ${escopoFisico}`;
+    }
+
     return `SELECT objeto, status, categoria, bairro, engenheiro, empresa, valor_total, ` +
       `valor_executado, percentual_executado, aba_origem, dados_extras FROM obras ` +
       `${whereRanking} ${whereRanking ? "AND" : "WHERE"} ${campoOrdem} IS NOT NULL ` +
@@ -868,6 +893,16 @@ async function redigir(pergunta, linhas, ehInicio = false, historico = [], sqlUs
       // So formata como R$ campos que sao REALMENTE valor monetario. Evita
       // pegar contagens (count, total de obras) - por isso exige "valor" ou
       // palavras de dinheiro, e ignora nomes com "obras"/"count"/"quantidade".
+      // Percentual de execucao vai pronto no padrao brasileiro. Isso evita a IA
+      // trocar 54,24% por 54.24% ou chamar progresso de "concluido".
+      if (/^percentual_executado$/i.test(chave) &&
+          v !== null && v !== undefined && v !== "" && !isNaN(Number(v))) {
+        junto[chave] = Number(v).toLocaleString("pt-BR", {
+          minimumFractionDigits: 2, maximumFractionDigits: 2,
+        }) + "%";
+        continue;
+      }
+
       const ehContagem = /obras|count|quantidade|qtd|numero de/i.test(chave);
       const ehValor = !ehContagem &&
         /valor|custo|investi|aditivo|orcamento|montante|r\$/i.test(chave);
@@ -980,6 +1015,12 @@ REGRAS ABSOLUTAS DE EXATIDAO (o mais importante - nunca quebre):
   algarismo, NAO arredonde, NAO recalcule. Copiar errado um valor e o pior erro.
 - Todo numero, nome ou valor na resposta TEM que aparecer no JSON. Se nao esta
   no JSON, NAO existe - nao invente.
+- BAIRRO/LOCAL, RESPONSAVEL, STATUS, VALOR e PERCENTUAL pertencem ao MESMO item
+  do JSON. NUNCA copie o bairro de uma obra para outra. Exiba o bairro exatamente
+  como veio no mesmo objeto/registro daquela obra.
+- percentual_executado significa PROGRESSO/EXECUCAO. Diga "54,24% executada" ou
+  "54,24% de execucao". So use "concluida" quando o status do proprio item for
+  realmente Concluida.
 - Para "quantas" (contagem): conte os itens do JSON ou use o COUNT que ele traz.
   O total que voce disser TEM que bater com a quantidade de itens listados. Se
   listou 6 obras, o total e 6 - nunca diga um numero diferente do que listou.
