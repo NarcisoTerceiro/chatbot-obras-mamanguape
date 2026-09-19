@@ -256,17 +256,70 @@ app.get("/sincronizar", (req, res) => {
 
 // ------------------------------------------------------------
 //  TESTAR-AGENTE: testa o agente SQL sem WhatsApp.
+//  Agora MANTEM CONTEXTO entre perguntas, para o terminal conseguir testar
+//  follow-ups do mesmo jeito que o WhatsApp (ex.: "qual o bairro dela?").
+//
 //  Chame GET /testar-agente?q=quantas obras concluidas com o cabecalho:
 //    Authorization: Bearer SEU_ADMIN_TOKEN
-//  Mostra o SQL gerado, quantas linhas voltaram, e a resposta.
-//  So para TESTE - nao mexe no bot do WhatsApp.
+//
+//  Opcional:
+//    &sessao=meu-teste  -> separa conversas de teste
+//    &reset=1           -> limpa a memoria dessa sessao
 // ------------------------------------------------------------
+const memoriaTesteAgente = new Map();
+const MEMORIA_TESTE_MS = 30 * 60 * 1000;
+
+function chaveSessaoTeste(req) {
+  const manual = (req.query.sessao || "").toString().trim();
+  if (manual) return manual.slice(0, 100);
+
+  // Para o chat-terminal antigo, que nao envia ?sessao=, usamos o IP do
+  // chamador. Assim varias perguntas seguidas da mesma maquina compartilham
+  // contexto sem alterar nada no script do terminal.
+  const encaminhado = (req.get("x-forwarded-for") || "").split(",")[0].trim();
+  return (encaminhado || req.ip || "teste-padrao").toString().slice(0, 100);
+}
+
+function lerHistoricoTeste(chave) {
+  const m = memoriaTesteAgente.get(chave);
+  if (!m) return [];
+  if (Date.now() - m.time > MEMORIA_TESTE_MS) {
+    memoriaTesteAgente.delete(chave);
+    return [];
+  }
+  return Array.isArray(m.historico) ? m.historico : [];
+}
+
+function salvarHistoricoTeste(chave, historico) {
+  memoriaTesteAgente.set(chave, {
+    historico: (historico || []).slice(-10),
+    time: Date.now(),
+  });
+}
+
 app.get("/testar-agente", async (req, res) => {
   if (!exigirAdmin(req, res)) return;
   const pergunta = req.query.q;
   if (!pergunta) return res.json({ erro: "passe a pergunta em ?q=..." });
+
+  const chave = chaveSessaoTeste(req);
+  if (req.query.reset === "1") memoriaTesteAgente.delete(chave);
+  const historico = lerHistoricoTeste(chave);
+
   try {
-    const r = await responderPergunta(pergunta);
+    const r = await responderPergunta(pergunta, historico);
+
+    salvarHistoricoTeste(chave, [
+      ...historico,
+      { role: "user", content: pergunta },
+      {
+        role: "assistant",
+        content: r.resposta,
+        sql: r.sql || null,
+        linhas: r.linhas ?? null,
+      },
+    ]);
+
     res.json({
       pergunta,
       sql_gerada: r.sql || r.sqlBloqueada || null,
