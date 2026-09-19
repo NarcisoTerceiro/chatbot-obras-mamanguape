@@ -11,10 +11,12 @@
 //  Os calculos continuam sendo feitos pelo PostgreSQL.
 // ============================================================
 
-import { queryReadOnly } from "./db.js";
+import { queryReadOnly, buscarConhecimentoAprovado, registrarConhecimentoCandidato, registrarUsoConhecimento } from "./db.js";
 import { chamarIAbruta } from "./groq.js"; // reaproveita a chamada de IA que ja existe
 
 // MODO PADRAO: IA interpreta a linguagem natural; o Node atua como guardrail.
+// O planejador usa exemplos semanticos recuperados por relevancia (estilo Vanna),
+// schema dinamico e memoria estruturada; exemplos ensinam regras, nao frases fixas.
 // As regras rapidas antigas ficam disponiveis apenas como fallback de contingencia
 // (ou se AGENTE_SQL_RAPIDA=true). Assim o chatbot nao depende de frases fixas.
 const USAR_SQL_RAPIDA_PRIMEIRO = process.env.AGENTE_SQL_RAPIDA === "true";
@@ -145,6 +147,57 @@ COMO USAR ESTES METADADOS:
     console.error("AGENTE: nao foi possivel carregar metadados do banco:", e.message);
     return "(metadados dinamicos indisponiveis; use o schema de negocio acima)";
   }
+}
+
+
+// ============================================================
+// CONTEXTO RELEVANTE (estilo RAG / Vanna)
+// ============================================================
+// O schema completo continua sendo obtido do banco, mas nao precisamos enviar
+// todos os valores distintos para a IA em toda pergunta. Este filtro conserva
+// a estrutura e so mantem exemplos de valores que tenham relacao com a frase.
+// Isso reduz tokens, latencia e a chance de bater limite do provedor.
+function tokensRelevantes(s = "") {
+  return [...new Set(normalizarTexto(s).split(/\s+/).filter((x) => x.length >= 3))];
+}
+
+function valorPareceRelevante(valor = "", pergunta = "") {
+  const q = new Set(tokensRelevantes(pergunta));
+  if (!q.size) return false;
+  const vt = tokensRelevantes(valor);
+  return vt.some((t) => q.has(t) || [...q].some((x) => x.length >= 5 && (t.startsWith(x) || x.startsWith(t))));
+}
+
+function contextoBancoCompacto(texto = "", pergunta = "") {
+  const linhas = String(texto || "").split("\n");
+  const saida = [];
+  for (const linha of linhas) {
+    if (!linha.includes("valores reais:")) {
+      // Chaves JSON podem ser numerosas. Mantemos a linha, mas com teto.
+      if (linha.startsWith("Chaves disponiveis em dados_extras:")) {
+        saida.push(linha.slice(0, 1800));
+      } else {
+        saida.push(linha);
+      }
+      continue;
+    }
+
+    const [cab, valoresBrutos = ""] = linha.split("valores reais:");
+    const nomeColuna = (cab.match(/^-\s*([^\s]+)/)?.[1] || "").toLowerCase();
+    const valores = valoresBrutos.split(/,\s+/).filter(Boolean);
+
+    // Status/origem sao pequenos e importantes para regra de negocio.
+    if (["status", "aba_origem", "categoria"].includes(nomeColuna)) {
+      saida.push(`${cab}valores reais: ${valores.slice(0, 15).join(", ")}`);
+      continue;
+    }
+
+    const relevantes = valores.filter((v) => valorPareceRelevante(v, pergunta)).slice(0, 8);
+    saida.push(relevantes.length
+      ? `${cab}valores relevantes para esta pergunta: ${relevantes.join(", ")}`
+      : `${cab}(valores omitidos por economia de tokens; descubra-os via SELECT se necessario)`);
+  }
+  return saida.join("\n").slice(0, 9000);
 }
 
 // --- SEGURANCA: valida a SQL antes de executar ---
@@ -527,6 +580,161 @@ function pistasInterpretacaoPergunta(pergunta = "") {
     // procurar em objeto ou confrontar com os metadados reais.
     termos_livres_candidatos: termosLivresCandidatos(pergunta),
   };
+}
+
+
+// ============================================================
+// EXEMPLOS SEMANTICOS DE NEGOCIO (estilo Vanna)
+// ============================================================
+// Estes exemplos NAO sao perguntas fixas e NAO geram respostas prontas.
+// Eles ensinam ao planejador como interpretar o nosso modelo de dados. Em cada
+// turno selecionamos somente os exemplos semanticamente mais proximos.
+const EXEMPLOS_SEMANTICOS = [
+  {
+    id: "obras_concluidas",
+    pergunta: "quantas obras concluidas existem e quais sao",
+    tags: "obra concluida contar listar status pavimentacao",
+    regra: "Obras genericas usam EM_ANDAMENTO + PAVIMENTAÇÃO; projeto e licitacao ficam fora. Filtrar status concluido e listar os objetos se isso foi pedido.",
+  },
+  {
+    id: "ranking_responsavel_obras",
+    pergunta: "qual responsavel tem mais obras",
+    tags: "engenheiro responsavel ranking mais quantidade obras",
+    regra: "Para ranking de obras, considerar apenas EM_ANDAMENTO + PAVIMENTAÇÃO, agrupar por engenheiro e contar no PostgreSQL. Nao somar projetos/licitações escondidos.",
+  },
+  {
+    id: "bairro_campos",
+    pergunta: "liste as obras do centro e seus recursos responsaveis valores",
+    tags: "bairro centro listar recurso engenheiro valor",
+    regra: "Se o usuario disser bairro X, filtrar pela coluna bairro. Para recurso selecionar dados_extras inteiro e normalizar depois. Trazer todos os campos explicitamente pedidos.",
+  },
+  {
+    id: "entidade_livre",
+    pergunta: "quantas UBS existem e quais seus recursos",
+    tags: "entidade sigla objeto contar recurso todas categorias",
+    regra: "Termo livre como sigla/equipamento deve ser procurado no objeto. Se o usuario nao disser obra/projeto/licitação, pesquisar todas as categorias e identificar cada tipo na resposta. Nao existe lista fixa de entidades.",
+  },
+  {
+    id: "followup_conjunto",
+    pergunta: "quais sao essas obras e quem sao os responsaveis delas",
+    tags: "followup essas delas contexto memoria conjunto anterior",
+    regra: "Referencia pronominal usa primeiro o conjunto do turno imediatamente anterior. Preserve os filtros sem ressuscitar assunto mais antigo.",
+  },
+  {
+    id: "valor_total_vs_executado",
+    pergunta: "qual o valor total e quanto ja foi executado",
+    tags: "valor total executado financeiro",
+    regra: "valor_total e valor_executado sao campos diferentes. Se ambos forem pedidos, selecionar ambos; nunca substituir um pelo outro.",
+  },
+  {
+    id: "projetos",
+    pergunta: "quais projetos concluidos existem",
+    tags: "projeto concluido listar",
+    regra: "Projeto exige aba_origem EM_PROJETO. Nao chamar projeto de obra fisica.",
+  },
+  {
+    id: "licitacoes",
+    pergunta: "quais licitacoes estao em habilitacao",
+    tags: "licitacao habilitacao status",
+    regra: "Licitacao exige aba_origem EM_LICITAÇÃO. 'Habilitacao em andamento' nao significa obra fisica em andamento.",
+  },
+  {
+    id: "multiplos_campos",
+    pergunta: "qual o recurso e o engenheiro desta obra",
+    tags: "recurso engenheiro dois campos mesma pergunta",
+    regra: "Uma mensagem pode pedir varios campos. A consulta precisa trazer todos; recurso vem de dados_extras e engenheiro da coluna engenheiro.",
+  },
+  {
+    id: "termo_desconhecido",
+    pergunta: "tem algum registro relacionado a uma entidade que nunca vimos",
+    tags: "termo desconhecido descoberta sinonimo grafia objeto",
+    regra: "Antes de dizer que nao existe, fazer descoberta dos nomes reais de objeto e tentar abreviacao, sinonimo ou grafia aproximada.",
+  },
+];
+
+function scoreExemploSemantico(exemplo, pergunta = "") {
+  const q = new Set(tokensRelevantes(pergunta));
+  const base = tokensRelevantes(`${exemplo.pergunta || ""} ${exemplo.tags || ""} ${exemplo.regra || ""}`);
+  let score = 0;
+  for (const t of base) {
+    if (q.has(t)) score += 3;
+    else if ([...q].some((x) => x.length >= 5 && (t.startsWith(x) || x.startsWith(t)))) score += 1;
+  }
+  const p = normalizarTexto(pergunta);
+  if (/\b(ela|ele|delas?|deles?|essas?|esses?|dessas?|desses?)\b/.test(p) && exemplo.id === "followup_conjunto") score += 6;
+  if (/\b(mais|menos|ranking)\b/.test(p) && exemplo.id === "ranking_responsavel_obras") score += 5;
+  if (/\b(recursos?|fonte)\b/.test(p) && exemplo.id === "bairro_campos") score += 2;
+  return score;
+}
+
+// Recupera conhecimento APROVADO do Supabase e combina com um conjunto-base
+// embutido. O banco vence o exemplo local quando ambos forem relevantes.
+// Itens CANDIDATE/REJECTED nunca entram no prompt do planejador.
+async function exemplosRelevantes(pergunta = "", limite = 4) {
+  let persistentes = [];
+  try {
+    const rows = await buscarConhecimentoAprovado({ limite: 200 });
+    persistentes = (rows || []).map((r) => ({
+      id: `db:${r.id}`,
+      dbId: Number(r.id),
+      pergunta: r.pergunta_exemplo || "",
+      tags: `${r.tags || ""} ${(r.campos_envolvidos || []).join(" ")} ${r.escopo || ""}`,
+      regra: r.regra_negocio || "",
+      sql: r.sql_exemplo || "",
+      persistente: true,
+    }));
+  } catch (e) {
+    console.warn("AGENTE: conhecimento persistente indisponivel:", e.message);
+  }
+
+  const todos = [...persistentes, ...EXEMPLOS_SEMANTICOS]
+    .map((e) => ({ ...e, score: scoreExemploSemantico(e, pergunta) }))
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return Number(Boolean(b.persistente)) - Number(Boolean(a.persistente));
+    })
+    .filter((e, i) => e.score > 0 || i === 0)
+    .slice(0, Math.max(1, limite));
+
+  const ids = todos.filter((e) => e.persistente && Number.isInteger(e.dbId)).map((e) => e.dbId);
+  const texto = todos.map((e) => {
+    const sql = e.sql ? `\nSQL de referencia APROVADA: ${String(e.sql).replace(/\s+/g, " ").slice(0, 900)}` : "";
+    return `Exemplo de interpretacao: "${e.pergunta}" -> ${e.regra}${sql}`;
+  }).join("\n");
+
+  return { texto, ids };
+}
+
+// Historico comum serve para CONTEXTO, mas nao para "ensinar" o agente.
+// So reutilizamos como exemplo de treinamento se uma mensagem tiver sido
+// explicitamente marcada como conhecimento aprovado. Isso evita aprender
+// automaticamente uma SQL que apenas executou sem erro, mas estava errada.
+function exemplosCorretosDoHistorico(historico = [], limite = 2) {
+  if (!Array.isArray(historico) || !historico.length) return "";
+  const pares = [];
+  for (let i = 0; i < historico.length - 1; i++) {
+    const u = historico[i];
+    const a = historico[i + 1];
+    const aprovado = a?.conhecimentoAprovado === true || a?.knowledgeApproved === true;
+    if (u?.role === "user" && a?.role === "assistant" && a?.sql && aprovado) {
+      pares.push({ pergunta: String(u.content || "").slice(0, 260), sql: String(a.sql).replace(/\s+/g, " ").slice(0, 700) });
+    }
+  }
+  return pares.slice(-limite).map((x) => `Pergunta aprovada: "${x.pergunta}"\nSQL aprovada usada: ${x.sql}`).join("\n");
+}
+
+function camposSolicitados(pergunta = "") {
+  const p = normalizarTexto(pergunta);
+  const campos = [];
+  if (/\b(recursos?|fontes? do recurso|fonte de recurso)\b/.test(p)) campos.push("recurso");
+  if (/\b(status|situacao)\b/.test(p)) campos.push("status");
+  if (/\b(engenheiros?|responsaveis?|arquitetos?)\b/.test(p)) campos.push("engenheiro");
+  if (/\b(empresas?|executoras?|construtoras?)\b/.test(p)) campos.push("empresa");
+  if (/\b(bairros?|localizacao|local)\b/.test(p)) campos.push("bairro");
+  if (/\b(valor total|valores totais|valor cadastrado|valores cadastrados|investido|investimento|custo)\b/.test(p)) campos.push("valor_total");
+  if (/\b(valor executado|ja executado|quanto executou|executado ate agora)\b/.test(p)) campos.push("valor_executado");
+  if (/\b(percentual|porcentagem|mais adiantad|mais avancad)\b/.test(p)) campos.push("percentual_executado");
+  return [...new Set(campos)];
 }
 
 function sqlDescobertaUniversal(pergunta = "") {
@@ -2362,10 +2570,12 @@ function serializarConsultasFerramenta(consultas = []) {
 }
 
 async function planejarPassoFerramenta(pergunta, historico, consultas = [], erroAnterior = null) {
-  const contextoBanco = await contextoAtualDoBanco();
+  const contextoBancoCompleto = await contextoAtualDoBanco();
+  const contextoBanco = contextoBancoCompacto(contextoBancoCompleto, pergunta);
   const prioritario = contextoPrioritario(historico);
   const resultados = serializarConsultasFerramenta(consultas);
   const pistas = pistasInterpretacaoPergunta(pergunta);
+  const conhecimento = await exemplosRelevantes(pergunta, 4);
 
   const prompt = `Voce e o PLANEJADOR de um assistente que conversa livremente com uma base de obras publicas.
 Voce NAO responde usando conhecimento proprio. Voce possui uma unica ferramenta: CONSULTAR_BANCO, que executa SELECT somente leitura na tabela obras.
@@ -2387,6 +2597,12 @@ ${JSON.stringify(resultados)}
 
 PISTAS DE INTERPRETACAO GERADAS PELO NODE (apoio; nao sao resposta):
 ${JSON.stringify(pistas)}
+
+EXEMPLOS SEMANTICOS RELEVANTES (ensinam regra; NAO sao frases fixas):
+${conhecimento.texto || "(nenhum exemplo aprovado relevante; use schema e regras gerais)"}
+
+EXEMPLOS CORRETOS DA PROPRIA CONVERSA (quando existirem):
+${exemplosCorretosDoHistorico(historico) || "(nenhum ainda)"}
 
 REGRAS DE COMPORTAMENTO:
 - Entenda linguagem natural, sinonimos, erros de digitacao e perguntas nunca vistas. Nao dependa de frases cadastradas.
@@ -2413,8 +2629,11 @@ Mantenha tambem um ESTADO SEMANTICO compacto do conjunto atual. Ele NAO e respos
 Formato do estado: {"escopo":"obras|obras_em_andamento|pavimentacoes|projetos|licitacoes|todos|indefinido","filtros":{"bairro":null,"engenheiro":null,"empresa":null,"status":null,"objeto":null},"conjunto":"descricao curta do recorte atual","entidade_foco":null}.
 O estado deve refletir a consulta REAL que voce esta pedindo, nao um assunto antigo.
 
+Antes da SQL, represente a intencao em um PLANO compacto. O plano serve apenas para o Node auditar coerencia; nao e mostrado ao usuario.
+Campos do plano: operacao (listar|contar|somar|media|ranking|comparar|detalhar|descobrir), entidade_livre (texto ou null), campos (array), filtros (objeto), agrupamento (texto ou null).
+
 Para consultar:
-{"acao":"consultar","objetivo":"descricao curta","sql":"SELECT ... FROM obras ...","estado":{"escopo":"...","filtros":{},"conjunto":"...","entidade_foco":null}}
+{"acao":"consultar","objetivo":"descricao curta","plano":{"operacao":"listar","entidade_livre":null,"campos":[],"filtros":{},"agrupamento":null},"sql":"SELECT ... FROM obras ...","estado":{"escopo":"...","filtros":{},"conjunto":"...","entidade_foco":null}}
 Quando os dados ja forem suficientes:
 {"acao":"finalizar","objetivo":"dados suficientes","estado":{"escopo":"...","filtros":{},"conjunto":"...","entidade_foco":null}}
 Use sem_consulta SOMENTE quando a pergunta estiver claramente fora do dominio dos dados. Qualquer termo livre pode ser um nome/trecho de objeto, bairro, pessoa, empresa ou valor textual ainda nao reconhecido; faca ao menos uma SELECT de descoberta antes de desistir.
@@ -2433,11 +2652,126 @@ ${erroAnterior ? `\nA tentativa anterior foi rejeitada/falhou: ${erroAnterior}. 
 
   const obj = extrairJSONSeguro(bruto);
   if (!obj || !obj.acao) throw new Error("planejador nao retornou JSON valido");
+  obj._knowledgeIds = conhecimento.ids || [];
+  if (obj._knowledgeIds.length) {
+    registrarUsoConhecimento(obj._knowledgeIds).catch(() => {});
+  }
   return obj;
 }
 
+
+function validarPlanoFerramenta(pergunta = "", decisao = {}, historico = []) {
+  if (!decisao || decisao.acao !== "consultar") return { ok: true };
+  const sql = String(decisao.sql || "");
+  const plano = decisao.plano && typeof decisao.plano === "object" ? decisao.plano : {};
+  const p = normalizarTexto(pergunta);
+  const pedidos = camposSolicitados(pergunta);
+
+  // Auditoria generica de campos pedidos. Nao depende de uma frase especifica.
+  const mapa = {
+    recurso: /\bdados_extras\b/i,
+    status: /\bstatus\b/i,
+    engenheiro: /\bengenheiro\b/i,
+    empresa: /\bempresa\b/i,
+    bairro: /\bbairro\b/i,
+    valor_total: /\bvalor_total\b/i,
+    valor_executado: /\bvalor_executado\b/i,
+    percentual_executado: /\bpercentual_executado\b/i,
+  };
+  for (const campo of pedidos) {
+    if (mapa[campo] && !mapa[campo].test(sql)) {
+      return { ok: false, motivo: `o plano/SQL omitiu o campo solicitado: ${campo}` };
+    }
+  }
+
+  // Se ha um termo livre real e nao e um follow-up referencial, a consulta alvo
+  // precisa procurar objeto ou assumir explicitamente que esta em descoberta.
+  const livres = termosLivresCandidatos(pergunta);
+  const referencial = /\b(ela|ele|delas?|deles?|essas?|esses?|dessas?|desses?|nessa|nesse|nela|nele)\b/.test(p);
+  const operacao = normalizarTexto(plano.operacao || "");
+  if (livres.length && !referencial && !/\bobjeto\b/i.test(sql) && operacao !== "descobrir") {
+    const estrutural = livres.every((t) => ["centro", "andamento", "concluida", "concluido"].includes(t));
+    if (!estrutural) return { ok: false, motivo: "ha termo livre na pergunta, mas a consulta nao procura nem seleciona objeto" };
+  }
+
+  // Contagem/ranking/soma devem ser calculados pelo banco quando a pergunta
+  // explicitamente exige uma metrica. Listar linhas para contar no Node continua
+  // valido quando a mesma pergunta tambem pede detalhes/campos de cada item.
+  const pedeDetalhes = /\b(quais|liste|mostre|recursos?|status|responsaveis?|engenheiros?|empresas?|bairros?|detalhes?)\b/.test(p);
+  if (/\bmais\b/.test(p) && /\b(engenheir|responsavel|arquit)/.test(p) && !/\bgroup\s+by\s+engenheiro\b/i.test(sql)) {
+    return { ok: false, motivo: "ranking de responsavel precisa agrupar por engenheiro" };
+  }
+  if (/\b(soma|somando|total investido|valor investido)\b/.test(p) && !pedeDetalhes && !/\bsum\s*\(/i.test(sql)) {
+    return { ok: false, motivo: "pedido de total financeiro sem detalhes deve usar SUM no banco" };
+  }
+
+  return { ok: true };
+}
+
+function tipoHumanoDaLinha(l = {}) {
+  const a = normalizarTexto(l.aba_origem || "");
+  if (a.includes("em projeto")) return "projeto";
+  if (a.includes("em licitacao")) return "licitacao";
+  if (a.includes("pavimentacao")) return "pavimentacao";
+  if (a.includes("em andamento")) return "obra";
+  return normalizarTexto(l.categoria || "") || "registro";
+}
+
+function formatarValorBR(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? `R$ ${n.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : null;
+}
+
+// Resposta deterministica para pedidos simples de campos. Isso economiza uma
+// segunda chamada de IA e mantem o bot funcional mesmo se Groq/Gemini estiverem
+// temporariamente indisponiveis. A logica e por CAMPOS/INTENCAO, nao por frase.
+function respostaDeterministicaFerramentas(pergunta = "", consultas = []) {
+  const p = normalizarTexto(pergunta);
+  if (/\b(maior|menor|mais adiantad|mais avancad|ranking|media|compare|comparar|diferenca|por que|porque)\b/.test(p)) return null;
+  const alvo = [...consultas].reverse().find((c) => !c.descoberta && Array.isArray(c.linhas));
+  if (!alvo || !alvo.linhas.length) return null;
+  const linhas = alvo.linhas.map(enriquecerLinhaParaIA);
+  if (!linhas.some((l) => l && l.objeto)) return null;
+
+  const campos = camposSolicitados(pergunta);
+  const pedeQuantidade = /\b(quantas|quantos|quantidade|numero de|total de)\b/.test(p);
+  const pedeLista = /\b(quais|liste|lista|mostre|mostrar|fala|fale|diga|recursos?|status|responsaveis?|engenheiros?|empresas?|bairros?)\b/.test(p);
+  if (!campos.length && !pedeQuantidade && !pedeLista) return null;
+
+  const rotulos = {
+    recurso: "Recurso",
+    status: "Status",
+    engenheiro: "Responsavel",
+    empresa: "Empresa",
+    bairro: "Bairro",
+    valor_total: "Valor total",
+    valor_executado: "Valor executado",
+    percentual_executado: "Percentual executado",
+  };
+
+  const partes = [];
+  if (pedeQuantidade) partes.push(`Encontrei *${linhas.length} registro${linhas.length === 1 ? "" : "s"}*.`);
+  if (pedeLista || campos.length) {
+    const multiplosTipos = new Set(linhas.map(tipoHumanoDaLinha)).size > 1;
+    for (const l of linhas.slice(0, 40)) {
+      const detalhes = [];
+      if (multiplosTipos) detalhes.push(`Tipo: ${tipoHumanoDaLinha(l)}`);
+      for (const campo of campos) {
+        let v = l?.[campo];
+        if (campo === "valor_total" || campo === "valor_executado") v = formatarValorBR(v);
+        if (campo === "percentual_executado" && v !== null && v !== undefined && v !== "") {
+          const n = Number(v); v = Number.isFinite(n) ? `${n.toLocaleString("pt-BR", { maximumFractionDigits: 2 })}%` : String(v);
+        }
+        if (v !== null && v !== undefined && String(v).trim() !== "") detalhes.push(`${rotulos[campo]}: ${v}`);
+      }
+      partes.push(`• *${l.objeto}*${detalhes.length ? ` — ${detalhes.join(" — ")}` : ""}`);
+    }
+  }
+  return partes.join("\n");
+}
+
 function linhasParaAuditoria(consultas = []) {
-  return consultas.flatMap((c) => Array.isArray(c.linhas) ? c.linhas : []);
+  return consultas.flatMap((c) => Array.isArray(c.linhas) ? c.linhas.map(enriquecerLinhaParaIA) : []);
 }
 
 async function redigirComFerramentas(pergunta, historico, consultas) {
@@ -2475,11 +2809,38 @@ REGRAS:
   });
 }
 
+
+function registrarCandidatoSeguro(pergunta, sql, estado, plano = {}) {
+  if (!sql || !/^\s*select\b/i.test(sql)) return;
+  const escopo = estado?.escopo || "indefinido";
+  const campos = camposSolicitados(pergunta);
+  const tags = tokensRelevantes(`${pergunta} ${escopo} ${campos.join(" ")}`).slice(0, 30).join(" ");
+  const intencao = {
+    ...(plano && typeof plano === "object" ? plano : {}),
+    estado: estado && typeof estado === "object" ? estado : {},
+  };
+
+  // CANDIDATE nao e usado pelo planejador. Precisa ser aprovado no Supabase
+  // para virar conhecimento permanente. Assim uma resposta apenas "executavel"
+  // nunca se auto-promove para verdade do sistema.
+  registrarConhecimentoCandidato({
+    pergunta_exemplo: String(pergunta || "").slice(0, 1000),
+    intencao,
+    escopo,
+    regra_negocio: "Consulta candidata gerada e validada pelos guardrails atuais. Aguardar revisao humana antes de usar como exemplo aprovado.",
+    sql_exemplo: String(sql).slice(0, 8000),
+    campos_envolvidos: campos,
+    tags,
+    origem: "agente_validado",
+  }).catch((e) => console.warn("AGENTE: nao foi possivel salvar candidato:", e.message));
+}
+
 async function responderComFerramentas(pergunta, historico = []) {
   const consultas = [];
   let erroAnterior = null;
   let sqlAnteriorNoTurno = "";
   let estadoAtual = ultimoEstadoDoHistorico(historico) || null;
+  let ultimoPlanoValido = {};
 
   for (let passo = 0; passo < MAX_PASSOS_FERRAMENTAS; passo++) {
     const decisao = await planejarPassoFerramenta(pergunta, historico, consultas, erroAnterior);
@@ -2523,6 +2884,14 @@ async function responderComFerramentas(pergunta, historico = []) {
       erroAnterior = "acao invalida; use consultar, finalizar ou sem_consulta";
       continue;
     }
+
+    const planoCheck = validarPlanoFerramenta(pergunta, decisao, historico);
+    if (!planoCheck.ok) {
+      erroAnterior = `plano rejeitado pelo auditor: ${planoCheck.motivo}`;
+      console.warn("AGENTE/FERRAMENTAS:", erroAnterior);
+      continue;
+    }
+    ultimoPlanoValido = decisao.plano && typeof decisao.plano === "object" ? decisao.plano : {};
 
     let sql = decisao.sql.replace(/```sql/gi, "").replace(/```/g, "").replace(/;$/, "").trim();
     const m = sql.match(/select[\s\S]+/i);
@@ -2580,6 +2949,24 @@ async function responderComFerramentas(pergunta, historico = []) {
     throw new Error(erroAnterior || "nenhuma consulta valida foi executada");
   }
 
+  const direta = respostaDeterministicaFerramentas(pergunta, consultas);
+  if (direta) {
+    const ultimaDireta = [...consultas].reverse().find((c) => !c.descoberta) || consultas[consultas.length - 1];
+    if (!estadoAtual || typeof estadoAtual !== "object") {
+      estadoAtual = estadoDaUltimaConsulta([{ role: "assistant", sql: ultimaDireta.sql }]);
+    }
+    registrarCandidatoSeguro(pergunta, ultimaDireta.sql, estadoAtual, ultimoPlanoValido);
+    return {
+      resposta: direta,
+      sql: ultimaDireta.sql,
+      linhas: ultimaDireta.linhas.length,
+      consultas: consultas.map((c) => c.sql),
+      estado: estadoAtual,
+      respostaDeterministica: true,
+      modoAgente: "ferramentas_controladas",
+    };
+  }
+
   let resposta = await redigirComFerramentas(pergunta, historico, consultas);
   const linhasAuditadas = linhasParaAuditoria(consultas);
   let auditoria = auditarRespostaNumerica(resposta, linhasAuditadas);
@@ -2612,6 +2999,7 @@ async function responderComFerramentas(pergunta, historico = []) {
     };
   }
 
+  registrarCandidatoSeguro(pergunta, ultima.sql, estadoAtual, ultimoPlanoValido);
   return {
     resposta,
     sql: ultima.sql,

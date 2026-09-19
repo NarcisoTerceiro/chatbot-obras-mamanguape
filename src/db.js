@@ -7,6 +7,7 @@
 // ============================================================
 
 import pg from "pg";
+import { createHash } from "node:crypto";
 
 const { Pool } = pg;
 
@@ -108,6 +109,121 @@ export async function withAdminTransaction(executar) {
 // Supabase; esta camada funciona como uma segunda barreira.
 export async function queryReadOnly(sql, params = []) {
   return withTransaction((client) => client.query(sql, params), { readOnly: true });
+}
+
+
+// ============================================================
+//  CONHECIMENTO PERMANENTE DO AGENTE
+// ============================================================
+// A tabela agent_knowledge NAO guarda respostas prontas. Ela guarda exemplos
+// de interpretacao/SQL e regras do negocio. Somente itens APPROVED sao usados
+// para orientar a IA. Consultas novas entram como CANDIDATE e nunca viram
+// conhecimento aprovado automaticamente.
+
+let cacheConhecimentoAgente = { quando: 0, linhas: [] };
+const CACHE_CONHECIMENTO_MS = 60 * 1000;
+
+function tabelaConhecimentoAusente(e) {
+  return e?.code === "42P01" || /agent_knowledge.*does not exist/i.test(e?.message || "");
+}
+
+export async function buscarConhecimentoAprovado({ limite = 200, ignorarCache = false } = {}) {
+  const agora = Date.now();
+  if (!ignorarCache && cacheConhecimentoAgente.linhas.length && agora - cacheConhecimentoAgente.quando < CACHE_CONHECIMENTO_MS) {
+    return cacheConhecimentoAgente.linhas.slice(0, limite);
+  }
+
+  try {
+    const r = await queryReadOnly(
+      `SELECT id, pergunta_exemplo, intencao, escopo, regra_negocio, sql_exemplo,
+              campos_envolvidos, tags, origem, vezes_utilizado
+         FROM public.agent_knowledge
+        WHERE status_aprovacao = 'approved'
+        ORDER BY vezes_utilizado DESC, id ASC
+        LIMIT $1`,
+      [Math.max(1, Math.min(Number(limite) || 200, 500))]
+    );
+    cacheConhecimentoAgente = { quando: agora, linhas: r.rows || [] };
+    return cacheConhecimentoAgente.linhas;
+  } catch (e) {
+    if (tabelaConhecimentoAusente(e)) {
+      // Permite publicar os arquivos antes de rodar a migracao SQL. O agente
+      // continua com seus exemplos-base embutidos e nao para o atendimento.
+      return [];
+    }
+    console.warn("DB: falha ao ler agent_knowledge:", e.message);
+    return [];
+  }
+}
+
+function fingerprintConhecimento({ pergunta_exemplo = "", sql_exemplo = "", escopo = "" } = {}) {
+  return createHash("sha256")
+    .update(`${String(pergunta_exemplo).trim().toLowerCase()}|${String(escopo).trim().toLowerCase()}|${String(sql_exemplo).replace(/\\s+/g, " ").trim().toLowerCase()}`)
+    .digest("hex");
+}
+
+export async function registrarConhecimentoCandidato({
+  pergunta_exemplo,
+  intencao = {},
+  escopo = "indefinido",
+  regra_negocio = "Consulta candidata gerada pelo agente; aguarda aprovacao humana.",
+  sql_exemplo = null,
+  campos_envolvidos = [],
+  tags = "",
+  origem = "agente",
+} = {}) {
+  if (!adminPool || !pergunta_exemplo || !sql_exemplo) return { ok: false, motivo: "admin_indisponivel" };
+
+  const fingerprint = fingerprintConhecimento({ pergunta_exemplo, sql_exemplo, escopo });
+  try {
+    const r = await adminPool.query(
+      `INSERT INTO public.agent_knowledge
+        (pergunta_exemplo, intencao, escopo, regra_negocio, sql_exemplo,
+         campos_envolvidos, tags, status_aprovacao, origem, fingerprint)
+       VALUES ($1, $2::jsonb, $3, $4, $5, $6::text[], $7, 'candidate', $8, $9)
+       ON CONFLICT (fingerprint) DO UPDATE SET
+         updated_at = now(),
+         intencao = EXCLUDED.intencao,
+         campos_envolvidos = EXCLUDED.campos_envolvidos,
+         tags = EXCLUDED.tags
+       RETURNING id, status_aprovacao`,
+      [
+        String(pergunta_exemplo).slice(0, 1000),
+        JSON.stringify(intencao && typeof intencao === "object" ? intencao : {}),
+        String(escopo || "indefinido").slice(0, 80),
+        String(regra_negocio || "").slice(0, 2000),
+        String(sql_exemplo).slice(0, 8000),
+        Array.isArray(campos_envolvidos) ? campos_envolvidos.map(String).slice(0, 30) : [],
+        String(tags || "").slice(0, 1000),
+        String(origem || "agente").slice(0, 80),
+        fingerprint,
+      ]
+    );
+    return { ok: true, ...(r.rows?.[0] || {}) };
+  } catch (e) {
+    if (tabelaConhecimentoAusente(e)) return { ok: false, motivo: "tabela_ausente" };
+    console.warn("DB: falha ao registrar conhecimento candidato:", e.message);
+    return { ok: false, motivo: e.message };
+  }
+}
+
+export async function registrarUsoConhecimento(ids = []) {
+  if (!adminPool || !Array.isArray(ids) || !ids.length) return;
+  const unicos = [...new Set(ids.map(Number).filter(Number.isInteger))].slice(0, 20);
+  if (!unicos.length) return;
+  try {
+    await adminPool.query(
+      `UPDATE public.agent_knowledge
+          SET vezes_utilizado = vezes_utilizado + 1,
+              updated_at = now()
+        WHERE status_aprovacao = 'approved' AND id = ANY($1::bigint[])`,
+      [unicos]
+    );
+  } catch (e) {
+    if (!tabelaConhecimentoAusente(e)) {
+      console.warn("DB: falha ao registrar uso de conhecimento:", e.message);
+    }
+  }
 }
 
 export { pool };
