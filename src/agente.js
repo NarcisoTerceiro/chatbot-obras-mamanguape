@@ -732,7 +732,7 @@ function camposSolicitados(pergunta = "") {
   if (/\b(engenheiros?|responsaveis?|arquitetos?)\b/.test(p)) campos.push("engenheiro");
   if (/\b(empresas?|executoras?|construtoras?)\b/.test(p)) campos.push("empresa");
   if (/\b(bairros?|localizacao|local)\b/.test(p)) campos.push("bairro");
-  if (/\b(valor total|valores totais|valor cadastrado|valores cadastrados|investido|investimento|custo)\b/.test(p)) campos.push("valor_total");
+  if (/\b(valor total|valores totais|valor cadastrado|valores cadastrados|investid\w*|investimento|investimentos|custo|custos)\b/.test(p)) campos.push("valor_total");
   if (/\b(valor executado|ja executado|quanto executou|executado ate agora)\b/.test(p)) campos.push("valor_executado");
   if (/\b(percentual|porcentagem|mais adiantad|mais avancad)\b/.test(p)) campos.push("percentual_executado");
   return [...new Set(campos)];
@@ -1632,13 +1632,15 @@ function montarResumoSomaDetalhada(pergunta, linhas) {
   if (!Array.isArray(linhas) || linhas.length === 0) return null;
 
   const p = normalizarTexto(pergunta);
-  const pedeExecutado = /\b(valor executado|quanto executou|ja executado|executad[oa])\b/.test(p);
-  const pedeValor = pedeExecutado || /\b(valor|valores|custos?|custou|investid|investimento|quanto foi|orcamento)\b/.test(p);
+  const pedeExecutado = /\b(valor executado|quanto executou|ja executado|executad\w*)\b/.test(p);
+  const pedeValor = pedeExecutado || /\b(valor|valores|custos?|custou|investid\w*|investimentos?|quanto foi|orcamentos?)\b/.test(p);
   const consultaTemContextoDeComposicao = linhas.some((l) => l &&
     Object.prototype.hasOwnProperty.call(l, "aba_origem") &&
     Object.prototype.hasOwnProperty.call(l, "categoria"));
+  const pedidoPluralDeValores = /\bvalores\b/.test(p) && /\b(obras?|projetos?|pavimentacoes?|licitacoes?|registros?)\b/.test(p);
   const pedeSoma = pedeValor && (
-    /\b(total|soma|somando|ao todo|quanto foi investido|quanto custou tudo|investid|investimento)\b/.test(p) ||
+    /\b(total|soma|somando|ao todo|quanto foi investid\w*|quanto custou tudo|investid\w*|investimentos?)\b/.test(p) ||
+    pedidoPluralDeValores ||
     (consultaTemContextoDeComposicao && /\bqual(?: e| o)? valor\b/.test(p))
   );
   if (!pedeSoma) return null;
@@ -2475,6 +2477,34 @@ function auditarCamposTextuaisSolicitados(pergunta, resposta, linhas) {
     }
   }
 
+  const exigirCampo = (regexPergunta, campo, rotulo) => {
+    if (!regexPergunta.test(p)) return null;
+    const valores = [...new Set(enriquecidas
+      .map((l) => l?.[campo])
+      .filter((v) => v !== null && v !== undefined && String(v).trim() !== "")
+      .map((v) => String(v).trim()))];
+    if (!valores.length) return null;
+    if (campo === "valor_total" || campo === "valor_executado") {
+      if (!/r\$\s*\d/i.test(resposta || "")) return `a resposta omitiu ${rotulo} pedido pelo usuario`;
+      return null;
+    }
+    const citou = valores.some((v) => txt.includes(normalizarTexto(v)));
+    return citou ? null : `a resposta omitiu ${rotulo} pedido pelo usuario`;
+  };
+
+  const checks = [
+    [/\b(valor total|valores totais|valor cadastrado|valores cadastrados|investid\w*|investimentos?|custos?)\b/, "valor_total", "o valor total"],
+    [/\b(valor executado|valores executados|ja executado|quanto executou|executad\w*)\b/, "valor_executado", "o valor executado"],
+    [/\b(status|situacao)\b/, "status", "o status"],
+    [/\b(engenheiros?|responsaveis?|arquitetos?)\b/, "engenheiro", "o responsavel tecnico"],
+    [/\b(empresas?|executoras?|construtoras?)\b/, "empresa", "a empresa"],
+    [/\b(bairros?|localizacao)\b/, "bairro", "o bairro"],
+  ];
+  for (const [rx, campo, rotulo] of checks) {
+    const motivo = exigirCampo(rx, campo, rotulo);
+    if (motivo) return { ok: false, motivo };
+  }
+
   return { ok: true };
 }
 
@@ -2702,7 +2732,7 @@ function validarPlanoFerramenta(pergunta = "", decisao = {}, historico = []) {
   if (/\bmais\b/.test(p) && /\b(engenheir|responsavel|arquit)/.test(p) && !/\bgroup\s+by\s+engenheiro\b/i.test(sql)) {
     return { ok: false, motivo: "ranking de responsavel precisa agrupar por engenheiro" };
   }
-  if (/\b(soma|somando|total investido|valor investido)\b/.test(p) && !pedeDetalhes && !/\bsum\s*\(/i.test(sql)) {
+  if (/\b(soma|somando|total investid\w*|valor investid\w*)\b/.test(p) && !pedeDetalhes && !/\bsum\s*\(/i.test(sql)) {
     return { ok: false, motivo: "pedido de total financeiro sem detalhes deve usar SUM no banco" };
   }
 
@@ -2738,6 +2768,24 @@ function respostaDeterministicaFerramentas(pergunta = "", consultas = []) {
   const pedeQuantidade = /\b(quantas|quantos|quantidade|numero de|total de)\b/.test(p);
   const pedeLista = /\b(quais|liste|lista|mostre|mostrar|fala|fale|diga|recursos?|status|responsaveis?|engenheiros?|empresas?|bairros?)\b/.test(p);
   if (!campos.length && !pedeQuantidade && !pedeLista) return null;
+
+  // Perguntas financeiras sobre um CONJUNTO precisam priorizar os valores,
+  // mesmo quando a consulta tambem trouxe engenheiro/empresa para contexto.
+  // Ex.: "quais os valores investidos nas obras concluidas?" -> lista os
+  // valores e apresenta o total, em vez de cair num resumo de responsaveis.
+  const resumoFinanceiro = montarResumoSomaDetalhada(pergunta, linhas);
+  if (resumoFinanceiro) {
+    const rotulo = resumoFinanceiro.campo === "valor_executado" ? "Total executado" : "Valor total cadastrado";
+    const itens = resumoFinanceiro.comValor.slice(0, 40).map((i) =>
+      `• *${i.objeto}* — ${formatarValorBR(i.valor)}`
+    );
+    let out = `${rotulo}: *${formatarValorBR(resumoFinanceiro.total)}*.`;
+    if (itens.length) out += `\n\n${itens.join("\n")}`;
+    if (resumoFinanceiro.semValor.length) {
+      out += `\n\n${resumoFinanceiro.semValor.length} registro${resumoFinanceiro.semValor.length === 1 ? " ficou" : "s ficaram"} fora da soma por nao ter valor cadastrado.`;
+    }
+    return out;
+  }
 
   const rotulos = {
     recurso: "Recurso",
@@ -3093,19 +3141,30 @@ async function responderComFerramentas(pergunta, historico = []) {
   const direta = respostaDeterministicaFerramentas(pergunta, consultas);
   if (direta) {
     const ultimaDireta = [...consultas].reverse().find((c) => !c.descoberta) || consultas[consultas.length - 1];
-    if (!estadoAtual || typeof estadoAtual !== "object") {
-      estadoAtual = estadoDaUltimaConsulta([{ role: "assistant", sql: ultimaDireta.sql }]);
+    const linhasDiretasAuditadas = linhasParaAuditoria(consultas);
+    const auditNumDireta = auditarRespostaNumerica(direta, linhasDiretasAuditadas);
+    const auditTxtDireta = auditarCamposTextuaisSolicitados(pergunta, direta, linhasDiretasAuditadas);
+    if (auditNumDireta.ok && auditTxtDireta.ok) {
+      if (!estadoAtual || typeof estadoAtual !== "object") {
+        estadoAtual = estadoDaUltimaConsulta([{ role: "assistant", sql: ultimaDireta.sql }]);
+      }
+      // So um padrao cuja RESPOSTA tambem passou pelas auditorias pode virar
+      // candidato. SQL que rodou mas respondeu a intencao errada nao e aprendida.
+      registrarCandidatoSeguro(pergunta, ultimaDireta.sql, estadoAtual, ultimoPlanoValido);
+      return {
+        resposta: direta,
+        sql: ultimaDireta.sql,
+        linhas: ultimaDireta.linhas.length,
+        consultas: consultas.map((c) => c.sql),
+        estado: estadoAtual,
+        respostaDeterministica: true,
+        modoAgente: "ferramentas_controladas",
+      };
     }
-    registrarCandidatoSeguro(pergunta, ultimaDireta.sql, estadoAtual, ultimoPlanoValido);
-    return {
-      resposta: direta,
-      sql: ultimaDireta.sql,
-      linhas: ultimaDireta.linhas.length,
-      consultas: consultas.map((c) => c.sql),
-      estado: estadoAtual,
-      respostaDeterministica: true,
-      modoAgente: "ferramentas_controladas",
-    };
+    console.warn("AGENTE/FERRAMENTAS: resposta deterministica rejeitada -",
+      !auditNumDireta.ok ? auditNumDireta.motivo : auditTxtDireta.motivo);
+    // Continua para a redacao por IA; se ela falhar, o fallback local tambem
+    // respeita a intencao. Nenhum conhecimento e salvo ate a resposta passar.
   }
 
   let resposta = await redigirComFerramentas(pergunta, historico, consultas);
