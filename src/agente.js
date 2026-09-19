@@ -235,13 +235,21 @@ export function sqlSegura(sql) {
 // Garante um LIMIT para nao trazer dados demais.
 export function comLimite(sql, max = 200) {
   const teto = Math.max(1, Math.min(Number(max) || 200, 200));
-  // Remove apenas LIMIT/OFFSET do nivel externo, caso a IA tenha definido um
-  // valor alto. Em seguida aplica o teto controlado pelo servidor.
-  const s = sql
-    .trim()
-    .replace(/;$/, "")
-    .replace(/\s+limit\s+(?:all|\d+)(?:\s+offset\s+\d+)?\s*$/i, "")
-    .trim();
+  const s = sql.trim().replace(/;$/, "").trim();
+
+  // PRESERVA limites menores definidos pela consulta. Antes, LIMIT 1 era
+  // removido e trocado por LIMIT 200; por isso uma pergunta de "maior percentual"
+  // executava varias linhas mesmo exibindo SQL com LIMIT 1. Isso tambem quebrava
+  // paginacao LIMIT 10 OFFSET N.
+  const m = s.match(/\s+limit\s+(all|\d+)(?:\s+offset\s+(\d+))?\s*$/i);
+  if (m) {
+    const base = s.slice(0, m.index).trim();
+    const solicitado = m[1].toLowerCase() === "all" ? teto : Math.max(1, Number(m[1]));
+    const limite = Math.min(solicitado, teto);
+    const offset = m[2] ? ` OFFSET ${Number(m[2])}` : "";
+    return `${base} LIMIT ${limite}${offset}`;
+  }
+
   return `${s} LIMIT ${teto}`;
 }
 
@@ -332,16 +340,21 @@ function pareceItemEspecifico(p) {
 // "obras do engenheiro Ricardo Sousa". O filtro e dinamico: nenhum nome fica
 // fixo no codigo.
 function condicaoEngenheiroDaPergunta(p) {
-  // Captura somente o NOME do profissional. Palavras que descrevem a pergunta
-  // ("tem", "maior percentual", "com", "obras" etc.) nao podem virar parte
-  // do nome pesquisado no banco.
-  const m = p.match(/\b(?:engenheir[oa]|eng|arquiteto|arquiteta|arq|responsavel(?: tecnico)?)\.?\s+([a-z][a-z .'-]{2,60}?)(?=\s+\b(?:tem|possui|acompanha|responsavel|com|que|no|na|em|das?|dos?|pel[oa]|obras?|projetos?|pavimentacoes?|licitacoes?|status|valor|maior|menor|mais|qual|percentual|porcentagem|execucao|executad[oa]?)\b|$)/i);
+  // Captura somente o NOME do profissional. Primeiro pega o texto depois do
+  // titulo (Eng./Arq./responsavel) e depois corta assim que aparece uma palavra
+  // que pertence a PERGUNTA, nao ao nome. Isso evita filtros errados como
+  // "%paulo nunes estao%" ou "%paulo nunes tem o maior percentual%".
+  const m = p.match(/\b(?:engenheir[oa]|eng|arquiteto|arquiteta|arq|responsavel(?: tecnico)?)\.?\s+([a-z][a-z .'-]{2,100})/i);
   if (!m) return "";
-  const nome = (m[1] || "")
+
+  let nome = (m[1] || "").trim();
+  nome = nome.split(/\s+\b(?:tem|possui|acompanha|acompanham|esta|estao|estava|estavam|fica|ficam|sao|com|que|no|na|em|das?|dos?|pel[oa]|obras?|projetos?|pavimentacoes?|licitacoes?|status|situacao|valor|maior|menor|mais|qual|percentual|porcentagem|execucao|executad[oa]s?|concluid[oa]s?|andamento)\b/i)[0];
+  nome = nome
     .replace(/\b(?:das?|dos?|de)\s*$/i, "")
     .replace(/[^a-z .'-]/gi, "")
     .replace(/\s+/g, " ")
     .trim();
+
   if (!nome || nome.length < 3) return "";
   const seguro = nome.replace(/'/g, "''");
   return `unaccent(COALESCE(engenheiro,'')) ILIKE unaccent('%${seguro}%')`;
@@ -399,7 +412,12 @@ function condicaoLocalDaPergunta(p) {
   }
 
   if (!local || local.length < 2 || local.length > 60) return "";
-  if (/^(andamento|execucao|licitacao|projeto|total|geral|tudo|cidade|mamanguape|obras?)$/i.test(local)) return "";
+
+  // Palavras da propria pergunta NAO sao local. Sem esta barreira, frases como
+  // "em andamento com obra, bairro, valor e percentual" podiam virar um bairro
+  // falso, e follow-ups como "qual o bairro dela?" tentavam procurar "dela".
+  const naoEhLocal = /\b(andamento|execucao|executad[oa]s?|licitacao|projeto|total|geral|tudo|cidade|obras?|obra|valor|valores|percentual|porcentagem|engenheir[oa]?|arquiteto|arquiteta|responsavel|responsaveis|empresa|empresas|status|situacao|com|dela|dele|delas|deles|nela|nele|essa|esse|essas|esses|ela|ele)\b/i;
+  if (naoEhLocal.test(local)) return "";
 
   // Para perguntas por LOCAL, o bairro cadastrado e a fonte principal.
   // O objeto entra como apoio porque algumas abas antigas so trazem o local no nome.
@@ -438,6 +456,21 @@ function gerarSQLRapida(pergunta, historico = []) {
     /\b(engenheiros?|engenheiras?|responsaveis?|empresas?|executoras?|valor|valores|custo|bairro|status|situacao|nomes?)\b/.test(p) ||
     perguntaCurtaLista
   );
+
+  // Follow-up de UM item que acabou de ser escolhido por ranking (maior valor,
+  // maior percentual etc.). Reaproveitamos a MESMA ordenacao + LIMIT 1 da SQL
+  // anterior. Assim "qual o bairro dela?" continua apontando exatamente para a
+  // obra vencedora, em vez de abrir novamente todas as obras do responsavel.
+  const referenciaMesmoItem = /\b(dela|dele|nela|nele|essa|esse|esta obra|este projeto|esse item|essa obra)\b/.test(p);
+  const pedeCampoMesmoItem = /\b(bairro|local|valor|percentual|porcentagem|status|situacao|empresa|engenheir|arquit|responsavel|contrato|convenio|recurso|executad)\b/.test(p);
+  if (referenciaMesmoItem && pedeCampoMesmoItem && sqlAnterior &&
+      /\border\s+by\b/i.test(sqlAnterior) && /\blimit\s+1\b/i.test(sqlAnterior)) {
+    const cauda = sqlAnterior.match(/\bFROM\s+obras\b[\s\S]*$/i)?.[0] || "";
+    if (cauda) {
+      return `SELECT objeto, status, categoria, bairro, engenheiro, empresa, valor_total, ` +
+        `valor_executado, percentual_executado, aba_origem, dados_extras ${cauda}`;
+    }
+  }
 
   // Se a pessoa nomeou um item concreto e pediu um campo dele, deixamos a IA
   // montar a busca exata pelo objeto. Isso evita o erro de interpretar apenas o
@@ -494,7 +527,7 @@ function gerarSQLRapida(pergunta, historico = []) {
   const usarAnterior = !!condAnterior && (referenciaAnterior || curtaDeAcompanhamento) && !temFiltroNovo;
   const where = condicoes.length ? `WHERE ${condicoes.join(" AND ")}` : "";
 
-  const pedeEng = /\b(engenheiros?|engenheiras?|arquitetos?|arquitetas?|responsavel|responsaveis|responsavel tecnico|responsaveis tecnicos)\b/.test(p);
+  const pedeEng = /\b(engenheiros?|engenheiras?|eng|arquitetos?|arquitetas?|arq|responsavel|responsaveis|responsavel tecnico|responsaveis tecnicos)\b/.test(p);
   const pedeEmpresa = /\b(empresas?|executoras?|construtoras?)\b/.test(p);
   const pedeBairro = /\bbairros?\b/.test(p);
   const pedeStatus = /\b(status|situacao)\b/.test(p);
@@ -829,7 +862,7 @@ function montarResumoSomaDetalhada(pergunta, linhas) {
 // profissional errado.
 function montarResumoEngenheiros(pergunta, linhas) {
   const p = normalizarTexto(pergunta);
-  if (!/\b(engenheiros?|engenheiras?|responsavel tecnico|responsaveis tecnicos)\b/.test(p)) return null;
+  if (!/\b(engenheiros?|engenheiras?|eng|arquitetos?|arquitetas?|arq|responsavel|responsaveis|responsavel tecnico|responsaveis tecnicos)\b/.test(p)) return null;
   if (!Array.isArray(linhas) || linhas.length === 0) return null;
   if (!linhas.some((l) => l && Object.prototype.hasOwnProperty.call(l, "engenheiro"))) return null;
 
@@ -875,6 +908,53 @@ function montarResumoEngenheiros(pergunta, linhas) {
     sem_responsavel: semResponsavel,
     responsaveis,
   };
+}
+
+// Resposta DETERMINISTICA para perguntas de engenheiro/responsavel.
+// A IA nao reorganiza esses dados: cada bairro, valor e percentual fica preso
+// ao mesmo registro retornado pelo banco. Isso elimina trocas como atribuir
+// "Centro" a uma obra cujo bairro real e "Nova Mamanguape".
+function redigirResumoEngenheirosDeterministico(resumo) {
+  if (!resumo || !Array.isArray(resumo.responsaveis) || resumo.responsaveis.length === 0) return null;
+
+  const plural = (n, singular, pluralTxt) => `${n} ${n === 1 ? singular : pluralTxt}`;
+  const total = resumo.total_registros || 0;
+  const tiposTodos = resumo.responsaveis.flatMap((r) => r.itens || []).map((i) => i.tipo);
+  const soObras = tiposTodos.length > 0 && tiposTodos.every((t) => t === "obra");
+  const labelTotal = soObras ? plural(total, "obra", "obras") : plural(total, "registro", "registros");
+
+  const linhas = [];
+  if (resumo.total_responsaveis === 1) {
+    const r = resumo.responsaveis[0];
+    linhas.push(`*${r.nome}* acompanha *${labelTotal}* neste recorte.`);
+  } else {
+    linhas.push(`São *${plural(resumo.total_responsaveis, "responsável técnico", "responsáveis técnicos")}* acompanhando *${labelTotal}* neste recorte.`);
+  }
+
+  linhas.push("", "*Detalhes por responsável*");
+  for (const r of resumo.responsaveis) {
+    const tipos = (r.itens || []).map((i) => i.tipo);
+    const somenteObras = tipos.length > 0 && tipos.every((t) => t === "obra");
+    const qtdLabel = somenteObras
+      ? plural(r.quantidade_registros, "obra", "obras")
+      : plural(r.quantidade_registros, "registro", "registros");
+    linhas.push("", `• *${r.nome}* — ${qtdLabel}`);
+
+    for (const i of (r.itens || [])) {
+      const partes = [i.objeto];
+      if (i.bairro) partes.push(`bairro ${i.bairro}`);
+      if (i.valor_total && i.valor_total !== "valor nao informado") partes.push(i.valor_total);
+      if (i.percentual_executado) partes.push(`${i.percentual_executado} executada`);
+      if (i.status) partes.push(i.status);
+      linhas.push(`  • ${partes.join(" — ")}`);
+    }
+    if (r.itens_omitidos > 0) linhas.push(`  • +${r.itens_omitidos} item(ns) não exibido(s)`);
+  }
+
+  if (resumo.sem_responsavel > 0) {
+    linhas.push("", `${plural(resumo.sem_responsavel, "registro", "registros")} sem responsável técnico informado.`);
+  }
+  return linhas.join("\n");
 }
 
 // --- CHAMADA 2: resultado -> resposta natural ---
@@ -924,6 +1004,14 @@ async function redigir(pergunta, linhas, ehInicio = false, historico = [], sqlUs
   const resumoContagem = montarResumoContagemPorTipo(pergunta, linhas);
   const resumoSoma = montarResumoSomaDetalhada(pergunta, linhas);
   const resumoEngenheiros = montarResumoEngenheiros(pergunta, linhasLimpas);
+
+  // Para responsaveis/engenheiros, a resposta sai direto do Node para preservar
+  // associacao exata entre obra, bairro, valor, percentual e profissional.
+  if (resumoEngenheiros) {
+    const pronta = redigirResumoEngenheirosDeterministico(resumoEngenheiros);
+    if (pronta) return pronta;
+  }
+
   const moedaResumo = (v) => "R$ " + Number(v).toLocaleString("pt-BR", {
     minimumFractionDigits: 2, maximumFractionDigits: 2,
   });
