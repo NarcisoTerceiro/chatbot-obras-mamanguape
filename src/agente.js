@@ -332,7 +332,10 @@ function ehPerguntaGenericaObrasEmAndamento(p) {
 // final do nome (ex.: "Rua do Cruzeiro - Centro" nao significa "todas do Centro").
 function pareceItemEspecifico(p) {
   const temEntidade = /\b(rua|avenida|creche|escola|mercado|ubs|posto|ponte|praca|quadra|hospital|campo|drenagem|muro|iluminacao|terminal|calcadao|estadio|biblioteca|galpao|passarela|ciclovia|orla|estacao|cemiterio)\b/.test(p);
-  const pedeCampo = /\b(valor|quanto|responsavel|engenheir|arquit|empresa|contrato|convenio|recurso|status|situacao|percentual|executad|prazo|data|detalh|informac)\b/.test(p);
+  // Aceita singular/plural e palavras completas. Antes "engenheiro" nao casava
+  // com o trecho "engenheir", fazendo perguntas duplas como
+  // "recurso e engenheiro da UBS X" cair no filtro errado de profissional.
+  const pedeCampo = /\b(valores?|quanto|responsaveis?|engenheir[oa]s?|arquit(?:eto|eta|etos|etas)?|empresas?|contratos?|convenios?|recursos?|status|situacao|percentual|porcentagem|executad[oa]s?|prazo|datas?|detalh\w*|informac\w*)\b/.test(p);
   return temEntidade && pedeCampo;
 }
 
@@ -348,6 +351,14 @@ function condicaoEngenheiroDaPergunta(p) {
   if (!m) return "";
 
   let nome = (m[1] || "").trim();
+
+  // "engenheiro" tambem pode ser o CAMPO que o cidadao quer saber, e nao o
+  // inicio do nome de um profissional. Ex.: "recurso e o engenheiro da Reforma
+  // da UBS do Cristo Rei". Nesses casos nao criamos filtro de engenheiro.
+  if (/^(?:(?:da|do|de)\s+)?(?:reforma|ampliacao|construcao|pavimentacao|obra|projeto|rua|avenida|ubs|creche|escola|mercado|posto|praca|quadra|hospital|drenagem|muro|iluminacao|terminal|calcadao|ciclovia|orla)\b/i.test(nome)) {
+    return "";
+  }
+
   nome = nome.split(/\s+\b(?:tem|possui|acompanha|acompanham|esta|estao|estava|estavam|fica|ficam|sao|com|que|no|na|em|das?|dos?|pel[oa]|obras?|projetos?|pavimentacoes?|licitacoes?|status|situacao|valor|maior|menor|mais|qual|percentual|porcentagem|execucao|executad[oa]s?|concluid[oa]s?|andamento)\b/i)[0];
   nome = nome
     .replace(/\b(?:das?|dos?|de)\s*$/i, "")
@@ -383,6 +394,7 @@ function condicaoLocalDaPergunta(p) {
   // quanto:
   //   "obras em Nova Mamanguape em andamento".
   let local = "";
+  let bairroExplicito = false;
   const statusFinal = /\b(concluidas?|concluidos?|prontas?|prontos?|finalizadas?|finalizados?|terminadas?|terminados?|em andamento|paralisadas?|paralisados?|em licitacao|homologadas?|homologados?)\b\s*$/i;
 
   const limparLocal = (valor = "") => valor
@@ -394,7 +406,10 @@ function condicaoLocalDaPergunta(p) {
 
   // Caso explicito: "bairro Centro", "bairro de Nova Mamanguape" etc.
   const mb = p.match(/\bbairro\s+(?:de\s+|do\s+|da\s+)?([a-z0-9][a-z0-9 -]{1,60})$/i);
-  if (mb) local = limparLocal(mb[1]);
+  if (mb) {
+    local = limparLocal(mb[1]);
+    bairroExplicito = true;
+  }
 
   const extrairUltimoNoNaEm = (texto) => {
     // .* e guloso de proposito: escolhe o ULTIMO no/na/em da frase.
@@ -419,8 +434,15 @@ function condicaoLocalDaPergunta(p) {
   const naoEhLocal = /\b(andamento|execucao|executad[oa]s?|licitacao|projeto|total|geral|tudo|cidade|obras?|obra|valor|valores|percentual|porcentagem|engenheir[oa]?|arquiteto|arquiteta|responsavel|responsaveis|empresa|empresas|status|situacao|com|dela|dele|delas|deles|nela|nele|essa|esse|essas|esses|ela|ele)\b/i;
   if (naoEhLocal.test(local)) return "";
 
-  // Para perguntas por LOCAL, o bairro cadastrado e a fonte principal.
-  // O objeto entra como apoio porque algumas abas antigas so trazem o local no nome.
+  // Se o cidadao escreveu explicitamente "bairro X", respeitamos exatamente
+  // o campo BAIRRO. Isso evita incluir uma obra de outro bairro apenas porque
+  // o nome/objeto contem a palavra procurada (ex.: "Ligacao Centro - Aldeia").
+  if (bairroExplicito) {
+    return `unaccent(COALESCE(bairro,'')) ILIKE unaccent('%${local}%')`;
+  }
+
+  // Em perguntas mais naturais como "obras no Centro", o objeto continua como
+  // apoio para abas antigas em que o local pode aparecer somente no nome da obra.
   return `(unaccent(COALESCE(bairro,'')) ILIKE unaccent('%${local}%') OR unaccent(objeto) ILIKE unaccent('%${local}%'))`;
 }
 
@@ -724,6 +746,8 @@ COMO TRABALHAR:
 1. Entenda a pergunta em linguagem natural, inclusive erros de digitacao e follow-ups.
 2. Use SOMENTE colunas/chaves que realmente existem no schema/metadados acima.
 3. Gere UMA SQL SELECT que responda exatamente o que foi perguntado.
+3.1. Se o cidadao fizer DUAS OU MAIS perguntas/campos na mesma mensagem (ex.: "qual o recurso e o engenheiro da UBS X?" ou "valor, empresa e percentual da obra Y?"), a MESMA SQL deve trazer TODOS os campos pedidos. Nunca responda apenas uma parte.
+3.2. Palavras como recurso, engenheiro, empresa, bairro, contrato, valor, percentual e status podem ser CAMPOS solicitados. Nao trate essas palavras nem o nome da obra que vem depois delas como valor de filtro de outro campo. Ex.: em "recurso e engenheiro da Reforma da UBS do Cristo Rei", "engenheiro" e campo pedido; o filtro deve localizar a obra pelo objeto, nao procurar um engenheiro chamado "Reforma da UBS...".
 4. Para pergunta de acompanhamento, use a conversa e a SQL anterior para manter/refinar o recorte.
 5. Se houver ambiguidade pequena, faca a interpretacao mais razoavel com base nos valores reais do banco.
 6. Se a pergunta nao puder ser respondida com este dataset, responda SEM_CONSULTA.
@@ -1083,6 +1107,7 @@ Escreva uma resposta clara e cordial em portugues, formato WhatsApp.
 
 FORMATO DE RESPOSTA (IMPORTANTE):
 - Comece pela resposta DIRETA em 1 frase (numero, valor, status ou conclusao pedida).
+- Se a mensagem tiver DUAS OU MAIS perguntas/campos pedidos, responda TODOS explicitamente na mesma resposta, de preferencia um por linha ou marcador. Nunca escolha so um deles. Ex.: "recurso e engenheiro" -> informe Recurso e Responsavel tecnico; "valor, empresa e percentual" -> informe os tres.
 - Depois, quando o resultado trouxer informacoes que ajudam a pessoa a entender o que esta acontecendo, acrescente uma secao curta de detalhes com marcadores.
 - Em perguntas de contagem, se o JSON trouxer VARIOS contadores/categorias, explique cada um separadamente. NAO some categorias diferentes sem o usuario pedir.
 - Se o JSON tiver tipo_resposta="contagem_por_tipo" e o usuario perguntou genericamente por "obras", a RESPOSTA PRINCIPAL e SEMPRE obras_e_pavimentacoes. Chame esse numero simplesmente de "obras" para o cidadao e, nos detalhes, explique a composicao entre obras fisicas e pavimentacoes. Projetos e processos de licitacao sao categorias SEPARADAS e NAO entram nessa contagem. Se existirem, voce pode menciona-los em uma frase separada como informacao adicional, deixando claro que nao entram no total de obras. NAO mostre total_registros_relacionados nem some obras + projetos + licitacoes, a menos que o usuario peça explicitamente "total de registros", "incluindo projetos e licitacoes", "tudo junto" ou equivalente. Em perguntas como "quantas obras concluidas?", responda pelo numero obras_e_pavimentacoes, mesmo que existam projetos concluidos separados. Nunca chame projeto ou processo de licitacao de obra executada.
