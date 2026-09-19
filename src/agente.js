@@ -890,6 +890,14 @@ function montarResumoEngenheiros(pergunta, linhas) {
   if (!Array.isArray(linhas) || linhas.length === 0) return null;
   if (!linhas.some((l) => l && Object.prototype.hasOwnProperty.call(l, "engenheiro"))) return null;
 
+  // Se o cidadao pediu, na MESMA mensagem, campos que este resumo
+  // deterministico nao exibe (recurso, contrato, convenio, empresa etc.),
+  // nao transforme a resposta em um relatorio apenas de responsaveis.
+  // Nesse caso deixamos a redacao geral usar todos os campos retornados pela SQL.
+  // Ex.: "qual o recurso e o engenheiro da UBS X?" precisa responder OS DOIS.
+  const pedeCampoForaDoResumo = /\b(recursos?|fontes?|contratos?|convenios?|aditivos?|prazos?|datas?|empresa|empresas|executora|executoras|valor executado|quanto (?:ja )?(?:foi )?(?:executado|pago)|saldo(?: devedor)?)\b/.test(p);
+  if (pedeCampoForaDoResumo) return null;
+
   const tipoRegistro = (l) => {
     const origem = `${l?.aba_origem || ""} ${l?.categoria || ""}`
       .normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
