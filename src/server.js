@@ -317,6 +317,7 @@ app.get("/testar-agente", async (req, res) => {
         content: r.resposta,
         sql: r.sql || null,
         linhas: r.linhas ?? null,
+        estado: r.estado || null,
       },
     ]);
 
@@ -784,6 +785,9 @@ async function processarMensagem(mensagem) {
           content: respostaAg,
           sql: resultadoAg?.sql || null,
           linhas: resultadoAg?.linhas ?? null,
+          // Estado semantico do recorte atual (ex.: obras do Centro / Eng. X).
+          // Permite follow-ups naturais sem depender de frases fixas.
+          estado: resultadoAg?.estado || null,
         },
       ].slice(-10),
     });

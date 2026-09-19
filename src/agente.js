@@ -19,6 +19,12 @@ import { chamarIAbruta } from "./groq.js"; // reaproveita a chamada de IA que ja
 // (ou se AGENTE_SQL_RAPIDA=true). Assim o chatbot nao depende de frases fixas.
 const USAR_SQL_RAPIDA_PRIMEIRO = process.env.AGENTE_SQL_RAPIDA === "true";
 
+// MODO PRINCIPAL: agente com ferramentas. A IA planeja o que precisa consultar,
+// o Node valida/executa cada SELECT e a IA so redige depois de receber dados reais.
+// Pode ser desativado apenas para contingencia com AGENTE_FERRAMENTAS=false.
+const USAR_AGENTE_FERRAMENTAS = process.env.AGENTE_FERRAMENTAS !== "false";
+const MAX_PASSOS_FERRAMENTAS = Math.max(1, Math.min(Number(process.env.AGENTE_MAX_PASSOS || 3), 4));
+
 // Descricao da tabela que a IA recebe (o "schema"). Se mudar a
 // tabela, atualize aqui.
 const SCHEMA = `
@@ -378,7 +384,10 @@ function resumoHistorico(historico = []) {
     const sqlAnterior = m.role === "assistant" && m.sql
       ? `\nSQL_USADA: ${(m.sql || "").toString().replace(/\s+/g, " ").trim().slice(0, 500)}`
       : "";
-    return `${quem}: ${txt}${sqlAnterior}`;
+    const estadoAnterior = m.role === "assistant" && m.estado
+      ? `\nESTADO_SEMANTICO: ${JSON.stringify(m.estado).slice(0, 700)}`
+      : "";
+    return `${quem}: ${txt}${sqlAnterior}${estadoAnterior}`;
   }).join("\n");
 }
 
@@ -423,9 +432,34 @@ function perguntaParaEscopo(pergunta, historico = []) {
 }
 
 function escopoNegocioObrigatorio(pergunta, historico = []) {
+  const atual = normalizarTexto(pergunta);
   const p = perguntaParaEscopo(pergunta, historico);
   const pedeTudo = /\b(tudo junto|tudo que|todos os registros|total de registros|incluindo projetos|incluindo licitacoes|todas as categorias|qualquer categoria)\b/.test(p);
   if (pedeTudo) return "";
+
+  // Follow-up sem tipo explicito: herda o ESCOPO da ultima SQL, nao uma frase
+  // antiga. Assim cadeias longas como "essas obras -> responsaveis delas -> qual
+  // delas e mais cara" continuam no mesmo conjunto mesmo quando a ultima frase
+  // nao repete a palavra "obras".
+  const temTipoAtual = /\b(obras?|projetos?|pavimentacoes?|licitacoes?|processos? licitatorios?|registros?)\b/.test(atual);
+  if (!temTipoAtual && ehFollowupReferencialForte(pergunta)) {
+    const estado = ultimoEstadoDoHistorico(historico);
+    const escopoEstado = normalizarTexto(estado?.escopo || "");
+    if (escopoEstado === "obras") return "aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO')";
+    if (escopoEstado === "obras_em_andamento") return "aba_origem = 'EM_ANDAMENTO'";
+    if (escopoEstado === "pavimentacoes") return "aba_origem = 'PAVIMENTAÇÃO'";
+    if (escopoEstado === "projetos") return "aba_origem = 'EM_PROJETO'";
+    if (escopoEstado === "licitacoes") return "aba_origem = 'EM_LICITAÇÃO'";
+
+    const anterior = ultimaSQLDoHistorico(historico);
+    if (/aba_origem\s+IN\s*\(\s*'EM_ANDAMENTO'\s*,\s*'PAVIMENTAÇÃO'\s*\)/i.test(anterior)) {
+      return "aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO')";
+    }
+    if (/aba_origem\s*=\s*'EM_ANDAMENTO'/i.test(anterior)) return "aba_origem = 'EM_ANDAMENTO'";
+    if (/aba_origem\s*=\s*'PAVIMENTAÇÃO'/i.test(anterior)) return "aba_origem = 'PAVIMENTAÇÃO'";
+    if (/aba_origem\s*=\s*'EM_PROJETO'/i.test(anterior)) return "aba_origem = 'EM_PROJETO'";
+    if (/aba_origem\s*=\s*'EM_LICITAÇÃO'/i.test(anterior)) return "aba_origem = 'EM_LICITAÇÃO'";
+  }
 
   // Tipos explicitamente pedidos sempre vencem.
   if (/\bprojetos?\b/.test(p)) return "aba_origem = 'EM_PROJETO'";
@@ -476,6 +510,16 @@ function aplicarEscopoNegocioNaSQL(pergunta, sql, historico = []) {
   if (/\baba_origem\b/i.test(s)) return s;
 
   return adicionarCondicaoNaSQL(s, esperado);
+}
+
+function ultimoEstadoDoHistorico(historico = []) {
+  if (!Array.isArray(historico)) return null;
+  for (let i = historico.length - 1; i >= 0; i--) {
+    if (historico[i]?.role === "assistant" && historico[i]?.estado && typeof historico[i].estado === "object") {
+      return historico[i].estado;
+    }
+  }
+  return null;
 }
 
 function ultimaSQLDoHistorico(historico = []) {
@@ -1970,6 +2014,312 @@ function auditarRespostaNumerica(resposta, linhas) {
   return { ok: true };
 }
 
+
+// ============================================================
+// MODO AGENTE COM FERRAMENTAS
+// ============================================================
+// Diferenca para o fluxo SQL de uma unica tentativa:
+// - a IA NAO recebe a planilha inteira nem responde de memoria;
+// - ela decide qual consulta precisa fazer;
+// - o Node valida e executa a consulta em modo somente leitura;
+// - o resultado volta para a IA, que pode pedir outra consulta complementar;
+// - so depois ela redige a resposta final.
+//
+// Isso aproxima o comportamento de um assistente com acesso ao dataset inteiro,
+// sem deixar o modelo solto para escrever no banco ou inventar numeros.
+
+function extrairJSONSeguro(texto = "") {
+  const limpo = texto.toString().replace(/```json/gi, "").replace(/```/g, "").trim();
+  try { return JSON.parse(limpo); } catch {}
+  const ini = limpo.indexOf("{");
+  const fim = limpo.lastIndexOf("}");
+  if (ini >= 0 && fim > ini) {
+    try { return JSON.parse(limpo.slice(ini, fim + 1)); } catch {}
+  }
+  return null;
+}
+
+function estadoDaUltimaConsulta(historico = []) {
+  const sql = ultimaSQLDoHistorico(historico);
+  const where = whereDaSQL(sql);
+  let escopo = "nao_identificado";
+  if (/aba_origem\s+IN\s*\(\s*'EM_ANDAMENTO'\s*,\s*'PAVIMENTAÇÃO'\s*\)/i.test(sql)) escopo = "obras";
+  else if (/aba_origem\s*=\s*'EM_ANDAMENTO'/i.test(sql)) escopo = "obras_em_andamento";
+  else if (/aba_origem\s*=\s*'PAVIMENTAÇÃO'/i.test(sql)) escopo = "pavimentacoes";
+  else if (/aba_origem\s*=\s*'EM_PROJETO'/i.test(sql)) escopo = "projetos";
+  else if (/aba_origem\s*=\s*'EM_LICITAÇÃO'/i.test(sql)) escopo = "licitacoes";
+
+  const captura = (rx) => {
+    const m = sql.match(rx);
+    return m ? m[1] : null;
+  };
+  return {
+    sql: sql || null,
+    where: where || null,
+    escopo,
+    filtros_detectados: {
+      engenheiro: captura(/engenheiro[^\n]*?ILIKE\s+unaccent\('\%([^%']+)\%'/i),
+      bairro: captura(/bairro[^\n]*?ILIKE\s+unaccent\('\%([^%']+)\%'/i),
+      empresa: captura(/empresa[^\n]*?ILIKE\s+unaccent\('\%([^%']+)\%'/i),
+      status: captura(/status[^\n]*?ILIKE\s+unaccent\('\%([^%']+)\%'/i),
+      objeto: captura(/objeto[^\n]*?ILIKE\s+unaccent\('\%([^%']+)\%'/i),
+    },
+  };
+}
+
+function contextoPrioritario(historico = []) {
+  if (!Array.isArray(historico) || historico.length === 0) {
+    return { turno_anterior: null, estado_consulta: estadoDaUltimaConsulta([]) };
+  }
+  let ultimoAssistente = null;
+  let ultimoUsuario = null;
+  for (let i = historico.length - 1; i >= 0; i--) {
+    const m = historico[i];
+    if (!ultimoAssistente && m?.role === "assistant") ultimoAssistente = m;
+    if (!ultimoUsuario && m?.role === "user") ultimoUsuario = m;
+    if (ultimoAssistente && ultimoUsuario) break;
+  }
+  const estadoSalvo = ultimoAssistente?.estado && typeof ultimoAssistente.estado === "object"
+    ? ultimoAssistente.estado
+    : null;
+  return {
+    turno_anterior: {
+      usuario: ultimoUsuario?.content?.toString().slice(0, 500) || null,
+      assistente: ultimoAssistente?.content?.toString().slice(0, 700) || null,
+      sql: ultimoAssistente?.sql?.toString().slice(0, 1200) || null,
+    },
+    // Estado estruturado salvo pelo servidor vence; a leitura da SQL e fallback.
+    estado_semantico: estadoSalvo,
+    estado_consulta: estadoDaUltimaConsulta(historico),
+  };
+}
+
+function serializarConsultasFerramenta(consultas = []) {
+  return consultas.map((c, i) => ({
+    passo: i + 1,
+    objetivo: c.objetivo || "consulta",
+    sql: c.sql,
+    quantidade_linhas: c.linhas.length,
+    // O dataset atual e pequeno; ainda assim limitamos o material enviado ao LLM
+    // para manter custo/latencia previsiveis.
+    dados: c.linhas.slice(0, 80),
+  }));
+}
+
+async function planejarPassoFerramenta(pergunta, historico, consultas = [], erroAnterior = null) {
+  const contextoBanco = await contextoAtualDoBanco();
+  const prioritario = contextoPrioritario(historico);
+  const resultados = serializarConsultasFerramenta(consultas);
+
+  const prompt = `Voce e o PLANEJADOR de um assistente que conversa livremente com uma base de obras publicas.
+Voce NAO responde usando conhecimento proprio. Voce possui uma unica ferramenta: CONSULTAR_BANCO, que executa SELECT somente leitura na tabela obras.
+
+SCHEMA DE NEGOCIO:
+${SCHEMA}
+
+METADADOS REAIS DO BANCO:
+${contextoBanco}
+
+CONTEXTO PRIORITARIO DO TURNO IMEDIATAMENTE ANTERIOR:
+${JSON.stringify(prioritario)}
+
+HISTORICO RECENTE (apoio secundario):
+${resumoHistorico(historico)}
+
+CONSULTAS JA FEITAS NESTE TURNO:
+${JSON.stringify(resultados)}
+
+REGRAS DE COMPORTAMENTO:
+- Entenda linguagem natural, sinonimos, erros de digitacao e perguntas nunca vistas. Nao dependa de frases cadastradas.
+- Referencias como ela/ele/dela/dele/dessas/deles/essas/esses devem apontar primeiro para o turno imediatamente anterior.
+- Se os dados ja retornados forem suficientes para responder TUDO o que foi pedido, finalize. Se faltar algo, faca outra consulta complementar.
+- Nunca invente nomes, valores, percentuais, quantidades, bairros, empresas, status ou responsaveis.
+- \"obras\" generico significa EM_ANDAMENTO + PAVIMENTAÇÃO. Projeto e licitacao sao categorias separadas.
+- \"obras em andamento\" significa origem EM_ANDAMENTO. Etapa de licitacao com a palavra andamento nao e obra em andamento.
+- Se o usuario pedir explicitamente projeto, pavimentacao ou licitacao, use a origem correspondente.
+- Se pedir \"tudo/todas as categorias/todos os registros\", ai sim pode considerar todas as origens.
+- Para valores: valor_total, valor_executado e valores pagos sao conceitos diferentes. Nao substitua um pelo outro.
+- Para campos livres (recurso, contrato, convenio, aditivo, prazo, datas, observacoes), use dados_extras ou uma chave real listada nos metadados.
+- Para ranking/contagem/soma/comparacao, deixe o PostgreSQL calcular. Nao faca contas de cabeca.
+- Para uma pergunta com varios pedidos, obtenha dados suficientes para responder todos.
+- So use SELECT na tabela obras; sem JOIN, escrita, comentarios ou outras tabelas.
+
+FORMATO OBRIGATORIO: retorne APENAS um JSON valido, sem markdown.
+Mantenha tambem um ESTADO SEMANTICO compacto do conjunto atual. Ele NAO e resposta pronta; serve para memoria entre turnos.
+Formato do estado: {"escopo":"obras|obras_em_andamento|pavimentacoes|projetos|licitacoes|todos|indefinido","filtros":{"bairro":null,"engenheiro":null,"empresa":null,"status":null,"objeto":null},"conjunto":"descricao curta do recorte atual","entidade_foco":null}.
+O estado deve refletir a consulta REAL que voce esta pedindo, nao um assunto antigo.
+
+Para consultar:
+{"acao":"consultar","objetivo":"descricao curta","sql":"SELECT ... FROM obras ...","estado":{"escopo":"...","filtros":{},"conjunto":"...","entidade_foco":null}}
+Quando os dados ja forem suficientes:
+{"acao":"finalizar","objetivo":"dados suficientes","estado":{"escopo":"...","filtros":{},"conjunto":"...","entidade_foco":null}}
+Se a pergunta realmente nao puder ser respondida com esta base:
+{"acao":"sem_consulta","objetivo":"motivo curto","estado":{"escopo":"indefinido","filtros":{},"conjunto":"","entidade_foco":null}}
+${erroAnterior ? `\nA tentativa anterior foi rejeitada/falhou: ${erroAnterior}. Corrija a proxima acao sem mudar a intencao.` : ""}`;
+
+  const bruto = await chamarIAbruta([
+    { role: "system", content: prompt },
+    { role: "user", content: (pergunta || "").toString().slice(0, 1600) },
+  ], {
+    max_tokens: 520,
+    temperature: 0,
+    reasoning_effort: "low",
+  });
+
+  const obj = extrairJSONSeguro(bruto);
+  if (!obj || !obj.acao) throw new Error("planejador nao retornou JSON valido");
+  return obj;
+}
+
+function linhasParaAuditoria(consultas = []) {
+  return consultas.flatMap((c) => Array.isArray(c.linhas) ? c.linhas : []);
+}
+
+async function redigirComFerramentas(pergunta, historico, consultas) {
+  const dados = serializarConsultasFerramenta(consultas);
+  const prompt = `Voce e o Assistente de Obras da Prefeitura de Mamanguape.
+Responda em portugues claro e direto usando EXCLUSIVAMENTE os resultados das ferramentas abaixo.
+
+PERGUNTA ATUAL:
+${pergunta}
+
+CONTEXTO PRIORITARIO:
+${JSON.stringify(contextoPrioritario(historico))}
+
+RESULTADOS REAIS DAS FERRAMENTAS:
+${JSON.stringify(dados)}
+
+REGRAS:
+- Responda primeiro exatamente o que foi perguntado.
+- Se houver varios pedidos na mesma mensagem, responda todos.
+- Nunca invente um numero, nome, obra, bairro, empresa, responsavel, status ou percentual que nao apareca nos resultados.
+- Nao use memoria antiga para acrescentar dados que nao aparecem nos resultados atuais.
+- Diferencie obras, pavimentacoes, projetos e licitacoes conforme aba_origem/categoria.
+- Se a pergunta disser \"obras\" genericamente, nao chame projeto ou licitacao de obra.
+- Explique a diferenca entre valor total, executado e pago quando isso for relevante.
+- Se a consulta retornou zero linhas, diga que nao encontrou registro correspondente; nao suponha.
+- Nao mencione SQL, banco, JSON, ferramenta ou detalhes internos.
+- Seja conciso, mas liste os itens quando o usuario pedir quais sao.
+`;
+
+  return await chamarIAbruta([{ role: "user", content: prompt }], {
+    max_tokens: 900,
+    temperature: 0,
+    reasoning_effort: "low",
+  });
+}
+
+async function responderComFerramentas(pergunta, historico = []) {
+  const consultas = [];
+  let erroAnterior = null;
+  let sqlAnteriorNoTurno = "";
+  let estadoAtual = ultimoEstadoDoHistorico(historico) || null;
+
+  for (let passo = 0; passo < MAX_PASSOS_FERRAMENTAS; passo++) {
+    const decisao = await planejarPassoFerramenta(pergunta, historico, consultas, erroAnterior);
+    erroAnterior = null;
+    if (decisao?.estado && typeof decisao.estado === "object") estadoAtual = decisao.estado;
+
+    if (decisao.acao === "sem_consulta") {
+      if (consultas.length) break;
+      return {
+        resposta: "Nao encontrei dados suficientes na planilha para responder isso com seguranca. Pode detalhar um pouco mais o que deseja consultar?",
+        semConsulta: true,
+        estado: estadoAtual,
+        modoAgente: "ferramentas_controladas",
+      };
+    }
+
+    if (decisao.acao === "finalizar") {
+      if (consultas.length) break;
+      erroAnterior = "voce tentou finalizar sem consultar o banco; faca ao menos uma consulta para pergunta de dados";
+      continue;
+    }
+
+    if (decisao.acao !== "consultar" || typeof decisao.sql !== "string") {
+      erroAnterior = "acao invalida; use consultar, finalizar ou sem_consulta";
+      continue;
+    }
+
+    let sql = decisao.sql.replace(/```sql/gi, "").replace(/```/g, "").replace(/;$/, "").trim();
+    const m = sql.match(/select[\s\S]+/i);
+    if (m) sql = m[0].trim();
+
+    // A IA escolhe a consulta, mas o Node garante o escopo de negocio.
+    sql = aplicarEscopoNegocioNaSQL(pergunta, sql, historico);
+
+    // Evita loop pedindo a mesma ferramenta repetidamente.
+    if (sqlAnteriorNoTurno && normalizarTexto(sqlAnteriorNoTurno) === normalizarTexto(sql)) {
+      break;
+    }
+
+    // Para follow-up, validamos com o tipo herdado do contexto quando a frase
+    // atual nao o repete. Isso mantem a conversa sem depender de frase fixa.
+    const perguntaValidacao = perguntaParaEscopo(pergunta, historico);
+    const check = validarConsulta(perguntaValidacao, sql);
+    if (!check.ok) {
+      erroAnterior = `SQL rejeitada pelo guardrail: ${check.motivo}. SQL=${sql.slice(0, 700)}`;
+      console.warn("AGENTE/FERRAMENTAS:", erroAnterior);
+      continue;
+    }
+
+    try {
+      const r = await queryReadOnly(comLimite(sql));
+      consultas.push({
+        objetivo: (decisao.objetivo || "consulta").toString().slice(0, 160),
+        sql,
+        linhas: r.rows || [],
+      });
+      sqlAnteriorNoTurno = sql;
+      console.log(`AGENTE/FERRAMENTAS: passo ${passo + 1}, ${r.rows.length} linha(s).`);
+    } catch (e) {
+      erroAnterior = `erro ao executar: ${e.message}. SQL=${sql.slice(0, 700)}`;
+      console.warn("AGENTE/FERRAMENTAS:", erroAnterior);
+    }
+  }
+
+  if (!consultas.length) {
+    throw new Error(erroAnterior || "nenhuma consulta valida foi executada");
+  }
+
+  let resposta = await redigirComFerramentas(pergunta, historico, consultas);
+  let auditoria = auditarRespostaNumerica(resposta, linhasParaAuditoria(consultas));
+  if (!auditoria.ok) {
+    console.warn("AGENTE/FERRAMENTAS: redacao rejeitada -", auditoria.motivo);
+    resposta = await redigirComFerramentas(
+      `${pergunta}\nATENCAO: use somente numeros literalmente presentes nos resultados das ferramentas; a resposta anterior falhou na auditoria por ${auditoria.motivo}.`,
+      historico,
+      consultas
+    );
+    auditoria = auditarRespostaNumerica(resposta, linhasParaAuditoria(consultas));
+  }
+
+  const ultima = consultas[consultas.length - 1];
+  if (!estadoAtual || typeof estadoAtual !== "object") {
+    estadoAtual = estadoDaUltimaConsulta([{ role: "assistant", sql: ultima.sql }]);
+  }
+  if (!auditoria.ok) {
+    return {
+      resposta: redigirLocal(pergunta, ultima.linhas),
+      sql: ultima.sql,
+      linhas: ultima.linhas.length,
+      consultas: consultas.map((c) => c.sql),
+      estado: estadoAtual,
+      fallbackLocal: true,
+      modoAgente: "ferramentas_controladas",
+    };
+  }
+
+  return {
+    resposta,
+    sql: ultima.sql,
+    linhas: ultima.linhas.length,
+    consultas: consultas.map((c) => c.sql),
+    estado: estadoAtual,
+    modoAgente: "ferramentas_controladas",
+  };
+}
+
 // --- FLUXO COMPLETO ---
 export async function responderPergunta(pergunta, historico = []) {
   // 0. Saudacao/agradecimento/despedida - responde sem tocar no banco.
@@ -1977,6 +2327,16 @@ export async function responderPergunta(pergunta, historico = []) {
   if (social) {
     console.log("AGENTE: resposta social (sem SQL).");
     return { resposta: social, social: true };
+  }
+
+  // Modo principal: a IA trabalha como agente de consulta com ferramentas.
+  // O fluxo antigo permanece logo abaixo como contingencia automatica.
+  if (USAR_AGENTE_FERRAMENTAS) {
+    try {
+      return await responderComFerramentas(pergunta, historico);
+    } catch (e) {
+      console.error("AGENTE/FERRAMENTAS: falhou; usando fluxo SQL antigo como fallback:", e.message);
+    }
   }
 
   // 1. Gera SQL. A IA interpreta a frase livremente. Se os provedores
