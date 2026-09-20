@@ -516,6 +516,8 @@ function normalizarTexto(s = "") {
     [/\butilisadas\b/g, "utilizadas"],
     [/\bengenhero\b/g, "engenheiro"],
     [/\bengenheros\b/g, "engenheiros"],
+    [/\bestatus\b/g, "status"],
+    [/\bestatu\b/g, "status"],
   ];
   for (const [rx, valor] of trocas) t = t.replace(rx, valor);
   return t;
@@ -576,6 +578,18 @@ function enriquecerLinhaParaIA(linha = {}) {
   if (out.observacoes === null || out.observacoes === undefined || String(out.observacoes).trim() === "") {
     out.observacoes = valorExtraPorPrioridade(ex, ["OBSERVACOES", "OBSERVACAO"]);
   }
+  if (out.tipo_recurso === null || out.tipo_recurso === undefined || String(out.tipo_recurso).trim() === "") {
+    out.tipo_recurso = valorExtraPorPrioridade(ex, ["TIPO_RECURSO", "TIPO RECURSO"]);
+  }
+  if (out.data_inicio === null || out.data_inicio === undefined || String(out.data_inicio).trim() === "") {
+    out.data_inicio = valorExtraPorPrioridade(ex, ["DATA_INICIO", "DATA INICIO", "DATA DE INICIO"]);
+  }
+  if (out.data_prev_termino === null || out.data_prev_termino === undefined || String(out.data_prev_termino).trim() === "") {
+    out.data_prev_termino = valorExtraPorPrioridade(ex, ["DATA_PREV_TERMINO", "DATA PREV TERMINO", "PREVISAO DE TERMINO", "DATA PREVISTA DE TERMINO"]);
+  }
+  if (out.saldo_devedor === null || out.saldo_devedor === undefined || String(out.saldo_devedor).trim() === "") {
+    out.saldo_devedor = valorExtraPorPrioridade(ex, ["SALDO DEVEDOR", "SALDO"]);
+  }
   return out;
 }
 
@@ -588,7 +602,7 @@ function termosLivresCandidatos(pergunta = "") {
   const stop = new Set([
     "a","o","as","os","um","uma","uns","umas","de","do","da","dos","das",
     "no","na","nos","nas","em","e","ou","que","qual","quais","quem","como",
-    "me","fala","fale","diga","mostre","liste","listar","existe","existem","tem",
+    "me","fala","fale","diga","dar","informe","informar","explique","explica","detalhe","detalhes","dados","informacao","informacoes","mostre","liste","listar","existe","existem","tem",
     "tenho","temos","sao","ser","esta","estao","foi","foram","com","sem","por",
     "para","pra","seu","sua","seus","suas","isso","isto","aquilo","mais","menos",
     "maior","menor","quantas","quantos","quanto","total","geral","todos","todas","cada","entre",
@@ -617,6 +631,66 @@ function termosLivresCandidatos(pergunta = "") {
     t.length >= 2 && !stop.has(t) && !ehOperacional(t) && !/^\d+(?:[.,]\d+)?$/.test(t)
   );
   return [...new Set(tokens)].slice(0, 12);
+}
+
+
+// Diferencia uma referencia pura ("ela", "dessas obras") de uma pergunta que
+// contem um ALVO nomeado no proprio turno ("dessa Reforma da Escola...").
+// Quando o usuario escreveu o nome/descricao do item, esse alvo novo vence a
+// memoria anterior. Isso evita herdar filtros antigos como "concluidas".
+function temAlvoExplicitoNaPergunta(pergunta = "") {
+  const termos = termosLivresCandidatos(pergunta);
+  // Dois termos significativos normalmente indicam um nome/descricao real.
+  // Um unico termo continua podendo ser um refinamento do conjunto anterior
+  // (ex.: "dessas obras do Centro").
+  return termos.length >= 2;
+}
+
+function ehPedidoDescricaoRegistro(pergunta = "") {
+  const p = normalizarTexto(pergunta);
+  return /\b(fale|fala|conte|explica|explique)\s+(?:mais\s+)?sobre\b/.test(p) ||
+    /\b(detalhes?|informacoes?|dados)\s+(?:d[oa]s?|sobre|desta|deste|dessa|desse|dela|dele)\b/.test(p) ||
+    /\bo que (?:voce )?sabe sobre\b/.test(p) ||
+    /\bme diga tudo sobre\b/.test(p);
+}
+
+function tipoRegistroHumano(aba = "") {
+  if (aba === "EM_PROJETO") return "projeto";
+  if (aba === "EM_LICITAÇÃO") return "licitação";
+  if (aba === "PAVIMENTAÇÃO") return "pavimentação";
+  if (aba === "EM_ANDAMENTO") return "obra";
+  return "registro";
+}
+
+function formatarPercentualSeguro(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return String(v);
+  return `${n.toLocaleString("pt-BR", { maximumFractionDigits: 2 })}%`;
+}
+
+function formatarFichaRegistro(linha = {}) {
+  const l = enriquecerLinhaParaIA(linha);
+  const vazio = (v) => v === null || v === undefined || String(v).trim() === "";
+  const itens = [];
+  itens.push(`Tipo: ${tipoRegistroHumano(l.aba_origem)}`);
+  if (!vazio(l.status)) itens.push(`Status: ${l.status}`);
+  if (!vazio(l.bairro)) itens.push(`Local: ${l.bairro}`);
+  if (!vazio(l.engenheiro)) itens.push(`Responsável técnico: ${l.engenheiro}`);
+  if (!vazio(l.empresa)) itens.push(`Empresa: ${l.empresa}`);
+  if (!vazio(l.recurso)) itens.push(`Recurso: ${l.recurso}`);
+  if (!vazio(l.tipo_recurso) && normalizarTexto(l.tipo_recurso) !== normalizarTexto(l.recurso || "")) itens.push(`Tipo de recurso: ${l.tipo_recurso}`);
+  if (!vazio(l.contrato)) itens.push(`Contrato: ${l.contrato}`);
+  if (!vazio(l.convenio)) itens.push(`Convênio/proposta: ${l.convenio}`);
+  if (!vazio(l.valor_total)) itens.push(`Valor total: ${formatarMoedaSemantica(l.valor_total)}`);
+  if (!vazio(l.valor_executado)) itens.push(`Valor executado: ${formatarMoedaSemantica(l.valor_executado)}`);
+  if (!vazio(l.saldo_devedor)) itens.push(`Saldo devedor: ${formatarMoedaSemantica(l.saldo_devedor)}`);
+  const pct = formatarPercentualSeguro(l.percentual_executado);
+  if (pct) itens.push(`Execução: ${pct}`);
+  if (!vazio(l.data_inicio)) itens.push(`Início: ${l.data_inicio}`);
+  if (!vazio(l.data_prev_termino)) itens.push(`Previsão de término: ${l.data_prev_termino}`);
+  if (!vazio(l.observacoes)) itens.push(`Observações: ${l.observacoes}`);
+  return `**${l.objeto || "Registro sem nome"}**\n` + itens.map((x) => `• ${x}`).join("\n");
 }
 
 function pistasInterpretacaoPergunta(pergunta = "") {
@@ -695,6 +769,12 @@ const EXEMPLOS_SEMANTICOS = [
     pergunta: "quais licitacoes estao em habilitacao",
     tags: "licitacao habilitacao status",
     regra: "Licitacao exige aba_origem EM_LICITAÇÃO. 'Habilitacao em andamento' nao significa obra fisica em andamento.",
+  },
+  {
+    id: "descricao_item",
+    pergunta: "fale sobre esta obra",
+    tags: "descricao detalhes ficha item status recurso engenheiro valor",
+    regra: "Quando o usuario pede para falar sobre um item, trate como descricao do registro. Localize o item e apresente os principais dados disponiveis; nao transforme o pedido em contagem, soma ou apenas responsavel.",
   },
   {
     id: "multiplos_campos",
@@ -1142,6 +1222,16 @@ function redigirResultadoSemantico(pergunta = "", interpretacao = {}, diretas = 
 
   if (!diretas.length && !relacionadas.length) return null;
 
+  // "Fale sobre X" e uma intencao descritiva, nao uma conta nem uma lista de
+  // responsaveis. Para um item unico, devolvemos uma ficha util do registro.
+  if (ehPedidoDescricaoRegistro(pergunta) && diretas.length === 1) {
+    let ficha = formatarFichaRegistro(diretas[0]);
+    if (relacionadas.length) {
+      ficha += `\n\nEncontrei também ${relacionadas.length} registro${relacionadas.length === 1 ? "" : "s"} relacionado${relacionadas.length === 1 ? "" : "s"}, mas não ${relacionadas.length === 1 ? "o tratei" : "os tratei"} como o mesmo item.`;
+    }
+    return ficha;
+  }
+
   let out = "";
   if (diretas.length) {
     if (pedeContagem) {
@@ -1173,7 +1263,7 @@ async function tentarResolucaoSemantica(pergunta = "", historico = []) {
 
   // Follow-ups devem usar primeiro os IDs/WHERE guardados no estado anterior.
   // Nao reinterpreta "elas", "dela", "dele" como um novo assunto.
-  if (ehFollowupReferencialForte(pergunta) && ultimoEstadoDoHistorico(historico)) return null;
+  if (ehFollowupReferencialForte(pergunta) && !temAlvoExplicitoNaPergunta(pergunta) && ultimoEstadoDoHistorico(historico)) return null;
 
   const termos = termosAssuntoSemantico(pergunta);
   if (!termos.length) return null;
@@ -1249,7 +1339,8 @@ function gerarSQLFallbackUniversal(pergunta = "", historico = []) {
   // Primeiro respeita o contexto imediato quando a frase e referencial.
   const sqlAnterior = ultimaSQLDoHistorico(historico);
   const condAnterior = whereDaSQL(sqlAnterior).replace(/^WHERE\s+/i, "").trim();
-  const referenciaAnterior = /\b(dessas?|destas?|nessas?|nestas?|delas?|deles?|dele|dela|essas?|esses?|elas?|eles?|nela|nele|anteriores?|anterior|acima|mesmas?|mesmos?|isso|essa|esse)\b/.test(p);
+  const referenciaAnterior = /\b(dessas?|destas?|nessas?|nestas?|delas?|deles?|dele|dela|essas?|esses?|elas?|eles?|nela|nele|anteriores?|anterior|acima|mesmas?|mesmos?|isso|essa|esse)\b/.test(p) &&
+    !temAlvoExplicitoNaPergunta(pergunta);
   const filtroRecurso = condicaoRecursoDaPergunta(p);
   const followupRecursoSemSujeito = !!filtroRecurso &&
     /^(?:e\s+)?(?:quais?|qual)\s+(?:usam?|utilizam?|possuem?|tem|com)\b/.test(p) &&
@@ -1733,6 +1824,9 @@ function condicaoEngenheiroExato(engenheiro = "") {
 
 function contextoReferencialDoEstado(pergunta = "", historico = []) {
   const p = normalizarTexto(pergunta);
+  // "dessa Reforma da Escola Municipal..." contem um demonstrativo, mas o
+  // proprio usuario nomeou um novo alvo. Nao reutilize o conjunto anterior.
+  if (temAlvoExplicitoNaPergunta(pergunta)) return "";
   const estado = ultimoEstadoDoHistorico(historico);
   if (!estado || typeof estado !== "object") return "";
 
@@ -1905,7 +1999,8 @@ function gerarSQLRapida(pergunta, historico = []) {
     return `SELECT objeto, valor_total FROM obras WHERE ${condAnterior} ORDER BY objeto LIMIT 10 OFFSET ${jaMostrou}`;
   }
 
-  const referenciaAnterior = /\b(dessas?|destas?|nessas?|nestas?|delas?|deles?|dele|dela|essas?|esses?|elas?|eles?|nela|nele|anteriores?|anterior|acima|mesmas?|mesmos?|isso|essa|esse)\b/.test(p);
+  const referenciaAnterior = /\b(dessas?|destas?|nessas?|nestas?|delas?|deles?|dele|dela|essas?|esses?|elas?|eles?|nela|nele|anteriores?|anterior|acima|mesmas?|mesmos?|isso|essa|esse)\b/.test(p) &&
+    !temAlvoExplicitoNaPergunta(pergunta);
   const perguntaCurtaLista = /^(?:e\s+)?quais(?:\s+sao)?$|^(?:lista|liste|mostra|mostre)(?:\s+(?:elas|essas|as obras))?$/.test(p);
   const curtaDeAcompanhamento = p.split(" ").length <= 7 && (
     /\b(engenheiros?|engenheiras?|responsaveis?|empresas?|executoras?|valor|valores|custo|bairro|status|situacao|nomes?|quantos|quantas|total|percentual|porcentagem|recursos?|contratos?|convenios?)\b/.test(p) ||
@@ -2025,7 +2120,7 @@ function gerarSQLRapida(pergunta, historico = []) {
     /\b(total|soma|somam|somar|somando|somado|somados|ao todo|quanto foi investid\w*|quanto custou tudo|investid\w*|investimentos?|quanto ja foi executad\w*)\b/.test(p) ||
     (!!filtroLocal && /\bqual(?: e| o)? valor\b/.test(p))
   );
-  const pedeDetalhes = /\b(detalh\w*|informacoes?|completo|completa|tudo sobre|me fale sobre|explique|como esta|como ta|situacao completa)\b/.test(p);
+  const pedeDetalhes = ehPedidoDescricaoRegistro(pergunta) || /\b(detalh\w*|informacoes?|completo|completa|tudo sobre|explique|como esta|como ta|situacao completa)\b/.test(p);
   const pedeExistencia = /\b(existe|existem|ha|tem|algum|alguma|alguns|algumas)\b/.test(p);
   const pedeMaiorValor = /\b(maior valor|maior custo|mais cara|mais caro|maior investimento)\b/.test(p);
   const pedeMenorValor = /\b(menor valor|menor custo|mais barata|mais barato|menor investimento)\b/.test(p);
@@ -2204,6 +2299,10 @@ function gerarSQLRapida(pergunta, historico = []) {
 function ehFollowupReferencialForte(pergunta = "") {
   const p = normalizarTexto(pergunta);
   if (!p) return false;
+
+  // Um demonstrativo acompanhado de um nome/descricao novo nao e follow-up
+  // puro. Ex.: "status dessa Reforma da Escola Municipal do Distrito...".
+  if (temAlvoExplicitoNaPergunta(pergunta)) return false;
 
   // Referencias como "essas obras", "delas", "ele", "aquelas" devem
   // continuar o RECORTE IMEDIATAMENTE anterior. Isso nao e uma frase fixa: e
@@ -2977,6 +3076,13 @@ function redigirLocal(pergunta, linhas) {
     if (l.status) partes.push(`status: ${texto(l.status)}`);
     if (l.engenheiro) partes.push(`responsável: ${texto(l.engenheiro)}`);
     return `• ${texto(l.objeto, "Registro sem nome")} — ${partes.join(" — ")}`;
+  }
+
+
+  // Pedido descritivo de UM registro: "fale sobre ela", "me dê detalhes desta
+  // obra" etc. Nao reduza a resposta a um campo incidental como engenheiro.
+  if (ehPedidoDescricaoRegistro(pergunta) && linhas.length === 1 && linhas[0]?.objeto) {
+    return formatarFichaRegistro(linhas[0]);
   }
 
   // Campos explicitamente pedidos tem prioridade sobre colunas incidentais que
