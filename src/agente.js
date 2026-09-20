@@ -41,6 +41,13 @@ const MAX_PASSOS_FERRAMENTAS = Math.max(1, Math.min(Number(process.env.AGENTE_MA
 const USAR_BUSCA_SEMANTICA = process.env.AGENTE_BUSCA_SEMANTICA !== "false";
 const MAX_CANDIDATOS_SEMANTICOS = Math.max(8, Math.min(Number(process.env.AGENTE_MAX_CANDIDATOS_SEMANTICOS || 24), 40));
 
+// MODO ASSISTENTE: antes das regras de SQL, uma leitura curta da pergunta separa
+// INTENCAO, CAMPOS PEDIDOS, ALVO NOVO e REFERENCIA AO CONTEXTO. A IA nao recebe
+// permissao para executar SQL nessa etapa; ela apenas devolve um pequeno plano JSON.
+// Se essa camada estiver indisponivel, todo o Agente 1 antigo continua funcionando.
+const USAR_MODO_ASSISTENTE = process.env.AGENTE_MODO_ASSISTENTE !== "false";
+const CONFIANCA_MIN_PLANO = Math.max(0.45, Math.min(Number(process.env.AGENTE_CONFIANCA_PLANO || 0.68), 0.95));
+
 
 // Descricao da tabela que a IA recebe (o "schema"). Se mudar a
 // tabela, atualize aqui.
@@ -4166,6 +4173,266 @@ async function tentarCamadaDireta(pergunta, historico = []) {
   }
 }
 
+
+// ============================================================
+// MODO ASSISTENTE — INTERPRETACAO ANTES DA CONSULTA
+// ============================================================
+// Esta camada aproxima o comportamento de um assistente conversacional: primeiro
+// entende o que o cidadao quer; depois escolhe como buscar. Ela NAO gera SQL.
+// O Node continua sendo o responsavel por localizar candidatos reais, validar e
+// executar consultas somente-leitura.
+const ACOES_PLANO_ASSISTENTE = new Set([
+  "consultar_campo", "descrever", "listar", "contar", "somar",
+  "existencia", "comparar", "ranking", "outro"
+]);
+const CAMPOS_PLANO_ASSISTENTE = new Set([
+  "recurso", "status", "engenheiro", "empresa", "bairro",
+  "valor_total", "valor_executado", "percentual_executado",
+  "contrato", "convenio", "tipo_recurso", "data_inicio",
+  "data_prev_termino", "saldo_devedor", "observacoes"
+]);
+
+function alvoPlanoEhGenericoOuFiltro(alvo = "", pergunta = "") {
+  const a = normalizarTexto(alvo);
+  if (!a) return true;
+  if (/^(?:obra|obras|projeto|projetos|licitacao|licitacoes|pavimentacao|pavimentacoes|registro|registros)$/.test(a)) return true;
+
+  const p = normalizarTexto(pergunta);
+  const conds = [
+    condicaoLocalDaPergunta(p),
+    condicaoEngenheiroDaPergunta(p),
+    condicaoEngenheiroImplicitoDaPergunta(p),
+    condicaoRecursoDaPergunta(p),
+    filtroStatusDaPergunta(p),
+  ].filter(Boolean);
+  const literais = conds.flatMap(extrairLiteraisILIKE).map(normalizarTexto).filter(Boolean);
+  return literais.some((x) => a === x || (a.split(/\s+/).length <= 2 && (a.includes(x) || x.includes(a))));
+}
+
+function sanitizarPlanoAssistente(raw = {}, pergunta = "") {
+  if (!raw || typeof raw !== "object") return null;
+  const acao = ACOES_PLANO_ASSISTENTE.has(raw.acao) ? raw.acao : "outro";
+  const campos = [...new Set((Array.isArray(raw.campos) ? raw.campos : [])
+    .map((x) => String(x || "").trim())
+    .filter((x) => CAMPOS_PLANO_ASSISTENTE.has(x)))];
+  const alvo = sanitizarPistaSemantica(raw.alvo || "");
+  const fortes = [...new Set([
+    alvo,
+    ...(Array.isArray(raw.equivalentes_fortes) ? raw.equivalentes_fortes : [])
+  ].map(sanitizarPistaSemantica).filter(Boolean))].slice(0, 5);
+  const relacionados = [...new Set((Array.isArray(raw.relacionados) ? raw.relacionados : [])
+    .map(sanitizarPistaSemantica)
+    .filter((x) => x && !fortes.includes(x)))].slice(0, 4);
+  const confiancaNum = Number(raw.confianca);
+  const confianca = Number.isFinite(confiancaNum) ? Math.max(0, Math.min(confiancaNum, 1)) : 0.5;
+  const perguntaEsclarecimento = String(raw.pergunta_esclarecimento || "").trim().slice(0, 220);
+
+  return {
+    acao,
+    campos,
+    alvo,
+    equivalentes_fortes: fortes,
+    relacionados,
+    usar_contexto: raw.usar_contexto === true,
+    novo_alvo: raw.novo_alvo === true && !!alvo,
+    precisa_esclarecer: raw.precisa_esclarecer === true,
+    pergunta_esclarecimento: perguntaEsclarecimento,
+    confianca,
+    pergunta_normalizada: normalizarTexto(pergunta),
+  };
+}
+
+async function interpretarPerguntaComoAssistente(pergunta = "", historico = []) {
+  if (!USAR_MODO_ASSISTENTE) return null;
+
+  const estado = ultimoEstadoDoHistorico(historico);
+  const resumoEstado = estado ? {
+    escopo: estado.escopo || null,
+    foco_objeto: estado.foco_objeto || null,
+    foco_engenheiro: estado.foco_engenheiro || null,
+    tem_conjunto: !!estado.where_conjunto,
+  } : null;
+
+  const prompt = `Voce e a camada de COMPRETENSAO de um chatbot de obras publicas.\n` +
+    `NAO escreva SQL e NAO responda a pergunta. Apenas transforme a mensagem em um plano curto.\n\n` +
+    `Mensagem atual: ${JSON.stringify(pergunta)}\n` +
+    `Estado recente da conversa: ${JSON.stringify(resumoEstado)}\n\n` +
+    `Retorne SOMENTE JSON valido no formato:\n` +
+    `{"acao":"consultar_campo|descrever|listar|contar|somar|existencia|comparar|ranking|outro",` +
+    `"campos":["..."],"alvo":"...","usar_contexto":false,"novo_alvo":true,` +
+    `"precisa_esclarecer":false,"pergunta_esclarecimento":"",` +
+    `"equivalentes_fortes":["..."],"relacionados":["..."],"confianca":0.0}\n\n` +
+    `REGRAS IMPORTANTES:\n` +
+    `1. Separe O QUE O USUARIO QUER VER do ALVO que deve ser localizado. ` +
+    `Ex.: "qual o recurso das UBS" => campo=recurso e alvo=UBS.\n` +
+    `2. "status", "engenheiro", "recurso", "valor" etc. quando pedidos sao CAMPOS, nao filtros.\n` +
+    `3. Se o usuario nomeou uma obra/projeto/local/entidade no turno atual, novo_alvo=true e usar_contexto=false. ` +
+    `O novo alvo vence filtros antigos da conversa.\n` +
+    `4. Se a mensagem e apenas "ela", "delas", "dessas", "o engenheiro?", "e o recurso?" sem novo nome, usar_contexto=true.\n` +
+    `5. Para "fale sobre", "me explique", "detalhes" use acao=descrever.\n` +
+    `6. equivalentes_fortes sao apenas grafias/correcoes ou expressoes realmente equivalentes. ` +
+    `Termos apenas proximos ficam em relacionados. Ex.: "posto de saude" pode ser relacionado a UBS, mas nao assuma que e sempre a mesma coisa.\n` +
+    `7. Nao invente nomes de obras, bairros, pessoas ou empresas. As pistas servem somente para buscar registros reais.\n` +
+    `8. Se a pergunta estiver incompleta e nao houver contexto suficiente, precisa_esclarecer=true.\n` +
+    `9. Campos permitidos: recurso,status,engenheiro,empresa,bairro,valor_total,valor_executado,percentual_executado,contrato,convenio,tipo_recurso,data_inicio,data_prev_termino,saldo_devedor,observacoes.\n` +
+    `10. Se a pergunta for apenas sobre obras/projetos de um BAIRRO, engenheiro ou status, nao use esse filtro como alvo semantico; deixe alvo vazio e novo_alvo=false. Ex.: "obras do Centro" => Centro e filtro de local, nao alvo.\n` +
+    `11. confianca vai de 0 a 1. Nao inclua explicacoes fora do JSON.`;
+
+  try {
+    const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
+      max_tokens: 360,
+      temperature: 0,
+      reasoning_effort: "low",
+    });
+    return sanitizarPlanoAssistente(extrairJSONSeguro(bruto) || {}, pergunta);
+  } catch (e) {
+    console.warn("AGENTE/MODO ASSISTENTE: interpretacao indisponivel; seguindo fluxo normal:", e.message);
+    return null;
+  }
+}
+
+function campoNumericoDoPlano(plano = {}, pergunta = "") {
+  const p = normalizarTexto(pergunta);
+  if (plano.campos?.includes("valor_executado") || /\b(executado|executou|pago|pagou)\b/.test(p)) return "valor_executado";
+  if (plano.campos?.includes("percentual_executado") || /\b(percentual|porcentagem|avancad|adiantad)\b/.test(p)) return "percentual_executado";
+  return "valor_total";
+}
+
+function respostaPlanoPorLinhas(pergunta = "", plano = {}, diretas = [], relacionadas = []) {
+  const p = normalizarTexto(pergunta);
+  const alvo = plano.alvo || "esse assunto";
+  const campos = plano.campos?.length ? plano.campos : camposSolicitados(pergunta);
+
+  if (plano.acao === "descrever") {
+    if (diretas.length === 1) return formatarFichaRegistro(diretas[0]);
+    if (diretas.length > 1) {
+      return `Encontrei ${diretas.length} registros que podem corresponder a “${alvo}”:\n` +
+        diretas.slice(0, 12).map((l) => `• ${l.objeto}`).join("\n") +
+        `\n\nQual deles voce quer que eu detalhe?`;
+    }
+  }
+
+  if (plano.acao === "contar") {
+    let out = `Encontrei ${diretas.length} registro${diretas.length === 1 ? "" : "s"} diretamente relacionado${diretas.length === 1 ? "" : "s"} a “${alvo}”.`;
+    if (relacionadas.length) out += ` Tambem ha ${relacionadas.length} registro${relacionadas.length === 1 ? "" : "s"} relacionado${relacionadas.length === 1 ? "" : "s"}, que nao contei automaticamente como equivalente.`;
+    return out;
+  }
+
+  if (plano.acao === "somar") {
+    const campo = campoNumericoDoPlano(plano, pergunta);
+    const vals = diretas.map((l) => Number(l?.[campo])).filter(Number.isFinite);
+    if (!vals.length) return `Encontrei os registros de “${alvo}”, mas nenhum deles tem esse valor cadastrado.`;
+    const total = vals.reduce((a, b) => a + b, 0);
+    const rotulo = campo === "valor_executado" ? "Valor executado somado" : campo === "percentual_executado" ? "Percentual somado" : "Valor total cadastrado";
+    const valor = campo === "percentual_executado" ? `${total.toLocaleString("pt-BR", { maximumFractionDigits: 2 })}%` : formatarMoedaSemantica(total);
+    return `${rotulo}: ${valor}.\n\nConsiderados ${vals.length} registro${vals.length === 1 ? "" : "s"} com valor informado.`;
+  }
+
+  if (plano.acao === "comparar" || plano.acao === "ranking") {
+    const campo = campoNumericoDoPlano(plano, pergunta);
+    const validas = diretas.filter((l) => Number.isFinite(Number(l?.[campo])));
+    if (validas.length) {
+      const querMenor = /\b(menor|menos|mais barata|mais barato|menos avancad|menos adiantad)\b/.test(p);
+      validas.sort((a, b) => querMenor ? Number(a[campo]) - Number(b[campo]) : Number(b[campo]) - Number(a[campo]));
+      const vencedora = validas[0];
+      return formatarLinhaSemantica(vencedora, [campo, ...campos.filter((c) => c !== campo)]);
+    }
+  }
+
+  return redigirResultadoSemantico(
+    pergunta,
+    { alvo, termos_originais: [alvo] },
+    diretas,
+    relacionadas
+  );
+}
+
+async function tentarResolverComPlanoAssistente(pergunta = "", historico = [], plano = null) {
+  if (!plano || plano.confianca < CONFIANCA_MIN_PLANO) return null;
+  if (plano.precisa_esclarecer) {
+    return {
+      resposta: plano.pergunta_esclarecimento || "Pode me dizer qual obra, projeto, licitacao ou conjunto voce quer consultar?",
+      desambiguacao: true,
+      modoAgente: "agente1_modo_assistente",
+    };
+  }
+
+  // Referencias puras devem continuar usando a memoria de IDs/WHERE ja existente.
+  if (plano.usar_contexto && !plano.novo_alvo) return null;
+  if (!plano.novo_alvo || !plano.alvo) return null;
+  // Bairro, engenheiro, recurso/status e escopos genericos ja possuem filtros
+  // estruturados melhores que busca semantica. Ex.: "obras do Centro" nao deve
+  // exigir que a palavra Centro apareca no nome da obra.
+  if (alvoPlanoEhGenericoOuFiltro(plano.alvo, pergunta)) return null;
+
+  // Analises totalmente gerais (ex.: "qual engenheiro tem mais obras?") sao
+  // melhores no agente de ferramentas/SQL. Esta camada assume um ALVO localizavel.
+  if (!plano.equivalentes_fortes?.length) return null;
+
+  try {
+    const filtros = filtrosEstruturadosParaSemantica(pergunta);
+    const buscaDireta = await buscarCandidatosSemanticos(plano.equivalentes_fortes, filtros);
+    const diretasMap = new Map((buscaDireta.rows || []).map((r) => [Number(r.id), r]));
+
+    let buscaRelacionada = { rows: [], sql: "", params: [] };
+    if (plano.relacionados?.length) {
+      buscaRelacionada = await buscarCandidatosSemanticos(plano.relacionados, filtros);
+    }
+    const relacionadas = (buscaRelacionada.rows || []).filter((r) => !diretasMap.has(Number(r.id)));
+    const diretas = [...diretasMap.values()];
+    if (!diretas.length && !relacionadas.length) return null;
+
+    // O foco conversacional usa apenas correspondencias fortes quando elas existem.
+    // Relacionados aparecem como apoio, mas nao inflacionam contagens nem follow-ups.
+    const foco = diretas.length ? diretas : relacionadas;
+    const ids = foco.map((x) => x.id);
+    const sqlFinal = sqlDefinitivaPorIds(ids);
+    if (!sqlFinal || !sqlSegura(sqlFinal).ok) return null;
+    const final = await queryReadOnly(sqlFinal);
+    const linhasFoco = (final.rows || []).map(enriquecerLinhaParaIA);
+    const linhasRelacionadas = diretas.length ? relacionadas.map(enriquecerLinhaParaIA) : [];
+
+    const resposta = respostaPlanoPorLinhas(
+      pergunta,
+      plano,
+      diretas.length ? linhasFoco : [],
+      diretas.length ? linhasRelacionadas : linhasFoco
+    );
+    if (!resposta) return null;
+
+    // Para comparacao/ranking o item escolhido deve virar foco singular da conversa.
+    let linhasEstado = linhasFoco;
+    if ((plano.acao === "comparar" || plano.acao === "ranking") && linhasFoco.length > 1) {
+      const campo = campoNumericoDoPlano(plano, pergunta);
+      const validas = linhasFoco.filter((l) => Number.isFinite(Number(l?.[campo])));
+      if (validas.length) {
+        const querMenor = /\b(menor|menos|mais barata|mais barato|menos avancad|menos adiantad)\b/.test(normalizarTexto(pergunta));
+        validas.sort((a, b) => querMenor ? Number(a[campo]) - Number(b[campo]) : Number(b[campo]) - Number(a[campo]));
+        linhasEstado = [validas[0]];
+      }
+    }
+
+    const estado = construirEstadoSemantico(pergunta, sqlFinal, linhasEstado, historico);
+    return {
+      resposta,
+      sql: sqlFinal,
+      linhas: linhasFoco.length,
+      estado,
+      modoAgente: "agente1_modo_assistente",
+      planoAssistente: {
+        acao: plano.acao,
+        campos: plano.campos,
+        alvo: plano.alvo,
+        confianca: plano.confianca,
+      },
+      consultas: [buscaDireta.sql, buscaRelacionada.sql, sqlFinal].filter(Boolean),
+    };
+  } catch (e) {
+    console.warn("AGENTE/MODO ASSISTENTE: resolucao por plano falhou; seguindo fluxo tradicional:", e.message);
+    return null;
+  }
+}
+
 // --- FLUXO COMPLETO ---
 export async function responderPergunta(pergunta, historico = []) {
   // 0. Saudacao/agradecimento/despedida - responde sem tocar no banco.
@@ -4173,6 +4440,14 @@ export async function responderPergunta(pergunta, historico = []) {
   if (social) {
     console.log("AGENTE: resposta social (sem SQL).");
     return { resposta: social, social: true };
+  }
+
+  // 0.1. Modo Assistente: compreende a intencao ANTES de decidir como consultar.
+  // A camada devolve somente um plano JSON; SQL continua sob controle do Node.
+  const planoAssistente = await interpretarPerguntaComoAssistente(pergunta, historico);
+  if (planoAssistente) {
+    const resolvidaPeloPlano = await tentarResolverComPlanoAssistente(pergunta, historico, planoAssistente);
+    if (resolvidaPeloPlano) return resolvidaPeloPlano;
   }
 
   // 0.2. Se falta o alvo e nao existe contexto anterior, pergunta antes de
