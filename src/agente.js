@@ -679,8 +679,7 @@ function exemplosRelevantes(pergunta = "", limite = 4) {
 
   const texto = todos.map((e) =>
     `Exemplo de interpretacao: "${e.pergunta}" -> ${e.regra}`
-  ).join("
-");
+  ).join("\n");
 
   return { texto };
 }
