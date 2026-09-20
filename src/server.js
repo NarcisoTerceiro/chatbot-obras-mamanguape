@@ -16,6 +16,7 @@ import express from "express";
 import { getObras, getDiagnostico } from "./sheets.js";
 import { sincronizar } from "./ingestao.js";
 import { responderPergunta } from "./agente.js";
+import { responderPergunta as responderPerguntaV2 } from "./agente_v2.js";
 import { buscarObrasPorTermos, buscarObras, buscarPorEngenheiro } from "./search.js";
 import { interpretarPergunta, redigirResposta, calcularComCodeExecution, gerarCodigoPython } from "./groq.js";
 import { executarAgregacao, executarReceita } from "./agregacao.js";
@@ -41,6 +42,20 @@ const USAR_AGENTE_SQL = process.env.USAR_AGENTE_SQL !== "false";
 const PERMITIR_TOKEN_QUERY = process.env.PERMITIR_TOKEN_QUERY === "true";
 const PERMITIR_SYNC_GET_LEGADO = process.env.PERMITIR_SYNC_GET_LEGADO === "true";
 const HABILITAR_TESTE_PUBLICO = process.env.HABILITAR_TESTE_PUBLICO === "true";
+// Seleciona qual agente SQL atende /testar-agente e o WhatsApp.
+// false (padrao) = agente.js atual; true = agente_v2.js.
+// Isso permite rollback no Render sem trocar arquivos.
+const AGENTE_V2 = process.env.AGENTE_V2 === "true";
+
+function nomeAgenteAtivo() {
+  return AGENTE_V2 ? "v2" : "v1";
+}
+
+async function responderComAgenteAtivo(pergunta, historico = []) {
+  return AGENTE_V2
+    ? responderPerguntaV2(pergunta, historico)
+    : responderPergunta(pergunta, historico);
+}
 
 if (!VERIFY_TOKEN) {
   throw new Error("VERIFY_TOKEN e obrigatorio; o servidor nao inicia sem ele.");
@@ -194,6 +209,7 @@ app.get("/diagnostico", async (req, res) => {
       ]);
       return res.json({
         fonte_do_atendimento: "PostgreSQL/Supabase",
+        agente_sql_ativo: nomeAgenteAtivo(),
         total_de_obras: total.rows[0]?.total || 0,
         contagem_por_status: status.rows,
         exemplo_de_obra: exemplo.rows[0] || null,
@@ -308,7 +324,7 @@ app.get("/testar-agente", async (req, res) => {
   const historico = lerHistoricoTeste(chave);
 
   try {
-    const r = await responderPergunta(pergunta, historico);
+    const r = await responderComAgenteAtivo(pergunta, historico);
 
     salvarHistoricoTeste(chave, [
       ...historico,
@@ -322,6 +338,7 @@ app.get("/testar-agente", async (req, res) => {
     ]);
 
     res.json({
+      motor: nomeAgenteAtivo(),
       pergunta,
       sql_gerada: r.sql || r.sqlBloqueada || null,
       linhas_retornadas: r.linhas ?? null,
@@ -394,6 +411,7 @@ app.get("/teste-publico", async (req, res) => {
       ok: true,
       rota: "teste-publico",
       ativa: true,
+      motor: "v2",
       uso: "/teste-publico?q=sua+pergunta&sessao=teste1",
       dica_memoria: "Use a mesma sessao nas perguntas seguintes. Use reset=1 para limpar.",
     });
@@ -408,7 +426,9 @@ app.get("/teste-publico", async (req, res) => {
   const historico = lerHistoricoTeste(chave);
 
   try {
-    const r = await responderPergunta(pergunta, historico);
+    // A rota publica usa a V2 em paralelo. O WhatsApp e /testar-agente
+    // continuam usando o agente atual ate a bateria de regressao aprovar a V2.
+    const r = await responderPerguntaV2(pergunta, historico);
 
     salvarHistoricoTeste(chave, [
       ...historico,
@@ -418,16 +438,20 @@ app.get("/teste-publico", async (req, res) => {
         content: r.resposta,
         sql: r.sql || null,
         linhas: r.linhas ?? null,
+        estado: r.estado || null,
       },
     ]);
 
     return res.json({
       ok: !r.erro,
+      motor: "v2",
       sessao: chave.replace(/^publico:/, ""),
       pergunta,
       resposta: r.resposta,
       sql_gerada: r.sql || r.sqlBloqueada || null,
       linhas_retornadas: r.linhas ?? null,
+      planejador: r.planejador || null,
+      plano_v2: r.plano || null,
       erro: r.erro || null,
     });
   } catch (e) {
@@ -875,7 +899,7 @@ async function processarMensagem(mensagem) {
     let respostaAg;
     let resultadoAg = null;
     try {
-      resultadoAg = await responderPergunta(pergunta, historicoAg);
+      resultadoAg = await responderComAgenteAtivo(pergunta, historicoAg);
       respostaAg = resultadoAg.resposta;
     } catch (e) {
       console.error("AGENTE SQL falhou:", e.message);
@@ -1581,6 +1605,8 @@ async function processarMensagem(mensagem) {
 
   await enviarTexto(de, texto);
 }
+
+console.log(`Agente SQL selecionado: ${nomeAgenteAtivo()} (AGENTE_V2=${AGENTE_V2})`);
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
