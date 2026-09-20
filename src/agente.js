@@ -11,12 +11,12 @@
 //  Os calculos continuam sendo feitos pelo PostgreSQL.
 // ============================================================
 
-import { queryReadOnly, buscarConhecimentoAprovado, registrarConhecimentoCandidato, registrarUsoConhecimento } from "./db.js";
+import { queryReadOnly } from "./db.js";
 import { chamarIAbruta } from "./groq.js"; // reaproveita a chamada de IA que ja existe
 
 // MODO PADRAO: IA interpreta a linguagem natural; o Node atua como guardrail.
-// O planejador usa exemplos semanticos recuperados por relevancia (estilo Vanna),
-// schema dinamico e memoria estruturada; exemplos ensinam regras, nao frases fixas.
+// O planejador usa schema dinamico, regras gerais e memoria de conversa.
+// Nao existe aprendizado persistente nem gravacao de perguntas/padroes.
 // As regras rapidas antigas ficam disponiveis apenas como fallback de contingencia
 // (ou se AGENTE_SQL_RAPIDA=true). Assim o chatbot nao depende de frases fixas.
 const USAR_SQL_RAPIDA_PRIMEIRO = process.env.AGENTE_SQL_RAPIDA === "true";
@@ -667,62 +667,26 @@ function scoreExemploSemantico(exemplo, pergunta = "") {
   return score;
 }
 
-// Recupera conhecimento APROVADO do Supabase e combina com um conjunto-base
-// embutido. O banco vence o exemplo local quando ambos forem relevantes.
-// Itens CANDIDATE/REJECTED nunca entram no prompt do planejador.
-async function exemplosRelevantes(pergunta = "", limite = 4) {
-  let persistentes = [];
-  try {
-    const rows = await buscarConhecimentoAprovado({ limite: 200 });
-    persistentes = (rows || []).map((r) => ({
-      id: `db:${r.id}`,
-      dbId: Number(r.id),
-      pergunta: r.pergunta_exemplo || "",
-      tags: `${r.tags || ""} ${(r.campos_envolvidos || []).join(" ")} ${r.escopo || ""} ${r.padrao_chave || ""} ${JSON.stringify(r.padrao || {})}`,
-      regra: r.regra_negocio || "",
-      sql: r.sql_exemplo || "",
-      padrao: r.padrao || null,
-      persistente: true,
-    }));
-  } catch (e) {
-    console.warn("AGENTE: conhecimento persistente indisponivel:", e.message);
-  }
-
-  const todos = [...persistentes, ...EXEMPLOS_SEMANTICOS]
+// Seleciona somente exemplos gerais embutidos no codigo.
+// Eles servem como orientacao de negocio, nao sao frases exigidas e nao sao
+// alterados pelo uso do chatbot. Nenhuma pergunta do usuario e gravada aqui.
+function exemplosRelevantes(pergunta = "", limite = 4) {
+  const todos = EXEMPLOS_SEMANTICOS
     .map((e) => ({ ...e, score: scoreExemploSemantico(e, pergunta) }))
-    .sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      return Number(Boolean(b.persistente)) - Number(Boolean(a.persistente));
-    })
+    .sort((a, b) => b.score - a.score)
     .filter((e, i) => e.score > 0 || i === 0)
     .slice(0, Math.max(1, limite));
 
-  const ids = todos.filter((e) => e.persistente && Number.isInteger(e.dbId)).map((e) => e.dbId);
-  const texto = todos.map((e) => {
-    const sql = e.sql ? `\nSQL de referencia APROVADA: ${String(e.sql).replace(/\s+/g, " ").slice(0, 900)}` : "";
-    return `Exemplo de interpretacao: "${e.pergunta}" -> ${e.regra}${sql}`;
-  }).join("\n");
+  const texto = todos.map((e) =>
+    `Exemplo de interpretacao: "${e.pergunta}" -> ${e.regra}`
+  ).join("
+");
 
-  return { texto, ids };
+  return { texto };
 }
 
-// Historico comum serve para CONTEXTO, mas nao para "ensinar" o agente.
-// So reutilizamos como exemplo de treinamento se uma mensagem tiver sido
-// explicitamente marcada como conhecimento aprovado. Isso evita aprender
-// automaticamente uma SQL que apenas executou sem erro, mas estava errada.
-function exemplosCorretosDoHistorico(historico = [], limite = 2) {
-  if (!Array.isArray(historico) || !historico.length) return "";
-  const pares = [];
-  for (let i = 0; i < historico.length - 1; i++) {
-    const u = historico[i];
-    const a = historico[i + 1];
-    const aprovado = a?.conhecimentoAprovado === true || a?.knowledgeApproved === true;
-    if (u?.role === "user" && a?.role === "assistant" && a?.sql && aprovado) {
-      pares.push({ pergunta: String(u.content || "").slice(0, 260), sql: String(a.sql).replace(/\s+/g, " ").slice(0, 700) });
-    }
-  }
-  return pares.slice(-limite).map((x) => `Pergunta aprovada: "${x.pergunta}"\nSQL aprovada usada: ${x.sql}`).join("\n");
-}
+// O historico comum serve apenas para CONTEXTO da conversa.
+// Ele nao vira treinamento nem conhecimento permanente.
 
 function camposSolicitados(pergunta = "") {
   const p = normalizarTexto(pergunta);
@@ -2606,7 +2570,7 @@ async function planejarPassoFerramenta(pergunta, historico, consultas = [], erro
   const prioritario = contextoPrioritario(historico);
   const resultados = serializarConsultasFerramenta(consultas);
   const pistas = pistasInterpretacaoPergunta(pergunta);
-  const conhecimento = await exemplosRelevantes(pergunta, 4);
+  const conhecimento = exemplosRelevantes(pergunta, 4);
 
   const prompt = `Voce e o PLANEJADOR de um assistente que conversa livremente com uma base de obras publicas.
 Voce NAO responde usando conhecimento proprio. Voce possui uma unica ferramenta: CONSULTAR_BANCO, que executa SELECT somente leitura na tabela obras.
@@ -2630,10 +2594,7 @@ PISTAS DE INTERPRETACAO GERADAS PELO NODE (apoio; nao sao resposta):
 ${JSON.stringify(pistas)}
 
 EXEMPLOS SEMANTICOS RELEVANTES (ensinam regra; NAO sao frases fixas):
-${conhecimento.texto || "(nenhum exemplo aprovado relevante; use schema e regras gerais)"}
-
-EXEMPLOS CORRETOS DA PROPRIA CONVERSA (quando existirem):
-${exemplosCorretosDoHistorico(historico) || "(nenhum ainda)"}
+${conhecimento.texto || "(use schema e regras gerais)"}
 
 REGRAS DE COMPORTAMENTO:
 - Entenda linguagem natural, sinonimos, erros de digitacao e perguntas nunca vistas. Nao dependa de frases cadastradas.
@@ -2683,10 +2644,6 @@ ${erroAnterior ? `\nA tentativa anterior foi rejeitada/falhou: ${erroAnterior}. 
 
   const obj = extrairJSONSeguro(bruto);
   if (!obj || !obj.acao) throw new Error("planejador nao retornou JSON valido");
-  obj._knowledgeIds = conhecimento.ids || [];
-  if (obj._knowledgeIds.length) {
-    registrarUsoConhecimento(obj._knowledgeIds).catch(() => {});
-  }
   return obj;
 }
 
@@ -2934,102 +2891,12 @@ function generalizarSQLParaPadrao(sql = "") {
     .trim();
 }
 
-function construirPadraoConhecimento(pergunta = "", sql = "", estado = {}, plano = {}) {
-  const operacao = operacaoCanonicaDoPadrao(plano, sql);
-  const escopo = escopoCanonicoDoPadrao(estado, sql);
-  const campos = listaCanonicaPadrao([
-    ...camposSolicitados(pergunta),
-    ...(Array.isArray(plano?.campos) ? plano.campos : []),
-  ]);
-  const filtros = filtrosEstruturaisDoPadrao(plano, estado, sql);
-  const agrupamento = agrupamentoDoPadrao(plano, sql);
-  const p = normalizarTexto(pergunta);
-  const referencia_anterior = /\b(ela|ele|delas?|deles?|essas?|esses?|dessas?|desses?|nessa|nesse|nela|nele)\b/.test(p);
-  const entidade_livre = Boolean(plano?.entidade_livre) || filtros.includes("objeto");
-
-  // Nao guarda o VALOR do bairro, engenheiro, entidade etc. Guarda apenas a
-  // ESTRUTURA que funcionou. Assim "Centro" e "Cristo Rei" viram o mesmo
-  // padrao de filtro por bairro; "UBS" e "escola" viram o mesmo padrao de
-  // entidade livre no objeto.
-  const padrao = {
-    versao: 2,
-    operacao,
-    escopo,
-    campos,
-    filtros,
-    agrupamento,
-    entidade_livre,
-    referencia_anterior,
-  };
-  const chave = [
-    "v2",
-    `op=${operacao}`,
-    `escopo=${escopo}`,
-    `campos=${campos.join(",") || "-"}`,
-    `filtros=${filtros.join(",") || "-"}`,
-    `grupo=${agrupamento || "-"}`,
-    `entidade=${entidade_livre ? 1 : 0}`,
-    `ref=${referencia_anterior ? 1 : 0}`,
-  ].join("|");
-  const descricao = `PADRAO: ${operacao} | escopo=${escopo} | campos=${campos.join(",") || "-"} | filtros=${filtros.join(",") || "-"}${agrupamento ? ` | agrupar=${agrupamento}` : ""}${entidade_livre ? " | entidade_livre" : ""}${referencia_anterior ? " | referencia_anterior" : ""}`;
-  return { padrao, chave, descricao, sqlModelo: generalizarSQLParaPadrao(sql) };
-}
-
-function registrarCandidatoSeguro(pergunta, sql, estado, plano = {}) {
-  if (!sql || !/^\s*select\b/i.test(sql)) return;
-
-  const info = construirPadraoConhecimento(pergunta, sql, estado, plano);
-  // Evita aprender um padrao generico demais, como apenas "listar tudo" sem
-  // escopo/campo/filtro. Isso mantem a base pequena e realmente util.
-  const util = info.padrao.operacao !== "listar" ||
-    info.padrao.escopo !== "indefinido" ||
-    info.padrao.campos.length || info.padrao.filtros.length ||
-    info.padrao.agrupamento || info.padrao.entidade_livre || info.padrao.referencia_anterior;
-  if (!util) return;
-
-  const intencao = {
-    operacao: info.padrao.operacao,
-    escopo: info.padrao.escopo,
-    campos: info.padrao.campos,
-    filtros: info.padrao.filtros,
-    agrupamento: info.padrao.agrupamento,
-    entidade_livre: info.padrao.entidade_livre,
-    referencia_anterior: info.padrao.referencia_anterior,
-  };
-  const tags = [
-    info.padrao.operacao,
-    info.padrao.escopo,
-    ...info.padrao.campos,
-    ...info.padrao.filtros,
-    info.padrao.agrupamento,
-    info.padrao.entidade_livre ? "entidade_livre" : null,
-    info.padrao.referencia_anterior ? "referencia_anterior" : null,
-  ].filter(Boolean).join(" ");
-
-  // So chega aqui DEPOIS que a SQL executou e a resposta passou pelas
-  // auditorias. Mesmo assim entra como CANDIDATE: precisa de aprovacao humana
-  // para ensinar o agente. O banco faz UPSERT por padrao_chave; frases diferentes
-  // com a mesma estrutura incrementam "sucessos" na MESMA linha.
-  registrarConhecimentoCandidato({
-    pergunta_exemplo: info.descricao,
-    intencao,
-    escopo: info.padrao.escopo,
-    regra_negocio: `Padrao estrutural validado em execucao: ${info.descricao}. Valores literais da pergunta nao sao armazenados. Aguardar aprovacao humana antes de usar como conhecimento permanente.`,
-    sql_exemplo: info.sqlModelo,
-    campos_envolvidos: info.padrao.campos,
-    tags,
-    origem: "agente_padrao_validado",
-    padrao_chave: info.chave,
-    padrao: info.padrao,
-  }).catch((e) => console.warn("AGENTE: nao foi possivel salvar padrao candidato:", e.message));
-}
-
 async function responderComFerramentas(pergunta, historico = []) {
   const consultas = [];
   let erroAnterior = null;
   let sqlAnteriorNoTurno = "";
   let estadoAtual = ultimoEstadoDoHistorico(historico) || null;
-  let ultimoPlanoValido = {};
+  let ultimoPlanoValido = {}; // usado apenas para auditoria do turno; nao e salvo
 
   for (let passo = 0; passo < MAX_PASSOS_FERRAMENTAS; passo++) {
     const decisao = await planejarPassoFerramenta(pergunta, historico, consultas, erroAnterior);
@@ -3148,9 +3015,6 @@ async function responderComFerramentas(pergunta, historico = []) {
       if (!estadoAtual || typeof estadoAtual !== "object") {
         estadoAtual = estadoDaUltimaConsulta([{ role: "assistant", sql: ultimaDireta.sql }]);
       }
-      // So um padrao cuja RESPOSTA tambem passou pelas auditorias pode virar
-      // candidato. SQL que rodou mas respondeu a intencao errada nao e aprendida.
-      registrarCandidatoSeguro(pergunta, ultimaDireta.sql, estadoAtual, ultimoPlanoValido);
       return {
         resposta: direta,
         sql: ultimaDireta.sql,
@@ -3199,7 +3063,6 @@ async function responderComFerramentas(pergunta, historico = []) {
     };
   }
 
-  registrarCandidatoSeguro(pergunta, ultima.sql, estadoAtual, ultimoPlanoValido);
   return {
     resposta,
     sql: ultima.sql,
