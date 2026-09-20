@@ -1,5 +1,5 @@
 // ============================================================
-//  agente.js - AGENTE 1 REFORCADO
+//  agente.js - AGENTE 1 REFORCADO (correcao recurso x sujeito)
 //  Agente conversacional de analytics. Fluxo padrao de 2 chamadas:
 //    1) IA recebe a PERGUNTA + o schema da tabela -> gera SQL
 //    2) Validamos a SQL (so SELECT, bloqueia comandos perigosos)
@@ -497,6 +497,14 @@ function normalizarTexto(s = "") {
     [/\brecusos\b/g, "recursos"],
     [/\brecusso\b/g, "recurso"],
     [/\brecussos\b/g, "recursos"],
+    [/\bultilizado\b/g, "utilizado"],
+    [/\bultilizados\b/g, "utilizados"],
+    [/\bultilizada\b/g, "utilizada"],
+    [/\bultilizadas\b/g, "utilizadas"],
+    [/\butilisado\b/g, "utilizado"],
+    [/\butilisados\b/g, "utilizados"],
+    [/\butilisada\b/g, "utilizada"],
+    [/\butilisadas\b/g, "utilizadas"],
     [/\bengenhero\b/g, "engenheiro"],
     [/\bengenheros\b/g, "engenheiros"],
   ];
@@ -587,6 +595,8 @@ function termosLivresCandidatos(pergunta = "") {
     "ligado","ligada","ligados","ligadas","sobre","municipio","prefeitura",
     "soma","somam","somar","somando","somado","somados","ja","dinheiro","base","planilha","banco","sistema",
     "servico","servicos","aparece","aparecem","acima","abaixo","superior","inferior",
+    "utilizado","utilizados","utilizada","utilizadas","usado","usados","usada","usadas",
+    "empregado","empregados","empregada","empregadas","aplicado","aplicados","aplicada","aplicadas",
     "ela","elas","ele","eles","dela","delas","dele","deles","nela","nelas","nele","neles",
     "essa","essas","esse","esses","dessa","dessas","desse","desses","esta","estas","este","estes",
     "desta","destas","deste","destes","nessa","nessas","nesse","nesses","nesta","nestas","neste","nestes"
@@ -777,34 +787,45 @@ function termoFiltroRecursoDaPergunta(pergunta = "") {
 
   let termo = "";
 
-  // Formas mais claras de filtro: usam/com/possuem recurso X.
+  // Quando o verbo vem ANTES de "recurso", existe um valor de recurso sendo
+  // usado como FILTRO: "quais usam recurso proprio?", "obras com recurso FNDE".
+  // Esse formato tem prioridade porque e semanticamente inequívoco.
   let m = p.match(/\b(?:usam?|utilizam?|possuem?|tem|com)\s+(?:o\s+|os\s+)?(?:recursos?|fontes?(?: do recurso)?)\s+(.+)$/i);
   if (m) termo = m[1] || "";
 
-  // Tambem aceita "recurso proprio", "recurso federal", "fonte caixa ogu".
-  // Se vier "recurso da UBS"/"recursos das obras", isso e campo pedido,
-  // nao valor de filtro, portanto ignoramos.
-  if (!termo) {
-    m = p.match(/\b(?:recursos?|fontes?(?: do recurso)?)\s+(.+)$/i);
-    const candidato = (m?.[1] || "").trim();
-    if (candidato && !/^(?:da|das|do|dos|de|dela|delas|dele|deles|na|nas|no|nos)\b/i.test(candidato)) {
-      termo = candidato;
-    }
+  if (termo) {
+    termo = termo
+      .replace(/\s+\b(?:nas?|nos?|em)\s+(?:obras?|projetos?|pavimentacoes?|licitacoes?|registros?)\b.*$/i, "")
+      .replace(/\s+\b(?:que|e)\s+(?:estao|sao|tem|possuem|ficam|foram)\b.*$/i, "")
+      .trim();
+    if (!termo || /^(?:qual|quais|quanto|quantos|quantas|status|engenheiro|responsavel|empresa|bairro|valor)$/i.test(termo)) return "";
+    return termo.slice(0, 80);
   }
 
-  termo = termo.trim();
-  if (!termo) return "";
+  // "quais os recursos utilizados nas UBS?" significa PEDIR o campo recurso
+  // das UBS; "utilizados" nao e o nome de um recurso. O mesmo vale para
+  // "recursos usados", "fontes aplicadas" etc. Essa barreira impede SQL como
+  // recurso ILIKE '%utilizados nas ubs%'.
+  const pedeRecursoComoCampo =
+    /\b(?:qual|quais|informe|informar|mostre|mostrar|liste|listar|diga|saber)\b[\s\S]*?\b(?:recursos?|fontes?(?: do recurso)?)\b/i.test(p) ||
+    /\b(?:recursos?|fontes?(?: do recurso)?)\s+(?:utilizad[oa]s?|usad[oa]s?|empregad[oa]s?|aplicad[oa]s?)\b/i.test(p);
+  if (pedeRecursoComoCampo) return "";
 
-  // Remove uma nova clausula estrutural que venha depois do valor do recurso,
-  // sem manter nomes especificos fixos no codigo.
-  termo = termo
+  // Forma curta de filtro: "recurso proprio", "fonte caixa", "recurso federal".
+  // Se vier "recurso da UBS"/"recursos das obras", e campo pedido e nao filtro.
+  m = p.match(/\b(?:recursos?|fontes?(?: do recurso)?)\s+(.+)$/i);
+  let candidato = (m?.[1] || "").trim();
+  if (!candidato) return "";
+  if (/^(?:da|das|do|dos|de|dela|delas|dele|deles|na|nas|no|nos|em)\b/i.test(candidato)) return "";
+  if (/^(?:utilizad[oa]s?|usad[oa]s?|empregad[oa]s?|aplicad[oa]s?)(?:\s|$)/i.test(candidato)) return "";
+
+  candidato = candidato
     .replace(/\s+\b(?:nas?|nos?|em)\s+(?:obras?|projetos?|pavimentacoes?|licitacoes?|registros?)\b.*$/i, "")
     .replace(/\s+\b(?:que|e)\s+(?:estao|sao|tem|possuem|ficam|foram)\b.*$/i, "")
     .trim();
 
-  // Evita transformar palavras de comando em valor de recurso.
-  if (!termo || /^(?:qual|quais|quanto|quantos|quantas|status|engenheiro|responsavel|empresa|bairro|valor)$/i.test(termo)) return "";
-  return termo.slice(0, 80);
+  if (!candidato || /^(?:qual|quais|quanto|quantos|quantas|status|engenheiro|responsavel|empresa|bairro|valor)$/i.test(candidato)) return "";
+  return candidato.slice(0, 80);
 }
 
 function expressaoRecursoCanonicoSQL() {
@@ -1115,6 +1136,20 @@ function pareceItemEspecifico(p) {
   // "recurso e engenheiro da UBS X" cair no filtro errado de profissional.
   const pedeCampo = /\b(valores?|quanto|responsaveis?|engenheir[oa]s?|arquit(?:eto|eta|etos|etas)?|empresas?|contratos?|convenios?|recursos?|status|situacao|percentual|porcentagem|executad[oa]s?|prazo|datas?|detalh\w*|informac\w*)\b/.test(p);
   return temEntidade && pedeCampo;
+}
+
+// Diferencia "campo de UM item" de "campo de um GRUPO". Exemplos:
+// - "recurso da UBS do Cristo Rei" -> item especifico (IA pode localizar nome completo)
+// - "recursos utilizados nas UBS" -> grupo livre (Node procura UBS e projeta recurso)
+// O plural introduzido por nas/nos/das/dos e a pista estrutural; nao mantemos
+// uma lista fixa de entidades para decidir isso.
+function pedeCampoSobreGrupoLivre(pergunta = "") {
+  const p = normalizarTexto(pergunta);
+  const pedeCampo = /\b(recursos?|fontes?|contratos?|convenios?|engenheiros?|responsaveis?|empresas?|status|situacao|valores?|percentual|porcentagem)\b/.test(p);
+  if (!pedeCampo) return false;
+  if (!/\b(?:nas|nos|das|dos)\s+[a-z0-9]/.test(p)) return false;
+  const termos = termosLivresCandidatos(pergunta);
+  return termos.length >= 1 && termos.length <= 3;
 }
 
 // Extrai um nome de profissional quando a pergunta usa algo como
@@ -1525,7 +1560,7 @@ function gerarSQLRapida(pergunta, historico = []) {
   const referenciaAnterior = /\b(dessas?|destas?|nessas?|nestas?|delas?|deles?|dele|dela|essas?|esses?|elas?|eles?|nela|nele|anteriores?|anterior|acima|mesmas?|mesmos?|isso|essa|esse)\b/.test(p);
   const perguntaCurtaLista = /^(?:e\s+)?quais(?:\s+sao)?$|^(?:lista|liste|mostra|mostre)(?:\s+(?:elas|essas|as obras))?$/.test(p);
   const curtaDeAcompanhamento = p.split(" ").length <= 7 && (
-    /\b(engenheiros?|engenheiras?|responsaveis?|empresas?|executoras?|valor|valores|custo|bairro|status|situacao|nomes?|quantos|quantas|total|percentual|porcentagem|recurso|contrato|convenio)\b/.test(p) ||
+    /\b(engenheiros?|engenheiras?|responsaveis?|empresas?|executoras?|valor|valores|custo|bairro|status|situacao|nomes?|quantos|quantas|total|percentual|porcentagem|recursos?|contratos?|convenios?)\b/.test(p) ||
     perguntaCurtaLista
   );
 
@@ -1553,7 +1588,9 @@ function gerarSQLRapida(pergunta, historico = []) {
   // montar a busca exata pelo objeto. Isso evita o erro de interpretar apenas o
   // bairro no fim do nome (ex.: "valor da Creche ... no Centro").
   const itemEspecificoSemContexto = pareceItemEspecifico(p) && !referenciaAnterior;
-  if (itemEspecificoSemContexto) return null;
+  // "recursos utilizados nas UBS" e uma consulta de GRUPO, nao de uma UBS
+  // individual. Deixamos o caminho deterministico montar a busca livre.
+  if (itemEspecificoSemContexto && !pedeCampoSobreGrupoLivre(pergunta)) return null;
 
   // Caso importante: "quantas obras estao em andamento?" precisa responder
   // o TOTAL PRINCIPAL da aba EM_ANDAMENTO e, ao mesmo tempo, explicar os grupos
@@ -1829,7 +1866,7 @@ function ehFollowupReferencialForte(pergunta = "") {
   // So forcamos o caminho deterministico quando a frase realmente parece uma
   // continuacao. Filtros novos (status, bairro, valor, responsavel etc.) ainda
   // sao combinados normalmente pelo gerarSQLRapida com o WHERE anterior.
-  return p.split(" " ).length <= 16 || /\b(quais|quantas|quantos|valor|valores|bairro|status|engenheir|responsavel|empresa|percentual|recurso|contrato|convenio|concluid|andamento|maior|menor)\b/.test(p);
+  return p.split(" " ).length <= 16 || /\b(quais|quantas|quantos|valor|valores|bairro|status|engenheir|responsavel|empresa|percentual|recursos?|contratos?|convenios?|concluid|andamento|maior|menor)\b/.test(p);
 }
 
 // --- CHAMADA 1: pergunta -> SQL ---
