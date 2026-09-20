@@ -1698,7 +1698,14 @@ function sqlRankingResponsavel(p, filtroStatus = "", filtroLocal = "", filtroEsc
 
   // Se tambem pediu "quais sao", devolvemos as obras do profissional que lidera,
   // permitindo responder nome + quantidade + lista numa unica consulta.
-  const pedeLista = /\b(quais|liste|lista|mostrar?|nomes?)\b/.test(p) && /\b(obras?|projetos?|pavimentacoes?|licitacoes?|registros?)\b/.test(p);
+  // So lista as obras do lider quando a pessoa pedir explicitamente a LISTA
+  // dos registros. Antes, "quais os engenheiros tem mais obras?" era lido
+  // como se "quais" pedisse as obras, gerando uma SQL de itens em vez do
+  // ranking agregado por responsavel.
+  const pedeLista = (
+    /\b(?:quais(?:\s+sao)?|liste|lista|mostre|mostrar|nomes?)\s+(?:as\s+|os\s+)?(?:obras?|projetos?|pavimentacoes?|licitacoes?|registros?)\b/.test(p) ||
+    /\be\s+quais\s+(?:sao\s+)?(?:elas|eles)\b/.test(p)
+  );
   if (pedeLista) {
     const escopoSub = filtros.filter((f) => !/^engenheiro IS NOT NULL$|^BTRIM\(engenheiro\)/i.test(f));
     const whereSub = escopoSub.length ? `WHERE ${escopoSub.join(" AND ")} AND engenheiro IS NOT NULL AND BTRIM(engenheiro) <> ''` : "WHERE engenheiro IS NOT NULL AND BTRIM(engenheiro) <> ''";
@@ -1916,17 +1923,37 @@ function construirEstadoSemantico(pergunta = "", sql = "", linhas = [], historic
   let whereConjunto = wherePorIds || base.where || whereSQLAtual || anterior.where_conjunto || "";
   let focoObjeto = null;
   let focoEngenheiro = anterior.foco_engenheiro || null;
+  let focoEngenheiros = Array.isArray(anterior.foco_engenheiros) ? anterior.foco_engenheiros : [];
 
-  // Ranking de responsavel: a primeira linha e o vencedor pois a SQL ordena a
-  // contagem. O foco profissional continua vivo mesmo se depois o usuario
-  // refinar "dessas obras, quais concluidas?".
+  // Ranking de responsavel: nao escolhemos arbitrariamente o primeiro quando
+  // existe EMPATE. Se houver um unico lider, ele vira foco singular. Se houver
+  // empate, o conjunto focado passa a ser todos os lideres empatados.
   if (ehRankingResponsavel(p) && registros[0]?.engenheiro) {
-    focoEngenheiro = String(registros[0].engenheiro).trim();
-    const partes = [];
-    const ce = condicaoPorRotuloEscopo(escopo || rotuloEscopoDaPergunta(p));
-    if (ce) partes.push(ce);
-    partes.push(condicaoEngenheiroExato(focoEngenheiro));
-    whereConjunto = partes.filter(Boolean).join(" AND ");
+    const melhorQtd = Number(registros[0]?.quantidade_registros);
+    const lideres = Number.isFinite(melhorQtd)
+      ? registros.filter((r) => Number(r?.quantidade_registros) === melhorQtd && r?.engenheiro)
+      : [registros[0]];
+    focoEngenheiros = [...new Set(lideres.map((r) => String(r.engenheiro).trim()).filter(Boolean))];
+
+    const partesBase = [];
+    // base.where preserva filtros relevantes da pergunta atual (ex.: concluidas).
+    // Se estiver vazio, pelo menos preservamos o escopo de negocio.
+    if (base.where) partesBase.push(base.where);
+    else {
+      const ce = condicaoPorRotuloEscopo(escopo || rotuloEscopoDaPergunta(p));
+      if (ce) partesBase.push(ce);
+    }
+
+    if (focoEngenheiros.length === 1) {
+      focoEngenheiro = focoEngenheiros[0];
+      partesBase.push(condicaoEngenheiroExato(focoEngenheiro));
+      whereConjunto = partesBase.filter(Boolean).join(" AND ");
+    } else if (focoEngenheiros.length > 1) {
+      focoEngenheiro = null;
+      const condEmpate = focoEngenheiros.map(condicaoEngenheiroExato).filter(Boolean);
+      if (condEmpate.length) partesBase.push(`(${condEmpate.join(" OR ")})`);
+      whereConjunto = partesBase.filter(Boolean).join(" AND ");
+    }
   }
 
   const escolheUmItem = /\b(maior|menor|mais avancad|menos avancad|maior percentual|menor percentual|mais cara|mais caro|mais barata|mais barato)\b/.test(p);
@@ -1947,6 +1974,7 @@ function construirEstadoSemantico(pergunta = "", sql = "", linhas = [], historic
     where_conjunto: whereConjunto || null,
     foco_objeto: focoObjeto,
     foco_engenheiro: focoEngenheiro,
+    foco_engenheiros: focoEngenheiros,
     ultima_sql: sql || null,
     quantidade_resultados: registros.length,
   };
@@ -1991,7 +2019,18 @@ function gerarSQLRapida(pergunta, historico = []) {
   // PAGINACAO: "mostrar mais", "mais 10", "proximas", "ver mais obras".
   // Reaproveita o filtro da consulta anterior e pula as que ja foram mostradas.
   // Conta quantas ja apareceram somando os blocos de 10 pedidos antes.
-  const pedeMais = /\b(mais\s+\d*\s*obras?|mostrar? mais|ver mais|proxim|seguintes?|continua|continuar|mais 10|outras? 10)\b/.test(p);
+  // PAGINACAO precisa ser um pedido EXPLICITO de continuacao.
+  // Antes, a expressao "mais obras" tambem casava com perguntas analiticas
+  // como "qual engenheiro tem mais obras concluidas?", reaproveitando o
+  // conjunto anterior e gerando OFFSET indevido. Rankings nunca sao paginacao.
+  const pedeMais = !ehRankingResponsavel(p) && (
+    /\b(?:mostrar|mostre|ver)\s+mais\b/.test(p) ||
+    /\b(?:proximas?|proximos?|seguintes?)\b/.test(p) ||
+    /\b(?:continua|continuar|continue)\b/.test(p) ||
+    /\bmais\s+\d+\s*(?:obras?|projetos?|pavimentacoes?|licitacoes?|registros?)?\b/.test(p) ||
+    /\boutras?\s+\d+\s*(?:obras?|projetos?|pavimentacoes?|licitacoes?|registros?)?\b/.test(p) ||
+    /^(?:mais|outras?)\s+(?:obras?|projetos?|pavimentacoes?|licitacoes?|registros?)$/.test(p)
+  );
   if (pedeMais && condAnterior) {
     // conta quantas vezes o cidadao ja pediu "mais" nesta sequencia
     let jaMostrou = 10; // o primeiro bloco (as 10 primeiras)
