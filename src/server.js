@@ -40,6 +40,7 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || VERIFY_TOKEN;
 const USAR_AGENTE_SQL = process.env.USAR_AGENTE_SQL !== "false";
 const PERMITIR_TOKEN_QUERY = process.env.PERMITIR_TOKEN_QUERY === "true";
 const PERMITIR_SYNC_GET_LEGADO = process.env.PERMITIR_SYNC_GET_LEGADO === "true";
+const HABILITAR_TESTE_PUBLICO = process.env.HABILITAR_TESTE_PUBLICO === "true";
 
 if (!VERIFY_TOKEN) {
   throw new Error("VERIFY_TOKEN e obrigatorio; o servidor nao inicia sem ele.");
@@ -317,7 +318,6 @@ app.get("/testar-agente", async (req, res) => {
         content: r.resposta,
         sql: r.sql || null,
         linhas: r.linhas ?? null,
-        estado: r.estado || null,
       },
     ]);
 
@@ -330,6 +330,113 @@ app.get("/testar-agente", async (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ erro: e.message });
+  }
+});
+
+
+// ------------------------------------------------------------
+//  TESTE-PUBLICO: rota TEMPORARIA para testes externos do agente.
+//  Ative somente no Render com:
+//    HABILITAR_TESTE_PUBLICO=true
+//
+//  Exemplos:
+//    /teste-publico?q=quantas+obras+concluidas&sessao=teste1
+//    /teste-publico?q=quais+usam+recurso+proprio&sessao=teste1
+//    /teste-publico?reset=1&sessao=teste1&q=oi
+//
+//  A rota e SOMENTE LEITURA: chama o mesmo responderPergunta() do bot.
+//  Nao sincroniza a planilha, nao altera o banco e nao envia WhatsApp.
+//  Inclui um limitador simples por IP para reduzir abuso enquanto estiver ativa.
+// ------------------------------------------------------------
+const limiteTestePublicoPorIp = new Map();
+const TESTE_PUBLICO_JANELA_MS = 10 * 60 * 1000; // 10 min
+const TESTE_PUBLICO_MAX_REQUISICOES = 60;
+const TESTE_PUBLICO_MAX_PERGUNTA = 500;
+
+function permitirTestePublico(req) {
+  const encaminhado = (req.get("x-forwarded-for") || "").split(",")[0].trim();
+  const ip = (encaminhado || req.ip || "desconhecido").toString().slice(0, 120);
+  const agora = Date.now();
+  const atual = limiteTestePublicoPorIp.get(ip);
+
+  if (!atual || agora - atual.inicio >= TESTE_PUBLICO_JANELA_MS) {
+    limiteTestePublicoPorIp.set(ip, { inicio: agora, total: 1 });
+    return true;
+  }
+
+  if (atual.total >= TESTE_PUBLICO_MAX_REQUISICOES) return false;
+  atual.total += 1;
+  return true;
+}
+
+function chaveSessaoTestePublico(req) {
+  // Prefixo evita misturar memoria da rota publica com /testar-agente.
+  const manual = (req.query.sessao || "publico-padrao").toString().trim();
+  return "publico:" + (manual || "publico-padrao").slice(0, 80);
+}
+
+app.get("/teste-publico", async (req, res) => {
+  // Enquanto desligada, a rota se comporta como inexistente.
+  if (!HABILITAR_TESTE_PUBLICO) return res.sendStatus(404);
+  if (!permitirTestePublico(req)) {
+    return res.status(429).json({
+      erro: "Muitas requisicoes de teste. Aguarde alguns minutos e tente novamente.",
+    });
+  }
+
+  const pergunta = (req.query.q || "").toString().trim();
+  const chave = chaveSessaoTestePublico(req);
+
+  if (req.query.reset === "1") memoriaTesteAgente.delete(chave);
+
+  if (!pergunta) {
+    return res.json({
+      ok: true,
+      rota: "teste-publico",
+      ativa: true,
+      uso: "/teste-publico?q=sua+pergunta&sessao=teste1",
+      dica_memoria: "Use a mesma sessao nas perguntas seguintes. Use reset=1 para limpar.",
+    });
+  }
+
+  if (pergunta.length > TESTE_PUBLICO_MAX_PERGUNTA) {
+    return res.status(400).json({
+      erro: `Pergunta muito longa. Maximo: ${TESTE_PUBLICO_MAX_PERGUNTA} caracteres.`,
+    });
+  }
+
+  const historico = lerHistoricoTeste(chave);
+
+  try {
+    const r = await responderPergunta(pergunta, historico);
+
+    salvarHistoricoTeste(chave, [
+      ...historico,
+      { role: "user", content: pergunta },
+      {
+        role: "assistant",
+        content: r.resposta,
+        sql: r.sql || null,
+        linhas: r.linhas ?? null,
+      },
+    ]);
+
+    return res.json({
+      ok: !r.erro,
+      sessao: chave.replace(/^publico:/, ""),
+      pergunta,
+      resposta: r.resposta,
+      sql_gerada: r.sql || r.sqlBloqueada || null,
+      linhas_retornadas: r.linhas ?? null,
+      erro: r.erro || null,
+    });
+  } catch (e) {
+    console.error("ERRO /teste-publico:", e && e.message);
+    return res.status(500).json({
+      ok: false,
+      pergunta,
+      erro: "Falha interna no teste do agente.",
+    });
   }
 });
 
@@ -785,9 +892,6 @@ async function processarMensagem(mensagem) {
           content: respostaAg,
           sql: resultadoAg?.sql || null,
           linhas: resultadoAg?.linhas ?? null,
-          // Estado semantico do recorte atual (ex.: obras do Centro / Eng. X).
-          // Permite follow-ups naturais sem depender de frases fixas.
-          estado: resultadoAg?.estado || null,
         },
       ].slice(-10),
     });

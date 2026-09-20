@@ -728,6 +728,63 @@ function escaparLiteralSQL(valor = "") {
   return String(valor).replace(/'/g, "''");
 }
 
+// Identifica quando RECURSO/FONTE e um FILTRO, e nao apenas um campo pedido.
+// Exemplos naturais: "quais usam recurso proprio?", "obras com recurso federal".
+// Nao depende de valores cadastrados: extrai dinamicamente o texto informado
+// pelo usuario e aplica sobre o recurso canonico das diferentes abas.
+function termoFiltroRecursoDaPergunta(pergunta = "") {
+  const p = normalizarTexto(pergunta);
+  if (!p) return "";
+
+  let termo = "";
+
+  // Formas mais claras de filtro: usam/com/possuem recurso X.
+  let m = p.match(/\b(?:usam?|utilizam?|possuem?|tem|com)\s+(?:o\s+|os\s+)?(?:recursos?|fontes?(?: do recurso)?)\s+(.+)$/i);
+  if (m) termo = m[1] || "";
+
+  // Tambem aceita "recurso proprio", "recurso federal", "fonte caixa ogu".
+  // Se vier "recurso da UBS"/"recursos das obras", isso e campo pedido,
+  // nao valor de filtro, portanto ignoramos.
+  if (!termo) {
+    m = p.match(/\b(?:recursos?|fontes?(?: do recurso)?)\s+(.+)$/i);
+    const candidato = (m?.[1] || "").trim();
+    if (candidato && !/^(?:da|das|do|dos|de|dela|delas|dele|deles|na|nas|no|nos)\b/i.test(candidato)) {
+      termo = candidato;
+    }
+  }
+
+  termo = termo.trim();
+  if (!termo) return "";
+
+  // Remove uma nova clausula estrutural que venha depois do valor do recurso,
+  // sem manter nomes especificos fixos no codigo.
+  termo = termo
+    .replace(/\s+\b(?:nas?|nos?|em)\s+(?:obras?|projetos?|pavimentacoes?|licitacoes?|registros?)\b.*$/i, "")
+    .replace(/\s+\b(?:que|e)\s+(?:estao|sao|tem|possuem|ficam|foram)\b.*$/i, "")
+    .trim();
+
+  // Evita transformar palavras de comando em valor de recurso.
+  if (!termo || /^(?:qual|quais|quanto|quantos|quantas|status|engenheiro|responsavel|empresa|bairro|valor)$/i.test(termo)) return "";
+  return termo.slice(0, 80);
+}
+
+function expressaoRecursoCanonicoSQL() {
+  return `COALESCE(` +
+    `dados_extras->>'RECURSO', ` +
+    `dados_extras->>'CONVÊNIO/RECURSO', ` +
+    `dados_extras->>'CONVENIO/RECURSO', ` +
+    `dados_extras->>'FONTE DO RECURSO', ` +
+    `dados_extras->>'FONTE RECURSO', ` +
+    `dados_extras->>'TIPO_RECURSO', ` +
+    `dados_extras->>'TIPO RECURSO', '')`;
+}
+
+function condicaoRecursoDaPergunta(pergunta = "") {
+  const termo = termoFiltroRecursoDaPergunta(pergunta);
+  if (!termo) return "";
+  return `unaccent(${expressaoRecursoCanonicoSQL()}) ILIKE unaccent('%${escaparLiteralSQL(termo)}%')`;
+}
+
 function condicaoObjetoLivreDaPergunta(pergunta = "") {
   const termos = termosLivresCandidatos(pergunta)
     .map((t) => t.trim())
@@ -751,9 +808,13 @@ function gerarSQLFallbackUniversal(pergunta = "", historico = []) {
   const sqlAnterior = ultimaSQLDoHistorico(historico);
   const condAnterior = whereDaSQL(sqlAnterior).replace(/^WHERE\s+/i, "").trim();
   const referenciaAnterior = /\b(dessas?|destas?|nessas?|nestas?|delas?|deles?|dele|dela|essas?|esses?|elas?|eles?|nela|nele|anteriores?|anterior|acima|mesmas?|mesmos?|isso|essa|esse)\b/.test(p);
+  const filtroRecurso = condicaoRecursoDaPergunta(p);
+  const followupRecursoSemSujeito = !!filtroRecurso &&
+    /^(?:e\s+)?(?:quais?|qual)\s+(?:usam?|utilizam?|possuem?|tem|com)\b/.test(p) &&
+    !/\b(obras?|projetos?|pavimentacoes?|licitacoes?|registros?)\b/.test(p);
 
   const condicoes = [];
-  if (condAnterior && referenciaAnterior) condicoes.push(condAnterior);
+  if (condAnterior && (referenciaAnterior || followupRecursoSemSujeito)) condicoes.push(condAnterior);
 
   const filtroStatus = filtroStatusDaPergunta(p);
   const filtroLocal = condicaoLocalDaPergunta(p);
@@ -764,6 +825,7 @@ function gerarSQLFallbackUniversal(pergunta = "", historico = []) {
   if (filtroStatus) condicoes.push(filtroStatus);
   if (filtroLocal) condicoes.push(filtroLocal);
   if (filtroEngenheiro) condicoes.push(filtroEngenheiro);
+  if (filtroRecurso) condicoes.push(filtroRecurso);
 
   // Se nenhum filtro estrutural identificou o alvo, usa os termos livres como
   // busca no nome/objeto. Isso resolve QUALQUER entidade literal sem cadastra-la.
@@ -1220,6 +1282,7 @@ function gerarSQLRapida(pergunta, historico = []) {
   const filtroStatus = filtroStatusDaPergunta(p);
   const filtroLocal = condicaoLocalDaPergunta(p);
   const filtroEngenheiro = condicaoEngenheiroDaPergunta(p) || condicaoEngenheiroImplicitoDaPergunta(p);
+  const filtroRecurso = condicaoRecursoDaPergunta(p);
   let filtroEscopo = filtroEscopoDaPergunta(p);
 
   // Mesmo quando nao e uma contagem (ex.: "quais obras estao em andamento?"),
@@ -1229,16 +1292,23 @@ function gerarSQLRapida(pergunta, historico = []) {
     filtroEscopo = "aba_origem = 'EM_ANDAMENTO'";
   }
 
-  const temFiltroNovo = !!(filtroStatus || filtroLocal || filtroEscopo || filtroEngenheiro);
+  const temFiltroNovo = !!(filtroStatus || filtroLocal || filtroEscopo || filtroEngenheiro || filtroRecurso);
 
-  // Se a pessoa diz explicitamente "dessas" + um novo filtro, refinamos a
-  // consulta anterior. Se apenas faz uma pergunta curta, herdamos o filtro.
+  // Follow-up curto pode adicionar um NOVO filtro ao conjunto anterior mesmo
+  // sem pronome explicito. Ex.: depois de listar concluidas, "quais usam
+  // recurso proprio?" deve refinar AS MESMAS concluidas, e nao abrir a base toda.
   const condicoes = [];
-  if (condAnterior && referenciaAnterior) condicoes.push(condAnterior);
+  const followupRecursoSemSujeito = !!filtroRecurso &&
+    /^(?:e\s+)?(?:quais?|qual)\s+(?:usam?|utilizam?|possuem?|tem|com)\b/.test(p) &&
+    !/\b(obras?|projetos?|pavimentacoes?|licitacoes?|registros?)\b/.test(p);
+  if (condAnterior && (referenciaAnterior || (!temFiltroNovo && curtaDeAcompanhamento) || followupRecursoSemSujeito)) {
+    condicoes.push(condAnterior);
+  }
   if (filtroEscopo) condicoes.push(filtroEscopo);
   if (filtroStatus) condicoes.push(filtroStatus);
   if (filtroLocal) condicoes.push(filtroLocal);
   if (filtroEngenheiro) condicoes.push(filtroEngenheiro);
+  if (filtroRecurso) condicoes.push(filtroRecurso);
 
   // Quando a pessoa fala genericamente em "obras concluidas", projetos e
   // processos licitatorios nao entram no total de obras fisicas.
@@ -2679,6 +2749,20 @@ function validarPlanoFerramenta(pergunta = "", decisao = {}, historico = []) {
   if (livres.length && !referencial && !/\bobjeto\b/i.test(sql) && operacao !== "descobrir") {
     const estrutural = livres.every((t) => ["centro", "andamento", "concluida", "concluido"].includes(t));
     if (!estrutural) return { ok: false, motivo: "ha termo livre na pergunta, mas a consulta nao procura nem seleciona objeto" };
+  }
+
+  // Se o usuario forneceu um VALOR de recurso (ex.: "com recurso X",
+  // "quais usam recurso X"), a consulta precisa filtrar esse valor. Pedir o
+  // campo recurso e diferente de filtrar por um recurso especifico.
+  const termoRecurso = termoFiltroRecursoDaPergunta(pergunta);
+  if (termoRecurso) {
+    const termoEsc = termoRecurso.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const temFiltroRecursoSQL = /dados_extras/i.test(sql) &&
+      /(?:ilike|=)/i.test(sql) &&
+      new RegExp(termoEsc, "i").test(normalizarTexto(sql));
+    if (!temFiltroRecursoSQL) {
+      return { ok: false, motivo: `a pergunta filtra por recurso '${termoRecurso}', mas a SQL nao aplicou esse filtro` };
+    }
   }
 
   // Contagem/ranking/soma devem ser calculados pelo banco quando a pergunta
