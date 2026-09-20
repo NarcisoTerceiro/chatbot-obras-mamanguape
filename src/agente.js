@@ -1524,6 +1524,17 @@ function expressaoStatusAmploSQL() {
   return `COALESCE(NULLIF(BTRIM(dados_extras->>'STATUS ORIGINAL'), ''), status, '')`;
 }
 
+function condicaoObrasEmAndamento() {
+  // Regra de negocio: "obras" = EM_ANDAMENTO + PAVIMENTAÇÃO.
+  // A aba de pavimentação pode chegar do banco como "Em execução" ou já
+  // normalizada como "Em andamento". Aceitamos as duas formas.
+  return `((aba_origem = 'EM_ANDAMENTO' AND unaccent(status) ILIKE unaccent('%andamento%')) OR ` +
+    `(aba_origem = 'PAVIMENTAÇÃO' AND (` +
+      `unaccent(status) ILIKE unaccent('%andamento%') OR ` +
+      `unaccent(status) ILIKE unaccent('%execucao%')` +
+    `)))`;
+}
+
 function filtroStatusDaPergunta(p) {
   // Etapas de LICITACAO podem estar em STATUS ORIGINAL em vez da coluna status.
   // A etapa especifica tem prioridade sobre a palavra generica "andamento".
@@ -1538,7 +1549,10 @@ function filtroStatusDaPergunta(p) {
     return `unaccent(${expressaoStatusAmploSQL()}) ILIKE unaccent('%${termo}%')`;
   }
   if (/\b(concluid[ao]s?|pront[ao]s?|finalizad[ao]s?|terminad[ao]s?)\b/.test(p)) return "unaccent(status) ILIKE unaccent('%conclu%')";
-  // A ingestao padroniza "Em execucao" como "Em andamento" para obras/pavimentacoes.
+  if (/\bobras?\b/.test(p) && /\b(em andamento|andamento|em execucao|execucao|executando|sendo feit[ao]s?|tocando)\b/.test(p) &&
+      !/\bprojetos?\b/.test(p) && !/\b(licitacoes?|licitacao)\b/.test(p)) {
+    return condicaoObrasEmAndamento();
+  }
   if (/\b(em andamento|andamento|em execucao|execucao|executando|sendo feit[ao]s?|tocando)\b/.test(p)) return "unaccent(status) ILIKE unaccent('%andamento%')";
   if (/\b(em licitacao|licitacao|licitando)\b/.test(p)) return "unaccent(status) ILIKE unaccent('%licita%')";
   if (/\b(em projeto)\b/.test(p)) return "unaccent(status) ILIKE unaccent('%projeto%')";
@@ -1819,7 +1833,7 @@ function rotuloEscopoDaPergunta(p = "") {
 
 function condicaoPorRotuloEscopo(rotulo = "") {
   if (rotulo === "obras") return "aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO')";
-  if (rotulo === "obras_em_andamento") return "aba_origem = 'EM_ANDAMENTO'";
+  if (rotulo === "obras_em_andamento") return condicaoObrasEmAndamento();
   if (rotulo === "pavimentacoes") return "aba_origem = 'PAVIMENTAÇÃO'";
   if (rotulo === "projetos") return "aba_origem = 'EM_PROJETO'";
   if (rotulo === "licitacoes") return "aba_origem = 'EM_LICITAÇÃO'";
@@ -2047,7 +2061,29 @@ function gerarSQLRapida(pergunta, historico = []) {
 
   const referenciaAnterior = /\b(dessas?|destas?|nessas?|nestas?|delas?|deles?|dele|dela|essas?|esses?|elas?|eles?|nela|nele|anteriores?|anterior|acima|mesmas?|mesmos?|isso|essa|esse)\b/.test(p) &&
     !temAlvoExplicitoNaPergunta(pergunta);
-  const perguntaCurtaLista = /^(?:e\s+)?quais(?:\s+sao)?$|^(?:lista|liste|mostra|mostre)(?:\s+(?:elas|essas|as obras))?$/.test(p);
+  const perguntaCurtaLista = /^(?:e\s+)?quais(?:\s+sao)?(?:\s+(?:as|os)\s+(?:obras?|projetos?|pavimentacoes?|licitacoes?|registros?))?$|^(?:lista|liste|mostra|mostre)(?:\s+(?:elas|essas|as obras|os projetos|as pavimentacoes|as licitacoes))?$/.test(p);
+
+  // Depois de um ranking/contagem, frases como "quais são as obras?" sao
+  // continuação do conjunto focado, não uma nova consulta global. Isso preserva
+  // os engenheiros vencedores, o status e os demais filtros do turno anterior.
+  if (perguntaCurtaLista && estadoAnterior?.where_conjunto) {
+    const estadoEscopo = estadoAnterior?.escopo || "";
+    const pedeObras = /\bobras?\b/.test(p);
+    const pedeProjetos = /\bprojetos?\b/.test(p);
+    const pedePav = /\bpaviment/.test(p);
+    const pedeLic = /\b(licitacoes?|licitacao)\b/.test(p);
+    const mesmoTipo = (!pedeObras && !pedeProjetos && !pedePav && !pedeLic) ||
+      (pedeObras && /^obras/.test(estadoEscopo)) ||
+      (pedeProjetos && estadoEscopo === "projetos") ||
+      (pedePav && estadoEscopo === "pavimentacoes") ||
+      (pedeLic && estadoEscopo === "licitacoes");
+    if (mesmoTipo) {
+      return `SELECT objeto, status, categoria, bairro, engenheiro, empresa, valor_total, ` +
+        `valor_executado, percentual_executado, aba_origem, dados_extras FROM obras ` +
+        `WHERE ${estadoAnterior.where_conjunto} ORDER BY objeto`;
+    }
+  }
+
   const curtaDeAcompanhamento = p.split(" ").length <= 7 && (
     /\b(engenheiros?|engenheiras?|responsaveis?|empresas?|executoras?|valor|valores|custo|bairro|status|situacao|nomes?|quantos|quantas|total|percentual|porcentagem|recursos?|contratos?|convenios?)\b/.test(p) ||
     perguntaCurtaLista
@@ -2081,18 +2117,15 @@ function gerarSQLRapida(pergunta, historico = []) {
   // individual. Deixamos o caminho deterministico montar a busca livre.
   if (itemEspecificoSemContexto && !pedeCampoSobreGrupoLivre(pergunta)) return null;
 
-  // Caso importante: "quantas obras estao em andamento?" precisa responder
-  // o TOTAL PRINCIPAL da aba EM_ANDAMENTO e, ao mesmo tempo, explicar os grupos
-  // parecidos sem mistura-los. A consulta devolve os tres numeros em uma linha,
-  // para a redacao detalhar com transparencia.
+  // "quantas obras estao em andamento?" segue a regra de negocio completa:
+  // EM_ANDAMENTO + pavimentações em execução. Projetos/licitações não entram.
   if (ehPerguntaGenericaObrasEmAndamento(p) && !/\b(quais|liste|lista|mostrar?|nomes?)\b/.test(p)) {
     return `SELECT ` +
-      `SUM(CASE WHEN aba_origem = 'EM_ANDAMENTO' THEN 1 ELSE 0 END)::int AS obras_em_andamento, ` +
-      `SUM(CASE WHEN aba_origem = 'PAVIMENTAÇÃO' AND unaccent(status) ILIKE unaccent('%andamento%') THEN 1 ELSE 0 END)::int AS pavimentacoes_em_execucao, ` +
-      `SUM(CASE WHEN aba_origem = 'EM_LICITAÇÃO' AND (` +
-        `unaccent(status) ILIKE unaccent('%andamento%') OR ` +
-        `unaccent(COALESCE(dados_extras->>'STATUS ORIGINAL','')) ILIKE unaccent('%andamento%')` +
-      `) THEN 1 ELSE 0 END)::int AS licitacoes_com_etapa_em_andamento ` +
+      `SUM(CASE WHEN aba_origem = 'EM_ANDAMENTO' AND unaccent(status) ILIKE unaccent('%andamento%') THEN 1 ELSE 0 END)::int AS obras_fisicas_em_andamento, ` +
+      `SUM(CASE WHEN aba_origem = 'PAVIMENTAÇÃO' AND (` +
+        `unaccent(status) ILIKE unaccent('%andamento%') OR unaccent(status) ILIKE unaccent('%execucao%')` +
+      `) THEN 1 ELSE 0 END)::int AS pavimentacoes_em_execucao, ` +
+      `SUM(CASE WHEN ${condicaoObrasEmAndamento()} THEN 1 ELSE 0 END)::int AS obras_em_andamento ` +
       `FROM obras`;
   }
 
@@ -2109,12 +2142,9 @@ function gerarSQLRapida(pergunta, historico = []) {
     ? condicaoObjetoLivreDaPergunta(pergunta)
     : "";
 
-  // Mesmo quando nao e uma contagem (ex.: "quais obras estao em andamento?"),
-  // a expressao generica "obras em andamento" aponta para a area EM_ANDAMENTO.
-  // Pavimentacoes em execucao e etapas de licitacao ficam como grupos separados.
-  if (!filtroEscopo && /\bobras?\b/.test(p) && /\b(em andamento|andamento)\b/.test(p)) {
-    filtroEscopo = "aba_origem = 'EM_ANDAMENTO'";
-  }
+  // "Obras em andamento" nao pode ser reduzido apenas à aba EM_ANDAMENTO.
+  // Pela regra do sistema, obras = EM_ANDAMENTO + PAVIMENTAÇÃO; o filtro de
+  // status acima já inclui pavimentações em execução.
   // Em consultas nao agregadas, "obra/obras" generico significa exatamente
   // EM_ANDAMENTO + PAVIMENTAÇÃO. As contagens genericas continuam usando a
   // consulta especial por tipo para poder explicar projetos/licitacoes a parte.
