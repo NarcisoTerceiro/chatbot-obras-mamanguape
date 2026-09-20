@@ -1,5 +1,5 @@
 // ============================================================
-//  agente.js - AGENTE 1 REFORCADO (correcao recurso x sujeito)
+//  agente.js - AGENTE 1 REFORCADO (resolucao semantica + candidatos reais)
 //  Agente conversacional de analytics. Fluxo padrao de 2 chamadas:
 //    1) IA recebe a PERGUNTA + o schema da tabela -> gera SQL
 //    2) Validamos a SQL (so SELECT, bloqueia comandos perigosos)
@@ -32,6 +32,15 @@ const USAR_CAMADA_DIRETA = process.env.AGENTE_DIRETO !== "false";
 // Pode ser desativado apenas para contingencia com AGENTE_FERRAMENTAS=false.
 const USAR_AGENTE_FERRAMENTAS = process.env.AGENTE_FERRAMENTAS !== "false";
 const MAX_PASSOS_FERRAMENTAS = Math.max(1, Math.min(Number(process.env.AGENTE_MAX_PASSOS || 3), 4));
+
+// Resolucao semantica de entidades/assuntos antes do Text-to-SQL.
+// Em vez de transformar cada palavra da pergunta em ILIKE, o agente extrai o
+// assunto, gera poucas pistas linguisticas temporarias, busca candidatos REAIS
+// no PostgreSQL e so entao executa a consulta definitiva pelos IDs encontrados.
+// Nao existe dicionario persistente de sinonimos nem agent_knowledge.
+const USAR_BUSCA_SEMANTICA = process.env.AGENTE_BUSCA_SEMANTICA !== "false";
+const MAX_CANDIDATOS_SEMANTICOS = Math.max(8, Math.min(Number(process.env.AGENTE_MAX_CANDIDATOS_SEMANTICOS || 24), 40));
+
 
 // Descricao da tabela que a IA recebe (o "schema"). Se mudar a
 // tabela, atualize aqui.
@@ -900,6 +909,339 @@ function condicaoObjetoLivreDaPergunta(pergunta = "") {
   }).filter(Boolean).join(" AND ");
 }
 
+
+// ============================================================
+// RESOLUCAO SEMANTICA DE ASSUNTOS / ENTIDADES
+// ============================================================
+// O objetivo desta camada e resolver casos como:
+//   "qual o recurso das UBS?"
+// sem depender de um cadastro manual UBS -> posto de saude -> PSF etc.
+// A IA gera apenas PISTAS DE BUSCA temporarias. O banco continua sendo a fonte
+// da verdade e a consulta final usa somente IDs que realmente existem.
+
+let cachePgTrgm = { valor: null, quando: 0 };
+const CACHE_TRGM_MS = 10 * 60 * 1000;
+
+async function pgTrgmDisponivel() {
+  const agora = Date.now();
+  if (cachePgTrgm.valor !== null && agora - cachePgTrgm.quando < CACHE_TRGM_MS) {
+    return cachePgTrgm.valor;
+  }
+  try {
+    const r = await queryReadOnly("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') AS ok");
+    cachePgTrgm = { valor: !!r.rows?.[0]?.ok, quando: agora };
+  } catch {
+    cachePgTrgm = { valor: false, quando: agora };
+  }
+  return cachePgTrgm.valor;
+}
+
+function extrairLiteraisILIKE(condicao = "") {
+  const out = [];
+  const rx = /ILIKE\s+unaccent\('\%([^%']+)\%'\)/gi;
+  let m;
+  while ((m = rx.exec(condicao))) out.push(normalizarTexto(m[1]));
+  return out.filter(Boolean);
+}
+
+function termosAssuntoSemantico(pergunta = "") {
+  const p = normalizarTexto(pergunta);
+  let termos = termosLivresCandidatos(pergunta);
+  if (!termos.length) return [];
+
+  // Valores ja reconhecidos como filtros estruturados nao sao o ASSUNTO livre.
+  // Ex.: "UBS do Centro" -> Centro e filtro de local; UBS e o assunto.
+  const estruturados = [
+    filtroStatusDaPergunta(p),
+    condicaoLocalDaPergunta(p),
+    condicaoEngenheiroDaPergunta(p),
+    condicaoEngenheiroImplicitoDaPergunta(p),
+    condicaoRecursoDaPergunta(p),
+  ].flatMap(extrairLiteraisILIKE);
+
+  if (estruturados.length) {
+    termos = termos.filter((t) => !estruturados.some((e) => {
+      const nt = normalizarTexto(t);
+      return nt === e || nt.startsWith(e) || e.startsWith(nt) || e.split(/\s+/).includes(nt);
+    }));
+  }
+  return [...new Set(termos)].slice(0, 6);
+}
+
+function sanitizarPistaSemantica(v = "") {
+  const t = normalizarTexto(v)
+    .replace(/[^a-z0-9\s/-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (t.length < 2 || t.length > 80) return "";
+  return t;
+}
+
+async function interpretarAssuntoSemantico(pergunta = "", historico = []) {
+  const termos = termosAssuntoSemantico(pergunta);
+  if (!termos.length) return null;
+
+  const alvoLiteral = sanitizarPistaSemantica(termos.join(" "));
+  const prompt = `Voce atua SOMENTE como resolvedor linguistico de busca para um banco de obras publicas.\n\n` +
+    `Pergunta: ${JSON.stringify(pergunta)}\n` +
+    `Termos livres extraidos pelo Node: ${JSON.stringify(termos)}\n\n` +
+    `Retorne APENAS JSON valido neste formato:\n` +
+    `{\"usar\":true,\"alvo\":\"...\",\"tipo\":\"conceito_grupo|nome_especifico|nenhum\",` +
+    `\"equivalentes_fortes\":[\"...\"],\"relacionados\":[\"...\"]}\n\n` +
+    `REGRAS:\n` +
+    `- alvo = somente o assunto/entidade que deve ser localizado nos registros.\n` +
+    `- palavras que sao CAMPOS pedidos (recurso, engenheiro, valor, status, empresa etc.) nao sao alvo.\n` +
+    `- equivalentes_fortes: no maximo 4 formas que realmente significam o MESMO conceito ou correcao ortografica segura.\n` +
+    `- relacionados: no maximo 4 expressoes semanticamente proximas que podem ajudar a descobrir candidatos, mas NAO sao necessariamente equivalentes.\n` +
+    `- Nao use termos excessivamente amplos de uma palavra quando isso trouxer muitos falsos positivos.\n` +
+    `- Se for nome especifico (rua, equipamento, obra com nome proprio), nao expanda para categorias amplas.\n` +
+    `- Nao invente registros, bairros, pessoas, empresas ou valores. Isto serve apenas para procurar dados REAIS no banco.\n` +
+    `- Nao explique nada fora do JSON.`;
+
+  try {
+    const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
+      max_tokens: 220,
+      temperature: 0,
+      reasoning_effort: "low",
+    });
+    const j = extrairJSONSeguro(bruto) || {};
+    if (j.usar === false || j.tipo === "nenhum") return null;
+
+    const alvo = sanitizarPistaSemantica(j.alvo || alvoLiteral) || alvoLiteral;
+    const tipo = ["conceito_grupo", "nome_especifico"].includes(j.tipo) ? j.tipo : "conceito_grupo";
+    const fortes = [...new Set([
+      alvoLiteral,
+      alvo,
+      ...(Array.isArray(j.equivalentes_fortes) ? j.equivalentes_fortes : []),
+    ].map(sanitizarPistaSemantica).filter(Boolean))].slice(0, tipo === "nome_especifico" ? 3 : 5);
+    const relacionados = tipo === "nome_especifico" ? [] : [...new Set(
+      (Array.isArray(j.relacionados) ? j.relacionados : [])
+        .map(sanitizarPistaSemantica)
+        .filter((x) => x && !fortes.includes(x))
+    )].slice(0, 4);
+
+    return { alvo, tipo, fortes, relacionados, termos_originais: termos };
+  } catch (e) {
+    console.warn("AGENTE/SEMANTICA: expansao linguistica indisponivel; usando busca literal:", e.message);
+    return { alvo: alvoLiteral, tipo: "conceito_grupo", fortes: [alvoLiteral], relacionados: [], termos_originais: termos };
+  }
+}
+
+function filtrosEstruturadosParaSemantica(pergunta = "") {
+  const p = normalizarTexto(pergunta);
+  const condicoes = [];
+  let escopo = filtroEscopoDaPergunta(p);
+  if (!escopo && /\bobras?\b/.test(p) && !/\bprojetos?\b/.test(p) && !/\b(licitacoes?|licitacao)\b/.test(p)) {
+    escopo = "aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO')";
+  }
+  const outros = [
+    filtroStatusDaPergunta(p),
+    condicaoLocalDaPergunta(p),
+    condicaoEngenheiroDaPergunta(p) || condicaoEngenheiroImplicitoDaPergunta(p),
+    condicaoRecursoDaPergunta(p),
+    filtroComparacaoNumericaDaPergunta(p),
+  ];
+  if (escopo) condicoes.push(escopo);
+  for (const c of outros) if (c && !condicoes.includes(c)) condicoes.push(c);
+  return condicoes;
+}
+
+function montarCondicaoTermoSemantico(termo, parametros, usarTrgm = false) {
+  const limpo = sanitizarPistaSemantica(termo);
+  if (!limpo) return "";
+
+  const textoBusca = `(COALESCE(objeto,'') || ' ' || COALESCE(categoria,''))`;
+  const alternativas = [];
+
+  parametros.push(`%${limpo}%`);
+  alternativas.push(`unaccent(${textoBusca}) ILIKE unaccent($${parametros.length}::text)`);
+
+  const toks = tokensRelevantes(limpo).filter((t) => t.length >= 3).slice(0, 5);
+  if (toks.length >= 2) {
+    const partes = [];
+    for (const tok of toks) {
+      parametros.push(`%${tok}%`);
+      partes.push(`unaccent(${textoBusca}) ILIKE unaccent($${parametros.length}::text)`);
+    }
+    alternativas.push(`(${partes.join(" AND ")})`);
+  }
+
+  // Se pg_trgm ja estiver habilitado no Supabase/PostgreSQL, aproveitamos a
+  // similaridade para erros de digitacao. Se nao estiver, nada quebra e a
+  // busca segue com ILIKE + expansao linguistica.
+  if (usarTrgm && limpo.length >= 4) {
+    parametros.push(limpo);
+    alternativas.push(`word_similarity(unaccent($${parametros.length}::text), unaccent(COALESCE(objeto,''))) >= 0.58`);
+  }
+  return `(${alternativas.join(" OR ")})`;
+}
+
+async function buscarCandidatosSemanticos(termos = [], filtros = [], limite = MAX_CANDIDATOS_SEMANTICOS) {
+  const limpos = [...new Set((termos || []).map(sanitizarPistaSemantica).filter(Boolean))].slice(0, 6);
+  if (!limpos.length) return { rows: [], sql: "", params: [] };
+
+  const usarTrgm = await pgTrgmDisponivel();
+  const params = [];
+  const buscas = limpos.map((t) => montarCondicaoTermoSemantico(t, params, usarTrgm)).filter(Boolean);
+  if (!buscas.length) return { rows: [], sql: "", params: [] };
+
+  const where = [...(filtros || []).filter(Boolean), `(${buscas.join(" OR ")})`].join(" AND ");
+  const sql = `SELECT id, objeto, bairro, status, categoria, engenheiro, empresa, ` +
+    `valor_total, valor_executado, percentual_executado, aba_origem, dados_extras ` +
+    `FROM obras WHERE ${where} ORDER BY objeto LIMIT ${Math.max(1, Math.min(Number(limite) || 24, 40))}`;
+  const r = await queryReadOnly(sql, params);
+  return { rows: r.rows || [], sql, params };
+}
+
+function sqlDefinitivaPorIds(ids = []) {
+  const nums = [...new Set((ids || []).map((x) => Number(x)).filter((x) => Number.isInteger(x) && x > 0))];
+  if (!nums.length) return "";
+  return `SELECT id, objeto, bairro, status, categoria, engenheiro, empresa, valor_total, ` +
+    `valor_executado, percentual_executado, aba_origem, dados_extras FROM obras ` +
+    `WHERE id IN (${nums.join(",")}) ORDER BY objeto`;
+}
+
+function formatarMoedaSemantica(v) {
+  if (v === null || v === undefined || v === "") return "não informado";
+  if (!Number.isFinite(Number(v))) return String(v);
+  return "R$ " + Number(v).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function formatarLinhaSemantica(linha = {}, campos = []) {
+  const l = enriquecerLinhaParaIA(linha);
+  const partes = [];
+  const vazio = (v) => v === null || v === undefined || String(v).trim() === "";
+  for (const c of campos) {
+    if (c === "recurso") partes.push(`recurso: ${vazio(l.recurso) ? "não informado" : l.recurso}`);
+    else if (c === "engenheiro") partes.push(`responsável: ${vazio(l.engenheiro) ? "não informado" : l.engenheiro}`);
+    else if (c === "empresa") partes.push(`empresa: ${vazio(l.empresa) ? "não informada" : l.empresa}`);
+    else if (c === "status") partes.push(`status: ${vazio(l.status) ? "não informado" : l.status}`);
+    else if (c === "bairro") partes.push(`bairro: ${vazio(l.bairro) ? "não informado" : l.bairro}`);
+    else if (c === "valor_total") partes.push(`valor: ${formatarMoedaSemantica(l.valor_total)}`);
+    else if (c === "valor_executado") partes.push(`executado: ${formatarMoedaSemantica(l.valor_executado)}`);
+    else if (c === "percentual_executado") {
+      const v = vazio(l.percentual_executado) ? "não informado" : `${Number(l.percentual_executado).toLocaleString("pt-BR", { maximumFractionDigits: 2 })}%`;
+      partes.push(`percentual: ${v}`);
+    }
+  }
+  if (!partes.length) {
+    if (!vazio(l.status)) partes.push(l.status);
+    else if (!vazio(l.bairro)) partes.push(l.bairro);
+  }
+  return `• ${l.objeto || "Registro sem nome"}${partes.length ? ` — ${partes.join("; ")}` : ""}`;
+}
+
+function redigirResultadoSemantico(pergunta = "", interpretacao = {}, diretas = [], relacionadas = []) {
+  const p = normalizarTexto(pergunta);
+  const campos = camposSolicitados(pergunta);
+  const pedeContagem = /\b(quantos|quantas|numero de|qtd|quantidade de)\b/.test(p);
+  const pedeExistencia = /\b(existe|existem|ha|tem|algum|alguma|alguns|algumas)\b/.test(p);
+  const alvo = interpretacao.alvo || interpretacao.termos_originais?.join(" ") || "esse assunto";
+  const maxDiretas = 15;
+  const maxRelacionadas = 8;
+
+  if (!diretas.length && !relacionadas.length) return null;
+
+  let out = "";
+  if (diretas.length) {
+    if (pedeContagem) {
+      out += `Encontrei ${diretas.length} registro${diretas.length === 1 ? "" : "s"} que correspondem diretamente a “${alvo}”.`;
+    } else if (pedeExistencia) {
+      out += `Sim. Encontrei ${diretas.length} registro${diretas.length === 1 ? "" : "s"} diretamente relacionado${diretas.length === 1 ? "" : "s"} a “${alvo}”.`;
+    }
+    const deveListar = !pedeContagem || /\b(quais|liste|mostre|nomes?|recursos?|engenheiros?|responsaveis?|status|valores?|empresas?)\b/.test(p) || campos.length;
+    if (deveListar) {
+      if (out) out += "\n\n";
+      out += diretas.slice(0, maxDiretas).map((l) => formatarLinhaSemantica(l, campos)).join("\n");
+      if (diretas.length > maxDiretas) out += `\n• ... e mais ${diretas.length - maxDiretas}.`;
+    }
+  } else {
+    out = `Não encontrei registro que corresponda diretamente a “${alvo}”.`;
+  }
+
+  if (relacionadas.length) {
+    out += `${out ? "\n\n" : ""}Também encontrei ${relacionadas.length} registro${relacionadas.length === 1 ? "" : "s"} semanticamente relacionado${relacionadas.length === 1 ? "" : "s"}. ` +
+      `Não ${relacionadas.length === 1 ? "o conto" : "os conto"} automaticamente como equivalente${relacionadas.length === 1 ? "" : "s"}:\n` +
+      relacionadas.slice(0, maxRelacionadas).map((l) => formatarLinhaSemantica(l, campos)).join("\n");
+    if (relacionadas.length > maxRelacionadas) out += `\n• ... e mais ${relacionadas.length - maxRelacionadas}.`;
+  }
+  return out;
+}
+
+async function tentarResolucaoSemantica(pergunta = "", historico = []) {
+  if (!USAR_BUSCA_SEMANTICA) return null;
+
+  // Follow-ups devem usar primeiro os IDs/WHERE guardados no estado anterior.
+  // Nao reinterpreta "elas", "dela", "dele" como um novo assunto.
+  if (ehFollowupReferencialForte(pergunta) && ultimoEstadoDoHistorico(historico)) return null;
+
+  const termos = termosAssuntoSemantico(pergunta);
+  if (!termos.length) return null;
+
+  const interpretacao = await interpretarAssuntoSemantico(pergunta, historico);
+  if (!interpretacao?.fortes?.length) return null;
+
+  const filtros = filtrosEstruturadosParaSemantica(pergunta);
+  try {
+    const buscaDireta = await buscarCandidatosSemanticos(interpretacao.fortes, filtros);
+    const diretasPorId = new Map((buscaDireta.rows || []).map((r) => [Number(r.id), r]));
+
+    let buscaRelacionada = { rows: [], sql: "", params: [] };
+    if (interpretacao.relacionados?.length) {
+      buscaRelacionada = await buscarCandidatosSemanticos(interpretacao.relacionados, filtros);
+    }
+    const relacionadas = (buscaRelacionada.rows || []).filter((r) => !diretasPorId.has(Number(r.id)));
+    const diretasCandidatas = [...diretasPorId.values()];
+
+    // Se nao encontramos nada nem por equivalente forte nem por relacao, o
+    // agente tradicional ainda ganha a chance de descobrir via schema/amostras.
+    if (!diretasCandidatas.length && !relacionadas.length) return null;
+
+    // A consulta FINAL nao usa palavras inventadas pela IA. Usa apenas IDs que
+    // vieram do PostgreSQL na etapa de candidatos.
+    const idsFoco = (diretasCandidatas.length ? diretasCandidatas : relacionadas).map((x) => x.id);
+    const sqlFinal = sqlDefinitivaPorIds(idsFoco);
+    if (!sqlFinal) return null;
+    const check = sqlSegura(sqlFinal);
+    if (!check.ok) return null;
+
+    const final = await queryReadOnly(sqlFinal);
+    const linhasFinais = (final.rows || []).map(enriquecerLinhaParaIA);
+
+    // Relacionados sao exibidos como apoio, mas nao entram no foco quando ha
+    // correspondencias diretas. Assim "quantas UBS?" -> follow-up "quais?"
+    // continua apontando somente para o conjunto direto, sem inflar a contagem.
+    const linhasRelacionadas = relacionadas.map(enriquecerLinhaParaIA);
+    const resposta = redigirResultadoSemantico(
+      pergunta,
+      interpretacao,
+      diretasCandidatas.length ? linhasFinais : [],
+      diretasCandidatas.length ? linhasRelacionadas : linhasFinais
+    );
+    if (!resposta) return null;
+
+    const estado = construirEstadoSemantico(pergunta, sqlFinal, linhasFinais, historico);
+    return {
+      resposta,
+      sql: sqlFinal,
+      linhas: linhasFinais.length,
+      estado,
+      modoAgente: "agente1_resolucao_semantica",
+      consultas: [buscaDireta.sql, buscaRelacionada.sql, sqlFinal].filter(Boolean),
+      semantica: {
+        alvo: interpretacao.alvo,
+        equivalentes_fortes: interpretacao.fortes,
+        relacionados: interpretacao.relacionados,
+        ids_diretos: diretasCandidatas.map((x) => Number(x.id)),
+        ids_relacionados: relacionadas.map((x) => Number(x.id)),
+      },
+    };
+  } catch (e) {
+    console.warn("AGENTE/SEMANTICA: falhou; seguindo para o agente normal:", e.message);
+    return null;
+  }
+}
+
 function gerarSQLFallbackUniversal(pergunta = "", historico = []) {
   const p = normalizarTexto(pergunta);
   if (!p) return null;
@@ -1464,7 +1806,13 @@ function construirEstadoSemantico(pergunta = "", sql = "", linhas = [], historic
   const registros = Array.isArray(linhas) ? linhas : [];
 
   let escopo = base.escopo || anterior.escopo || estadoDaUltimaConsulta([{ role: "assistant", sql }]).escopo;
-  let whereConjunto = base.where || whereDaSQL(sql).replace(/^WHERE\s+/i, "").trim() || anterior.where_conjunto || "";
+  const whereSQLAtual = whereDaSQL(sql).replace(/^WHERE\s+/i, "").trim();
+  // Consultas da resolucao semantica terminam em IDs reais do banco. Esse
+  // recorte definitivo deve vencer a busca textual original na memoria; senao
+  // um follow-up voltaria a procurar apenas a sigla literal e perderia os itens
+  // resolvidos semanticamente.
+  const wherePorIds = /\bid\s+IN\s*\(/i.test(whereSQLAtual) ? whereSQLAtual : "";
+  let whereConjunto = wherePorIds || base.where || whereSQLAtual || anterior.where_conjunto || "";
   let focoObjeto = null;
   let focoEngenheiro = anterior.foco_engenheiro || null;
 
@@ -3728,6 +4076,14 @@ export async function responderPergunta(pergunta, historico = []) {
     console.log("AGENTE: pergunta ambigua; pedindo esclarecimento sem SQL.");
     return { resposta: esclarecer, desambiguacao: true };
   }
+
+  // 0.4. Resolucao semantica de assunto: extrai o conceito, busca candidatos
+  // REAIS no PostgreSQL e executa a consulta definitiva por IDs. Isto evita
+  // depender de listas manuais de sinonimos e evita transformar cada palavra
+  // da pergunta em um ILIKE obrigatorio. Se nao houver sinal suficiente, a
+  // camada simplesmente devolve null e o fluxo tradicional continua.
+  const semantica = await tentarResolucaoSemantica(pergunta, historico);
+  if (semantica) return semantica;
 
   // Antes da IA, tenta a camada de alta confianca. Ela entende operacoes e
   // filtros de forma generica, incluindo termos livres, sem perguntas fixas.
