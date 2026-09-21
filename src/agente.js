@@ -1,5 +1,5 @@
 // ============================================================
-//  agente.js - AGENTE 1 REFORCADO (resolucao semantica + candidatos reais)
+//  agente.js - AGENTE 1 REFORCADO (intencoes canonicas + resolucao semantica)
 //  Agente conversacional de analytics. Fluxo padrao de 2 chamadas:
 //    1) IA recebe a PERGUNTA + o schema da tabela -> gera SQL
 //    2) Validamos a SQL (so SELECT, bloqueia comandos perigosos)
@@ -840,8 +840,9 @@ function camposSolicitados(pergunta = "") {
   if (/\b(engenheiros?|responsaveis?|arquitetos?|cuida|cuidam|acompanha|acompanham)\b/.test(p)) campos.push("engenheiro");
   if (/\b(empresas?|executoras?|construtoras?)\b/.test(p)) campos.push("empresa");
   if (/\b(bairros?|localizacao|local)\b/.test(p)) campos.push("bairro");
-  if (/\b(valor total|valores totais|valor cadastrado|valores cadastrados|investid\w*|investimentos?|custo|custos|custa|custam|precos?|dinheiro)\b/.test(p)) campos.push("valor_total");
-  if (/\b(valor executado|ja executado|quanto executou|executado ate agora)\b/.test(p)) campos.push("valor_executado");
+  const pedeValorExecutado = /\b(valor executado|ja executado|quanto executou|executado ate agora|quanto ja foi executado)\b/.test(p);
+  if (pedeValorExecutado) campos.push("valor_executado");
+  else if (/\b(valor|valores|valor total|valores totais|valor cadastrado|valores cadastrados|investid\w*|investimentos?|custo|custos|custa|custam|precos?|dinheiro)\b/.test(p)) campos.push("valor_total");
   if (/\b(percentual|porcentagem|mais adiantad|mais avancad)\b/.test(p)) campos.push("percentual_executado");
   return [...new Set(campos)];
 }
@@ -1687,10 +1688,15 @@ function sqlContagemPorTipo(...filtros) {
 // "qual engenheiro tem mais obras?", "quem tem menos projetos?" ou
 // "ranking de responsaveis por quantidade de pavimentacoes".
 function ehRankingResponsavel(p) {
-  const falaResponsavel = /\b(engenheiros?|engenheiras?|arquitetos?|arquitetas?|responsaveis?|responsavel tecnico|responsaveis tecnicos)\b/.test(p);
+  // "quem tem mais obras?" e semanticamente um ranking POR PESSOA mesmo sem
+  // repetir a palavra engenheiro/responsavel. Antes esse caso escapava para a
+  // listagem generica de obras. Tambem aceitamos "profissional" como sinonimo
+  // do papel de responsavel tecnico, sem cadastrar nomes de pessoas.
+  const falaResponsavelExplicito = /\b(engenheiros?|engenheiras?|arquitetos?|arquitetas?|responsaveis?|responsavel tecnico|responsaveis tecnicos|profissionais?|tecnicos?)\b/.test(p);
+  const perguntaQuem = /\bquem\b/.test(p);
   const falaQuantidade = /\b(mais|menos|maior quantidade|menor quantidade|maior numero|menor numero|ranking|lidera|lider|primeiro)\b/.test(p);
   const falaRegistro = /\b(obras?|registros?|projetos?|pavimentacoes?|licitacoes?|processos? licitatorios?)\b/.test(p);
-  return falaResponsavel && falaQuantidade && falaRegistro;
+  return (falaResponsavelExplicito || perguntaQuem) && falaQuantidade && falaRegistro;
 }
 
 function sqlRankingResponsavel(p, filtroStatus = "", filtroLocal = "", filtroEscopo = "") {
@@ -2475,6 +2481,7 @@ REGRAS SQL:
 - "obras concluidas" generico NAO inclui projetos concluidos nem processos licitatorios.
 - Exemplo obrigatorio de semantica: "quais sao as obras concluidas que ele tem?" deve manter o responsavel do contexto, filtrar somente EM_ANDAMENTO/PAVIMENTAÇÃO e status concluido. Projetos concluidos desse mesmo responsavel NAO entram.
 - Exemplo obrigatorio de ranking: "qual engenheiro tem mais obras em geral?" conta somente EM_ANDAMENTO + PAVIMENTAÇÃO. Nunca use projetos ou licitacoes nessa contagem, a menos que o cidadao peça explicitamente todas as categorias/registros.
+- "quem tem mais obras em geral?" tem a MESMA intencao de ranking por responsavel, mesmo sem escrever "engenheiro". "em geral/no total/ao todo" remove um filtro de status herdado (como "em andamento") e recalcula sobre todo o escopo atual.
 - Se o usuario quiser projeto, licitacao ou pavimentacao, respeite exatamente essa categoria. Nunca use uma categoria apenas porque o texto do status ou do objeto parece relacionado.
 - Se a pergunta for sobre UM item identificavel pelo nome/rua/contrato, mesmo que o cidadao pergunte so valor, responsavel, empresa ou status, selecione contexto completo: objeto,status,categoria,bairro,engenheiro,empresa,valor_total,valor_executado,percentual_executado,aba_origem,dados_extras. A resposta destacara primeiro o campo pedido e depois os detalhes uteis.
 - Se a pergunta pedir DETALHES/INFORMACOES/SITUACAO, use esse mesmo conjunto completo de campos.
@@ -4252,14 +4259,157 @@ async function tentarCamadaDireta(pergunta, historico = []) {
 // executar consultas somente-leitura.
 const ACOES_PLANO_ASSISTENTE = new Set([
   "consultar_campo", "descrever", "listar", "contar", "somar",
-  "existencia", "comparar", "ranking", "outro"
+  "buscar_relacionado", "comparar", "ranking", "continuar_contexto", "outro"
 ]);
+const ESCOPOS_PLANO_ASSISTENTE = new Set([
+  "obras", "projetos", "pavimentacoes", "licitacoes", "registros", "indefinido"
+]);
+const AGRUPAMENTOS_PLANO_ASSISTENTE = new Set([
+  "engenheiro", "empresa", "bairro", "status", "recurso", "nenhum"
+]);
+const METRICAS_PLANO_ASSISTENTE = new Set([
+  "quantidade", "valor_total", "valor_executado", "percentual_executado", "nenhuma"
+]);
+const ORDENS_PLANO_ASSISTENTE = new Set(["maior", "menor", "nenhuma"]);
 const CAMPOS_PLANO_ASSISTENTE = new Set([
   "recurso", "status", "engenheiro", "empresa", "bairro",
   "valor_total", "valor_executado", "percentual_executado",
   "contrato", "convenio", "tipo_recurso", "data_inicio",
   "data_prev_termino", "saldo_devedor", "observacoes"
 ]);
+
+
+// ------------------------------------------------------------
+// INTENCAO CANONICA
+// ------------------------------------------------------------
+// O objetivo desta camada e reduzir centenas de maneiras de escrever a mesma
+// pergunta para poucas operacoes estaveis. Ela NAO responde e NAO consulta o
+// banco. Apenas classifica a estrutura da pergunta. A IA de compreensao recebe
+// esta classificacao como uma pista e pode corrigi-la quando a linguagem for
+// mais livre. Assim nao precisamos cadastrar uma regra para cada frase nova.
+function escopoCanonicoDaPergunta(pergunta = "", historico = []) {
+  const p = normalizarTexto(pergunta);
+  if (/\bprojetos?\b/.test(p)) return "projetos";
+  if (/\b(licitacoes?|licitacao|processos? licitatorios?)\b/.test(p)) return "licitacoes";
+  if (/\bpaviment(?:acao|acoes|ar|ada|adas|ado|ados)?\b/.test(p)) return "pavimentacoes";
+  if (/\b(obras?|construcoes?)\b/.test(p)) return "obras";
+  if (/\b(registros?|itens?|dados?)\b/.test(p)) return "registros";
+
+  // Follow-up sem repetir o substantivo: conserva apenas o TIPO do conjunto.
+  const anterior = ultimoEstadoDoHistorico(historico);
+  const eFollow = /\b(e|elas?|eles?|dessas?|desses?|delas?|deles?|dela|dele|essas?|esses?|no geral|em geral|ao todo)\b/.test(p) || p.split(/\s+/).length <= 6;
+  if (eFollow && anterior?.escopo) {
+    if (String(anterior.escopo).startsWith("obras")) return "obras";
+    if (anterior.escopo === "projetos") return "projetos";
+    if (anterior.escopo === "pavimentacoes") return "pavimentacoes";
+    if (anterior.escopo === "licitacoes") return "licitacoes";
+  }
+  return "indefinido";
+}
+
+function agrupamentoCanonicoDaPergunta(pergunta = "") {
+  const p = normalizarTexto(pergunta);
+  if (/\b(engenheiros?|engenheiras?|arquitetos?|arquitetas?|responsaveis?|responsavel tecnico|profissionais?|tecnicos?)\b/.test(p)) return "engenheiro";
+  // Em ranking, "quem" normalmente pergunta por pessoa/responsavel.
+  if (/\bquem\b/.test(p) && /\b(mais|menos|maior|menor|lider|lidera|ranking)\b/.test(p)) return "engenheiro";
+  if (/\b(empresas?|executoras?|construtoras?)\b/.test(p)) return "empresa";
+  if (/\bbairros?\b/.test(p)) return "bairro";
+  if (/\b(status|situacao)\b/.test(p)) return "status";
+  if (/\b(recursos?|fontes?)\b/.test(p)) return "recurso";
+  return "nenhum";
+}
+
+function ordemCanonicaDaPergunta(pergunta = "") {
+  const p = normalizarTexto(pergunta);
+  if (/\b(menos|menor|menores|mais baixo|mais baixa|pior)\b/.test(p)) return "menor";
+  if (/\b(mais|maior|maiores|mais alto|mais alta|lider|lidera|primeiro)\b/.test(p)) return "maior";
+  return "nenhuma";
+}
+
+function metricaCanonicaDaPergunta(pergunta = "", campos = []) {
+  const p = normalizarTexto(pergunta);
+  if (campos.includes("percentual_executado") || /\b(percentual|porcentagem|avanco|avancad\w*|adiantad\w*)\b/.test(p)) return "percentual_executado";
+  if (campos.includes("valor_executado") || /\b(valor executado|executado|pago|pagamento)\b/.test(p)) return "valor_executado";
+  if (campos.includes("valor_total") || /\b(valores?|custos?|precos?|investimentos?)\b/.test(p)) return "valor_total";
+  if (/\b(quantidade|quantos|quantas|numero|qtd|mais obras|menos obras|mais projetos|menos projetos|mais registros|menos registros)\b/.test(p)) return "quantidade";
+  return "nenhuma";
+}
+
+function referenciaCanonicaAoContexto(pergunta = "", historico = []) {
+  if (!ultimoEstadoDoHistorico(historico)) return false;
+  if (temAlvoExplicitoNaPergunta(pergunta)) return false;
+  const p = normalizarTexto(pergunta);
+  if (/\b(ela|ele|elas|eles|dela|dele|delas|deles|essa|esse|essas|esses|dessas|desses|nela|nele|nelas|neles|anteriores|acima|mesmas|mesmos)\b/.test(p)) return true;
+  // "quais sao as obras?" depois de um ranking/lista e uma continuacao, nao
+  // uma ordem para abrir toda a base. O estado anterior decide o recorte.
+  if (/^(?:e\s+)?quais(?:\s+sao)?(?:\s+(?:as|os)\s+(?:obras?|projetos?|pavimentacoes?|licitacoes?|registros?))?$/.test(p)) return true;
+  // Perguntas curtas de campo depois de um resultado sao continuacoes naturais.
+  if (p.split(/\s+/).length <= 6 && camposSolicitados(pergunta).length > 0) return true;
+  return false;
+}
+
+function classificarIntencaoCanonica(pergunta = "", historico = []) {
+  const p = normalizarTexto(pergunta);
+  const campos = camposSolicitados(pergunta);
+  const escopo = escopoCanonicoDaPergunta(pergunta, historico);
+  const agrupamento = agrupamentoCanonicoDaPergunta(pergunta);
+  const ordem = ordemCanonicaDaPergunta(pergunta);
+  let metrica = metricaCanonicaDaPergunta(pergunta, campos);
+  const usarContexto = referenciaCanonicaAoContexto(pergunta, historico);
+  const resetFiltros = /\b(em geral|no geral|geralmente|no total geral|considerando tudo|sem filtro|todas? no geral)\b/.test(p);
+
+  let acao = "outro";
+  let confianca = 0.55;
+
+  if (ehPedidoDescricaoRegistro(pergunta) || /\b(me conte|me explica|quero saber mais|mostra tudo|resumo completo)\b/.test(p)) {
+    acao = "descrever"; confianca = 0.99;
+  } else if ((agrupamento !== "nenhum" || /\bquem\b/.test(p)) && ordem !== "nenhuma" && (metrica === "quantidade" || /\b(tem|possui|acompanha|cuida|ranking|lider\w*)\b/.test(p))) {
+    if (metrica === "nenhuma") metrica = "quantidade";
+    acao = "ranking"; confianca = 0.99;
+  } else if (/\b(maior|menor|mais avancad\w*|menos avancad\w*|mais car[oa]|mais barat[oa]|primeir[oa]|ultim[oa])\b/.test(p) && metrica !== "nenhuma") {
+    acao = "comparar"; confianca = 0.97;
+  } else if (/\b(quantos|quantas|quantidade|numero de|qtd)\b/.test(p)) {
+    acao = "contar"; confianca = 0.99;
+  } else if (/\b(soma|somam|somar|totalizam|totaliza|ao todo|quanto(?:s)? .* somad|valor total de todas|quanto foi investid)\b/.test(p) && (metrica === "valor_total" || metrica === "valor_executado")) {
+    acao = "somar"; confianca = 0.98;
+  } else if (/\b(relacionad|referente|ligad|parecid|algum|alguma|existe|existem|ha|tem alguma|tem algum)\b/.test(p)) {
+    acao = "buscar_relacionado"; confianca = 0.92;
+  } else if (usarContexto) {
+    acao = "continuar_contexto"; confianca = 0.96;
+  } else if (campos.length > 0) {
+    acao = "consultar_campo"; confianca = 0.96;
+  } else if (/\b(quais|liste|listar|lista|mostre|mostrar|nomes?|me passe|me diga quais)\b/.test(p)) {
+    acao = "listar"; confianca = 0.94;
+  }
+
+  return {
+    acao, campos, escopo, agrupamento, metrica, ordem,
+    usar_contexto: usarContexto,
+    reset_filtros: resetFiltros,
+    confianca,
+  };
+}
+
+function reconciliarPlanoComIntencaoCanonica(plano = {}, canonica = {}, pergunta = "") {
+  if (!plano) plano = {};
+  const forteLocal = Number(canonica?.confianca || 0) >= 0.92 && canonica?.acao && canonica.acao !== "outro";
+  const acao = forteLocal ? canonica.acao : (plano.acao || canonica.acao || "outro");
+  const campos = [...new Set([...(plano.campos || []), ...(canonica.campos || [])])];
+  return {
+    ...plano,
+    acao,
+    campos,
+    escopo: plano.escopo && plano.escopo !== "indefinido" ? plano.escopo : (canonica.escopo || "indefinido"),
+    agrupamento: plano.agrupamento && plano.agrupamento !== "nenhum" ? plano.agrupamento : (canonica.agrupamento || "nenhum"),
+    metrica: plano.metrica && plano.metrica !== "nenhuma" ? plano.metrica : (canonica.metrica || "nenhuma"),
+    ordem: plano.ordem && plano.ordem !== "nenhuma" ? plano.ordem : (canonica.ordem || "nenhuma"),
+    usar_contexto: plano.novo_alvo ? false : (plano.usar_contexto || canonica.usar_contexto || false),
+    reset_filtros: plano.reset_filtros === true || canonica.reset_filtros === true,
+    confianca: Math.max(Number(plano.confianca || 0), Number(canonica.confianca || 0.5)),
+    intencao_canonica_local: canonica.acao || "outro",
+    pergunta_normalizada: normalizarTexto(pergunta),
+  };
+}
 
 function alvoPlanoEhGenericoOuFiltro(alvo = "", pergunta = "") {
   const a = normalizarTexto(alvo);
@@ -4280,7 +4430,8 @@ function alvoPlanoEhGenericoOuFiltro(alvo = "", pergunta = "") {
 
 function sanitizarPlanoAssistente(raw = {}, pergunta = "") {
   if (!raw || typeof raw !== "object") return null;
-  const acao = ACOES_PLANO_ASSISTENTE.has(raw.acao) ? raw.acao : "outro";
+  let acaoRaw = raw.acao === "existencia" ? "buscar_relacionado" : raw.acao;
+  const acao = ACOES_PLANO_ASSISTENTE.has(acaoRaw) ? acaoRaw : "outro";
   const campos = [...new Set((Array.isArray(raw.campos) ? raw.campos : [])
     .map((x) => String(x || "").trim())
     .filter((x) => CAMPOS_PLANO_ASSISTENTE.has(x)))];
@@ -4295,16 +4446,25 @@ function sanitizarPlanoAssistente(raw = {}, pergunta = "") {
   const confiancaNum = Number(raw.confianca);
   const confianca = Number.isFinite(confiancaNum) ? Math.max(0, Math.min(confiancaNum, 1)) : 0.5;
   const perguntaEsclarecimento = String(raw.pergunta_esclarecimento || "").trim().slice(0, 220);
+  const escopoRaw = String(raw.escopo || "indefinido").trim();
+  const agrupamentoRaw = String(raw.agrupamento || "nenhum").trim();
+  const metricaRaw = String(raw.metrica || "nenhuma").trim();
+  const ordemRaw = String(raw.ordem || "nenhuma").trim();
 
   return {
     acao,
     campos,
+    escopo: ESCOPOS_PLANO_ASSISTENTE.has(escopoRaw) ? escopoRaw : "indefinido",
+    agrupamento: AGRUPAMENTOS_PLANO_ASSISTENTE.has(agrupamentoRaw) ? agrupamentoRaw : "nenhum",
+    metrica: METRICAS_PLANO_ASSISTENTE.has(metricaRaw) ? metricaRaw : "nenhuma",
+    ordem: ORDENS_PLANO_ASSISTENTE.has(ordemRaw) ? ordemRaw : "nenhuma",
     alvo,
     equivalentes_fortes: fortes,
     relacionados,
     usar_contexto: raw.usar_contexto === true,
     novo_alvo: raw.novo_alvo === true && !!alvo,
     precisa_esclarecer: raw.precisa_esclarecer === true,
+    reset_filtros: raw.reset_filtros === true,
     pergunta_esclarecimento: perguntaEsclarecimento,
     confianca,
     pergunta_normalizada: normalizarTexto(pergunta),
@@ -4314,6 +4474,7 @@ function sanitizarPlanoAssistente(raw = {}, pergunta = "") {
 async function interpretarPerguntaComoAssistente(pergunta = "", historico = []) {
   if (!USAR_MODO_ASSISTENTE) return null;
 
+  const canonicaLocal = classificarIntencaoCanonica(pergunta, historico);
   const estado = ultimoEstadoDoHistorico(historico);
   const resumoEstado = estado ? {
     escopo: estado.escopo || null,
@@ -4325,10 +4486,14 @@ async function interpretarPerguntaComoAssistente(pergunta = "", historico = []) 
   const prompt = `Voce e a camada de COMPRETENSAO de um chatbot de obras publicas.\n` +
     `NAO escreva SQL e NAO responda a pergunta. Apenas transforme a mensagem em um plano curto.\n\n` +
     `Mensagem atual: ${JSON.stringify(pergunta)}\n` +
-    `Estado recente da conversa: ${JSON.stringify(resumoEstado)}\n\n` +
+    `Estado recente da conversa: ${JSON.stringify(resumoEstado)}\n` +
+    `Classificacao estrutural local (PISTA, nao verdade absoluta): ${JSON.stringify(canonicaLocal)}\n\n` +
     `Retorne SOMENTE JSON valido no formato:\n` +
-    `{"acao":"consultar_campo|descrever|listar|contar|somar|existencia|comparar|ranking|outro",` +
-    `"campos":["..."],"alvo":"...","usar_contexto":false,"novo_alvo":true,` +
+    `{"acao":"consultar_campo|descrever|listar|contar|somar|buscar_relacionado|comparar|ranking|continuar_contexto|outro",` +
+    `"campos":["..."],"escopo":"obras|projetos|pavimentacoes|licitacoes|registros|indefinido",` +
+    `"agrupamento":"engenheiro|empresa|bairro|status|recurso|nenhum",` +
+    `"metrica":"quantidade|valor_total|valor_executado|percentual_executado|nenhuma","ordem":"maior|menor|nenhuma",` +
+    `"alvo":"...","usar_contexto":false,"novo_alvo":true,"reset_filtros":false,` +
     `"precisa_esclarecer":false,"pergunta_esclarecimento":"",` +
     `"equivalentes_fortes":["..."],"relacionados":["..."],"confianca":0.0}\n\n` +
     `REGRAS IMPORTANTES:\n` +
@@ -4345,7 +4510,12 @@ async function interpretarPerguntaComoAssistente(pergunta = "", historico = []) 
     `8. Se a pergunta estiver incompleta e nao houver contexto suficiente, precisa_esclarecer=true.\n` +
     `9. Campos permitidos: recurso,status,engenheiro,empresa,bairro,valor_total,valor_executado,percentual_executado,contrato,convenio,tipo_recurso,data_inicio,data_prev_termino,saldo_devedor,observacoes.\n` +
     `10. Se a pergunta for apenas sobre obras/projetos de um BAIRRO, engenheiro ou status, nao use esse filtro como alvo semantico; deixe alvo vazio e novo_alvo=false. Ex.: "obras do Centro" => Centro e filtro de local, nao alvo.\n` +
-    `11. confianca vai de 0 a 1. Nao inclua explicacoes fora do JSON.`;
+    `11. Perguntas como "quem tem mais obras?", "quem tem menos projetos?" ou "quem lidera em pavimentacoes?" sao COMPLETAS e significam ranking por responsavel tecnico, mesmo sem a palavra engenheiro. Nao peca esclarecimento. Se disser "em geral", marque reset_filtros=true.\n` +
+    `12. Use apenas estas CLASSES de intencao. Duas frases diferentes com o mesmo objetivo DEVEM cair na mesma acao. Nao crie uma acao nova para uma frase nova.\n` +
+    `13. ranking = comparar GRUPOS por quantidade/valor; comparar = escolher ITEM maior/menor; consultar_campo = ler um campo; descrever = ficha; buscar_relacionado = descobrir/existencia sem equivalencia literal obrigatoria.\n` +
+    `14. continuar_contexto = mensagem que depende do resultado anterior sem criar novo alvo, como "e as outras?", "e o valor?", "quais sao elas?".\n` +
+    `15. agrupamento indica quem/qual grupo esta sendo comparado. Em "quem tem mais obras", agrupamento=engenheiro, metrica=quantidade.\n` +
+    `16. confianca vai de 0 a 1. Nao inclua explicacoes fora do JSON.`;
 
   try {
     const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
@@ -4353,7 +4523,8 @@ async function interpretarPerguntaComoAssistente(pergunta = "", historico = []) 
       temperature: 0,
       reasoning_effort: "low",
     });
-    return sanitizarPlanoAssistente(extrairJSONSeguro(bruto) || {}, pergunta);
+    const planoIA = sanitizarPlanoAssistente(extrairJSONSeguro(bruto) || {}, pergunta);
+    return reconciliarPlanoComIntencaoCanonica(planoIA, canonicaLocal, pergunta);
   } catch (e) {
     console.warn("AGENTE/MODO ASSISTENTE: interpretacao indisponivel; seguindo fluxo normal:", e.message);
     return null;
@@ -4416,6 +4587,99 @@ function respostaPlanoPorLinhas(pergunta = "", plano = {}, diretas = [], relacio
   );
 }
 
+
+function perguntaCanonicaParaExecutor(plano = {}, pergunta = "") {
+  const original = normalizarTexto(pergunta);
+  const escopo = plano.escopo && plano.escopo !== "indefinido" ? plano.escopo : "registros";
+  const nomeEscopo = escopo === "pavimentacoes" ? "pavimentacoes" : escopo;
+  const campo = plano.metrica === "valor_executado" ? "valor executado" :
+    plano.metrica === "percentual_executado" ? "percentual executado" :
+    plano.metrica === "valor_total" ? "valor total" : "quantidade";
+  const ordem = plano.ordem === "menor" ? "menos" : "mais";
+
+  if (plano.acao === "ranking") {
+    const grupo = plano.agrupamento === "empresa" ? "empresa" : plano.agrupamento === "bairro" ? "bairro" : "responsavel";
+    return `qual ${grupo} tem ${ordem} ${nomeEscopo} por ${campo} ${original}`.trim();
+  }
+  if (plano.acao === "contar") return `quantas ${nomeEscopo} existem ${original}`.trim();
+  if (plano.acao === "somar") return `qual o total de ${campo} das ${nomeEscopo} ${original}`.trim();
+  if (plano.acao === "comparar") {
+    const adj = plano.ordem === "menor" ? "menor" : "maior";
+    return `qual ${nomeEscopo} tem ${adj} ${campo} ${original}`.trim();
+  }
+  if (plano.acao === "listar") return `liste ${nomeEscopo} ${original}`.trim();
+  if (plano.acao === "consultar_campo") return `${(plano.campos || []).join(" ")} ${original}`.trim();
+  return original;
+}
+
+async function tentarResolverPlanoEstruturado(pergunta = "", historico = [], plano = null) {
+  if (!plano || plano.confianca < CONFIANCA_MIN_PLANO) return null;
+  const acoes = new Set(["ranking", "contar", "somar", "comparar", "listar", "consultar_campo"]);
+  if (!acoes.has(plano.acao)) return null;
+
+  // Se existe um alvo semantico real (UBS, drenagem, escola de Salema...), a
+  // busca por candidatos reais e melhor que forcar a consulta estruturada.
+  if (plano.novo_alvo && plano.alvo && !alvoPlanoEhGenericoOuFiltro(plano.alvo, pergunta)) return null;
+
+  const canonica = perguntaCanonicaParaExecutor(plano, pergunta);
+  let sql = null;
+
+  // Ranking por responsavel tem um construtor proprio. Isso evita que palavras
+  // de ligacao como "em projetos" ou "em obras" sejam confundidas com bairro.
+  if (plano.acao === "ranking" && (plano.agrupamento === "engenheiro" || /\bquem\b/.test(normalizarTexto(pergunta)))) {
+    const pOriginal = normalizarTexto(pergunta);
+    const pStatus = `${pOriginal} ${plano.escopo === "obras" ? "obras" : ""}`.trim();
+    const status = plano.reset_filtros ? "" : filtroStatusDaPergunta(pStatus);
+    let local = plano.reset_filtros ? "" : condicaoLocalDaPergunta(pOriginal);
+    const locaisFalsos = new Set(["obras", "obra", "projetos", "projeto", "pavimentacoes", "pavimentacao", "licitacoes", "licitacao", "registros", "registro"]);
+    const litsLocal = extrairLiteraisILIKE(local).map(normalizarTexto);
+    if (litsLocal.some((x) => locaisFalsos.has(x))) local = "";
+    const rotulo = plano.escopo === "indefinido" ? "" : plano.escopo;
+    const escopoSQL = rotulo === "registros" ? "" : condicaoPorRotuloEscopo(rotulo);
+    const pRanking = `responsavel ${plano.ordem === "menor" ? "menos" : "mais"} ${rotulo || "registros"}`;
+    sql = sqlRankingResponsavel(pRanking, status, local, escopoSQL);
+  } else {
+    sql = gerarSQLRapida(canonica, plano.reset_filtros ? [] : historico);
+  }
+  if (!sql) return null;
+
+  // SQL criada por funcoes locais, mas ainda passa pelo bloqueio de seguranca.
+  const segura = sqlSegura(sql);
+  if (!segura.ok) return null;
+
+  try {
+    const r = await queryReadOnly(comLimite(sql));
+    const linhas = (r.rows || []).map(enriquecerLinhaParaIA);
+    const resposta = redigirLocal(pergunta, linhas);
+    if (!resposta) return null;
+    const estado = construirEstadoSemantico(canonica, sql, linhas, plano.reset_filtros ? [] : historico);
+    estado.intencao = plano.acao;
+    estado.escopo_canonico = plano.escopo;
+    estado.agrupamento = plano.agrupamento;
+    estado.metrica = plano.metrica;
+    return {
+      resposta,
+      sql,
+      linhas: linhas.length,
+      estado,
+      respostaDeterministica: true,
+      modoAgente: "agente1_intencao_canonica",
+      planoAssistente: {
+        acao: plano.acao,
+        campos: plano.campos,
+        escopo: plano.escopo,
+        agrupamento: plano.agrupamento,
+        metrica: plano.metrica,
+        ordem: plano.ordem,
+        confianca: plano.confianca,
+      },
+    };
+  } catch (e) {
+    console.warn("AGENTE/INTENCAO CANONICA: executor estruturado falhou; seguindo fluxo normal:", e.message);
+    return null;
+  }
+}
+
 async function tentarResolverComPlanoAssistente(pergunta = "", historico = [], plano = null) {
   if (!plano || plano.confianca < CONFIANCA_MIN_PLANO) return null;
   if (plano.precisa_esclarecer) {
@@ -4425,6 +4689,12 @@ async function tentarResolverComPlanoAssistente(pergunta = "", historico = [], p
       modoAgente: "agente1_modo_assistente",
     };
   }
+
+  // Primeiro tenta executar a INTENCAO, nao a frase. O executor recebe uma
+  // pergunta canonica equivalente e reaproveita os filtros estruturados ja
+  // testados do Agente 1. Se nao for seguro/suficiente, cai para semantica/IA.
+  const estruturada = await tentarResolverPlanoEstruturado(pergunta, historico, plano);
+  if (estruturada) return estruturada;
 
   // Referencias puras devem continuar usando a memoria de IDs/WHERE ja existente.
   if (plano.usar_contexto && !plano.novo_alvo) return null;
@@ -4492,6 +4762,10 @@ async function tentarResolverComPlanoAssistente(pergunta = "", historico = [], p
         acao: plano.acao,
         campos: plano.campos,
         alvo: plano.alvo,
+        escopo: plano.escopo,
+        agrupamento: plano.agrupamento,
+        metrica: plano.metrica,
+        ordem: plano.ordem,
         confianca: plano.confianca,
       },
       consultas: [buscaDireta.sql, buscaRelacionada.sql, sqlFinal].filter(Boolean),
