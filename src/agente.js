@@ -16,10 +16,9 @@ import { chamarIAbruta } from "./groq.js"; // reaproveita a chamada de IA que ja
 
 // MODO PADRAO: IA interpreta a linguagem natural; o Node atua como guardrail.
 // O planejador usa schema dinamico, regras gerais e memoria de conversa.
-// Nao existe aprendizado AUTOMATICO nem gravacao autonoma de perguntas.
-// Padroes manuais APROVADOS pelo administrador podem ser lidos da tabela
-// agent_patterns; o agente nunca faz INSERT/UPDATE nessa tabela.
-// As regras rapidas antigas ficam disponiveis como protecao/fallback.
+// Nao existe aprendizado persistente nem gravacao de perguntas/padroes.
+// As regras rapidas antigas ficam disponiveis apenas como fallback de contingencia
+// (ou se AGENTE_SQL_RAPIDA=true). Assim o chatbot nao depende de frases fixas.
 const USAR_SQL_RAPIDA_PRIMEIRO = process.env.AGENTE_SQL_RAPIDA === "true";
 
 // Camada deterministica de alta confianca vem ANTES do agente por ferramentas.
@@ -38,8 +37,7 @@ const MAX_PASSOS_FERRAMENTAS = Math.max(1, Math.min(Number(process.env.AGENTE_MA
 // Em vez de transformar cada palavra da pergunta em ILIKE, o agente extrai o
 // assunto, gera poucas pistas linguisticas temporarias, busca candidatos REAIS
 // no PostgreSQL e so entao executa a consulta definitiva pelos IDs encontrados.
-// A busca semantica nao cria sinonimos permanentes nem agent_knowledge.
-// A memoria permanente permitida e somente a tabela manual agent_patterns.
+// Nao existe dicionario persistente de sinonimos nem agent_knowledge.
 const USAR_BUSCA_SEMANTICA = process.env.AGENTE_BUSCA_SEMANTICA !== "false";
 const MAX_CANDIDATOS_SEMANTICOS = Math.max(8, Math.min(Number(process.env.AGENTE_MAX_CANDIDATOS_SEMANTICOS || 24), 40));
 
@@ -831,164 +829,6 @@ function exemplosRelevantes(pergunta = "", limite = 4) {
   return { texto };
 }
 
-
-// ============================================================
-// PADROES MANUAIS APROVADOS NO POSTGRESQL
-// ============================================================
-// Esta camada NAO aprende sozinha e NAO grava nada no banco.
-// Ela apenas LE padroes que o administrador inseriu manualmente em agent_patterns.
-// Assim, um erro corrigido pode virar conhecimento permanente sem criar mais regex.
-// Se a tabela ainda nao existir ou estiver indisponivel, o Agente 1 continua usando
-// os exemplos embutidos e todas as protecoes antigas.
-const USAR_PADROES_BANCO = process.env.AGENTE_PADROES_BANCO !== "false";
-const CACHE_PADROES_BANCO_MS = Math.max(
-  15_000,
-  Math.min(Number(process.env.AGENTE_PADROES_CACHE_MS || 120_000), 15 * 60 * 1000)
-);
-let cachePadroesBanco = { linhas: [], quando: 0, erroAvisado: false };
-
-function valorComoArray(v) {
-  if (Array.isArray(v)) return v;
-  if (v === null || v === undefined || v === "") return [];
-  if (typeof v === "string") {
-    try {
-      const j = JSON.parse(v);
-      return Array.isArray(j) ? j : [v];
-    } catch {
-      return [v];
-    }
-  }
-  return [v];
-}
-
-function textoPlanoPadrao(v) {
-  if (!v) return "";
-  if (typeof v === "string") return v.slice(0, 1200);
-  try {
-    return JSON.stringify(v).slice(0, 1200);
-  } catch {
-    return "";
-  }
-}
-
-function scorePadraoBanco(padrao = {}, pergunta = "") {
-  const qNorm = normalizarTexto(pergunta);
-  const q = new Set(tokensRelevantes(pergunta));
-  if (!q.size) return 0;
-
-  const positivos = valorComoArray(padrao.exemplos_positivos).map((x) => String(x || ""));
-  const negativos = valorComoArray(padrao.exemplos_negativos).map((x) => String(x || ""));
-  const tags = Array.isArray(padrao.tags) ? padrao.tags.join(" ") : String(padrao.tags || "");
-
-  const corpus = [
-    padrao.titulo,
-    padrao.intencao,
-    padrao.pergunta_exemplo,
-    tags,
-    padrao.regra,
-    ...positivos,
-  ].filter(Boolean).join(" ");
-
-  const base = tokensRelevantes(corpus);
-  let score = 0;
-
-  for (const t of base) {
-    if (q.has(t)) score += 3;
-    else if ([...q].some((x) => x.length >= 5 && (t.startsWith(x) || x.startsWith(t)))) score += 1;
-  }
-
-  for (const ex of positivos) {
-    const n = normalizarTexto(ex);
-    if (!n) continue;
-    if (n === qNorm) score += 18;
-    else if (qNorm.includes(n) || n.includes(qNorm)) score += 8;
-  }
-
-  // Exemplos negativos existem para evitar aplicar um padrao em frases parecidas
-  // com significado diferente, como "mostrar mais obras" x "quem tem mais obras".
-  for (const ex of negativos) {
-    const n = normalizarTexto(ex);
-    if (!n) continue;
-    if (n === qNorm) score -= 30;
-    else {
-      const nt = tokensRelevantes(n);
-      const inter = nt.filter((x) => q.has(x)).length;
-      if (nt.length && inter / nt.length >= 0.75) score -= 12;
-    }
-  }
-
-  const prioridade = Number(padrao.prioridade);
-  if (Number.isFinite(prioridade)) score += Math.max(0, Math.min(prioridade, 200)) / 100;
-
-  return score;
-}
-
-async function carregarPadroesAprovadosBanco() {
-  if (!USAR_PADROES_BANCO) return [];
-  const agora = Date.now();
-  if (cachePadroesBanco.linhas.length && agora - cachePadroesBanco.quando < CACHE_PADROES_BANCO_MS) {
-    return cachePadroesBanco.linhas;
-  }
-
-  try {
-    const r = await queryReadOnly(
-      `SELECT chave, titulo, intencao, pergunta_exemplo, tags, regra, plano, sql_modelo, ` +
-      `exemplos_positivos, exemplos_negativos, prioridade ` +
-      `FROM agent_patterns ` +
-      `WHERE ativo = TRUE AND aprovado = TRUE ` +
-      `ORDER BY prioridade DESC, id ASC LIMIT 200`
-    );
-    cachePadroesBanco = {
-      linhas: Array.isArray(r.rows) ? r.rows : [],
-      quando: agora,
-      erroAvisado: false,
-    };
-    return cachePadroesBanco.linhas;
-  } catch (e) {
-    // Tabela ausente nao derruba o chatbot. Isso permite publicar o JS antes de
-    // rodar a migracao, embora os padroes so funcionem depois do SQL ser aplicado.
-    if (!cachePadroesBanco.erroAvisado) {
-      console.warn("AGENTE/PADROES: tabela agent_patterns indisponivel; usando apenas regras antigas:", e.message);
-    }
-    cachePadroesBanco = { linhas: [], quando: agora, erroAvisado: true };
-    return [];
-  }
-}
-
-async function padroesAprovadosRelevantes(pergunta = "", limite = 6) {
-  const todos = await carregarPadroesAprovadosBanco();
-  if (!todos.length) return { texto: "", itens: [] };
-
-  const itens = todos
-    .map((p) => ({ ...p, score: scorePadraoBanco(p, pergunta) }))
-    .filter((p) => p.score > 0)
-    .sort((a, b) => b.score - a.score || Number(b.prioridade || 0) - Number(a.prioridade || 0))
-    .slice(0, Math.max(1, Math.min(Number(limite) || 6, 10)));
-
-  const texto = itens.map((p) => {
-    const partes = [
-      `PADRAO APROVADO [${p.chave}]`,
-      p.titulo ? `Titulo: ${p.titulo}` : "",
-      p.intencao ? `Intencao: ${p.intencao}` : "",
-      p.pergunta_exemplo ? `Exemplo: ${p.pergunta_exemplo}` : "",
-      p.regra ? `Regra validada: ${String(p.regra).slice(0, 1200)}` : "",
-      p.plano ? `Plano de referencia: ${textoPlanoPadrao(p.plano)}` : "",
-      p.sql_modelo ? `SQL/modelo de consulta: ${String(p.sql_modelo).slice(0, 1400)}` : "",
-      valorComoArray(p.exemplos_negativos).length
-        ? `NAO aplicar como equivalencia nestes casos: ${valorComoArray(p.exemplos_negativos).join(" | ").slice(0, 900)}`
-        : "",
-    ].filter(Boolean);
-    return partes.join("\n");
-  }).join("\n\n");
-
-  if (itens.length) {
-    console.log("AGENTE/PADROES: usando", itens.map((p) => p.chave).join(", "));
-  }
-
-  return { texto: texto.slice(0, 8500), itens };
-}
-
-
 // O historico comum serve apenas para CONTEXTO da conversa.
 // Ele nao vira treinamento nem conhecimento permanente.
 
@@ -1589,7 +1429,7 @@ function escopoNegocioObrigatorio(pergunta, historico = []) {
     const estado = ultimoEstadoDoHistorico(historico);
     const escopoEstado = normalizarTexto(estado?.escopo || "");
     if (escopoEstado === "obras") return "aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO')";
-    if (escopoEstado === "obras_em_andamento") return "aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO')";
+    if (escopoEstado === "obras_em_andamento") return "aba_origem = 'EM_ANDAMENTO'";
     if (escopoEstado === "pavimentacoes") return "aba_origem = 'PAVIMENTAÇÃO'";
     if (escopoEstado === "projetos") return "aba_origem = 'EM_PROJETO'";
     if (escopoEstado === "licitacoes") return "aba_origem = 'EM_LICITAÇÃO'";
@@ -1610,11 +1450,10 @@ function escopoNegocioObrigatorio(pergunta, historico = []) {
   if (/\bpaviment/.test(p)) return "aba_origem = 'PAVIMENTAÇÃO'";
 
   if (/\bobras?\b/.test(p)) {
-    // Para o universo "obras", andamento inclui obra fisica em andamento +
-    // pavimentacao em execucao. O filtro de status detalhado e aplicado por
-    // condicaoObrasEmAndamento(); aqui mantemos apenas o universo correto.
+    // Regra especifica ja definida no projeto: "obras em andamento" refere-se
+    // a aba EM_ANDAMENTO. Pavimentacoes em execucao sao uma categoria separada.
     if (/\b(em andamento|andamento|em execucao|em execucao|executando|sendo feit[ao]s?)\b/.test(p)) {
-      return "aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO')";
+      return "aba_origem = 'EM_ANDAMENTO'";
     }
     if (/\bobras? fisic/.test(p)) return "aba_origem = 'EM_ANDAMENTO'";
 
@@ -2589,7 +2428,6 @@ async function gerarSQL(pergunta, historico = [], correcao = null) {
 
   const contextoBanco = await contextoAtualDoBanco();
   const amostrasBanco = await amostrasRelevantesDoBanco(pergunta);
-  const padroesBanco = await padroesAprovadosRelevantes(pergunta, 6);
 
   const blocoCorrecao = correcao
     ? `\nA consulta anterior falhou/rejeitou. SQL=${JSON.stringify((correcao.sql || "").slice(0, 600))} ERRO=${JSON.stringify((correcao.erro || "").slice(0, 220))}. Corrija a consulta sem mudar a intencao da pergunta.`
@@ -2610,11 +2448,7 @@ ${amostrasBanco}
 MEMORIA RECENTE DA CONVERSA:
 ${resumoHistorico(historico)}
 
-PADROES MANUAIS APROVADOS NO BANCO (use como casos validados; nunca como resposta fixa):
-${padroesBanco.texto || "(nenhum padrao manual relevante para esta pergunta)"}
-
 COMO TRABALHAR:
-0. Quando houver PADRAO MANUAL APROVADO claramente correspondente, preserve a logica validada dele (intencao, escopo, contexto e formato da consulta). Adapte nomes/filtros aos dados atuais e NUNCA reutilize resultado numerico antigo.
 1. Entenda a INTENCAO da pergunta em linguagem natural, inclusive sinonimos, erros de digitacao, frases nunca vistas e follow-ups. NAO dependa de frases exatas.
 1.1. Antes de escrever a SQL, resolva mentalmente: (a) o que o cidadao quer saber, (b) qual conjunto de registros ele quer, (c) quais filtros citou, (d) quais campos/metricas pediu. Nao exponha esse raciocinio.
 2. Use SOMENTE colunas/chaves que realmente existem no schema/metadados acima. Os metadados sao referencia; a resposta final deve vir da CONSULTA, nunca de memoria ou suposicao.
@@ -2635,7 +2469,7 @@ REGRAS SQL:
 - Para categorias, escolha valores REAIS listados nos metadados; nao invente categoria.
 - "quantas obras" = COUNT(*), mas RESPEITE o tipo/origem pedido e TODOS os filtros mencionados (bairro, status, responsavel etc.). Nunca descarte o filtro de pessoa ao contar.
 - REGRA DE NEGOCIO: quando o cidadao diz apenas "obra/obras" de forma generica, considere obras fisicas + pavimentacoes; PROJETOS e LICITACOES ficam separados, salvo quando forem pedidos explicitamente.
-- REGRA DE NEGOCIO: "obras em andamento" = (EM_ANDAMENTO com status em andamento) + (PAVIMENTAÇÃO com status em execucao/andamento). Nao inclua processos de licitacao cuja etapa se chama "Habilitacao em andamento".
+- REGRA DE NEGOCIO: "obras em andamento" = obras da origem/categoria EM_ANDAMENTO. Nao some processos de licitacao cuja etapa se chama "Habilitacao em andamento".
 - Em "qual engenheiro/responsavel tem MAIS/MENOS obras/projetos/pavimentacoes/licitacoes?", NAO filtre engenheiro por palavras como "tem", "possui", "mais" ou "menos". Agrupe por engenheiro com GROUP BY, conte os registros e ordene pela contagem.
 - Para ranking de responsavel, use aliases padrao para o Node auditar sem recalcular: engenheiro, COUNT(*)::int AS quantidade_registros e, quando o pedido for "obras" generico, tambem SUM(CASE WHEN aba_origem='EM_ANDAMENTO' THEN 1 ELSE 0 END)::int AS obras_fisicas, SUM(CASE WHEN aba_origem='PAVIMENTAÇÃO' THEN 1 ELSE 0 END)::int AS pavimentacoes, SUM(CASE WHEN aba_origem='EM_PROJETO' THEN 1 ELSE 0 END)::int AS projetos, SUM(CASE WHEN aba_origem='EM_LICITAÇÃO' THEN 1 ELSE 0 END)::int AS licitacoes. Para "obras" generico, filtre aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO') antes de agrupar.
 - "engenheiro", "responsavel" ou "arquiteto" pode ser CAMPO/perfil pedido, nao necessariamente o inicio de um nome. Verbos/interrogativos depois dessas palavras (tem, possui, esta, qual, mais, menos, com) NUNCA sao nomes de pessoa.
@@ -3813,7 +3647,6 @@ async function planejarPassoFerramenta(pergunta, historico, consultas = [], erro
   const resultados = serializarConsultasFerramenta(consultas);
   const pistas = pistasInterpretacaoPergunta(pergunta);
   const conhecimento = exemplosRelevantes(pergunta, 4);
-  const padroesBanco = await padroesAprovadosRelevantes(pergunta, 6);
 
   const prompt = `Voce e o PLANEJADOR de um assistente que conversa livremente com uma base de obras publicas.
 Voce NAO responde usando conhecimento proprio. Voce possui uma unica ferramenta: CONSULTAR_BANCO, que executa SELECT somente leitura na tabela obras.
@@ -3839,15 +3672,10 @@ ${JSON.stringify(resultados)}
 PISTAS DE INTERPRETACAO GERADAS PELO NODE (apoio; nao sao resposta):
 ${JSON.stringify(pistas)}
 
-PADROES MANUAIS APROVADOS NO BANCO (prioridade alta; foram corrigidos e confirmados):
-${padroesBanco.texto || "(nenhum padrao manual relevante para esta pergunta)"}
-
-EXEMPLOS SEMANTICOS EMBUTIDOS (fallback geral; NAO sao frases fixas):
+EXEMPLOS SEMANTICOS RELEVANTES (ensinam regra; NAO sao frases fixas):
 ${conhecimento.texto || "(use schema e regras gerais)"}
 
 REGRAS DE COMPORTAMENTO:
-- Se um PADRAO MANUAL APROVADO for claramente relevante, use a regra/plano dele como referencia principal. Nao copie valores fixos; adapte apenas a logica aos dados e filtros atuais.
-- Nunca aplique um padrao apenas por uma palavra solta; respeite exemplos negativos e a intencao completa da pergunta.
 - Entenda linguagem natural, sinonimos, erros de digitacao e perguntas nunca vistas. Nao dependa de frases cadastradas.
 - Referencias como ela/ele/dela/dele/dessas/deles/essas/esses devem apontar primeiro para o turno imediatamente anterior.
 - Se CONTEXTO PRIORITARIO.estado_semantico trouxer foco_objeto, use esse item para referencia singular (ela/dela/esse item).
@@ -3856,7 +3684,7 @@ REGRAS DE COMPORTAMENTO:
 - Se os dados ja retornados forem suficientes para responder TUDO o que foi pedido, finalize. Se faltar algo, faca outra consulta complementar.
 - Nunca invente nomes, valores, percentuais, quantidades, bairros, empresas, status ou responsaveis.
 - \"obras\" generico significa EM_ANDAMENTO + PAVIMENTAÇÃO. Projeto e licitacao sao categorias separadas.
-- \"obras em andamento\" usa EM_ANDAMENTO com status em andamento + PAVIMENTAÇÃO com status em execucao/andamento. Etapas de licitacao com a palavra andamento ficam fora.
+- \"obras em andamento\" significa origem EM_ANDAMENTO. Etapa de licitacao com a palavra andamento nao e obra em andamento.
 - Se o usuario pedir explicitamente projeto, pavimentacao ou licitacao, use a origem correspondente.
 - Se pedir \"tudo/todas as categorias/todos os registros\", ai sim pode considerar todas as origens.
 - Para valores: valor_total, valor_executado e valores pagos sao conceitos diferentes. Nao substitua um pelo outro.
@@ -4647,7 +4475,6 @@ async function interpretarPerguntaComoAssistente(pergunta = "", historico = []) 
   if (!USAR_MODO_ASSISTENTE) return null;
 
   const canonicaLocal = classificarIntencaoCanonica(pergunta, historico);
-  const padroesBanco = await padroesAprovadosRelevantes(pergunta, 6);
   const estado = ultimoEstadoDoHistorico(historico);
   const resumoEstado = estado ? {
     escopo: estado.escopo || null,
@@ -4661,9 +4488,6 @@ async function interpretarPerguntaComoAssistente(pergunta = "", historico = []) 
     `Mensagem atual: ${JSON.stringify(pergunta)}\n` +
     `Estado recente da conversa: ${JSON.stringify(resumoEstado)}\n` +
     `Classificacao estrutural local (PISTA, nao verdade absoluta): ${JSON.stringify(canonicaLocal)}\n\n` +
-    `PADROES MANUAIS APROVADOS QUE PODEM SER RELEVANTES:\n${padroesBanco.texto || "(nenhum)"}\n\n` +
-    `Quando um padrao aprovado corresponder claramente a mensagem, preserve sua intencao e regra. ` +
-    `Nao use valores/resultados antigos do padrao e nao force padrao irrelevante.\n\n` +
     `Retorne SOMENTE JSON valido no formato:\n` +
     `{"acao":"consultar_campo|descrever|listar|contar|somar|buscar_relacionado|comparar|ranking|continuar_contexto|outro",` +
     `"campos":["..."],"escopo":"obras|projetos|pavimentacoes|licitacoes|registros|indefinido",` +
