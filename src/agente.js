@@ -14,16 +14,15 @@
 import { queryReadOnly } from "./db.js";
 import { chamarIAbruta } from "./groq.js"; // reaproveita a chamada de IA que ja existe
 
-// MODO PADRAO: IA interpreta a linguagem natural; o Node atua como guardrail.
-// O planejador usa schema dinamico, regras gerais e memoria de conversa.
-// Nao existe aprendizado persistente nem gravacao de perguntas/padroes.
-// As regras rapidas antigas ficam disponiveis apenas como fallback de contingencia
-// (ou se AGENTE_SQL_RAPIDA=true). Assim o chatbot nao depende de frases fixas.
+// MODO PADRAO: IA interpreta a linguagem natural e produz um PLANO ESTRUTURADO.
+// O Node executa operacoes deterministicas e atua como guardrail.
+// Padroes manuais aprovados no PostgreSQL sao apenas APOIO; este arquivo nunca
+// grava/aprende padroes automaticamente. As regras antigas ficam como fallback.
+// Assim o chatbot nao depende de frases fixas nem de SQL livre como caminho principal.
 const USAR_SQL_RAPIDA_PRIMEIRO = process.env.AGENTE_SQL_RAPIDA === "true";
 
-// Camada deterministica de alta confianca vem ANTES do agente por ferramentas.
-// Ela nao usa perguntas fixas: identifica operacao, escopo, filtros, campos e
-// termos livres. Se nao reconhecer com seguranca, entrega para a IA.
+// Camada deterministica antiga fica como FALLBACK de alta confianca.
+// Ela nao usa perguntas fixas: identifica operacao, escopo, filtros e campos.
 // Pode ser desligada apenas para diagnostico com AGENTE_DIRETO=false.
 const USAR_CAMADA_DIRETA = process.env.AGENTE_DIRETO !== "false";
 
@@ -47,6 +46,28 @@ const MAX_CANDIDATOS_SEMANTICOS = Math.max(8, Math.min(Number(process.env.AGENTE
 // Se essa camada estiver indisponivel, todo o Agente 1 antigo continua funcionando.
 const USAR_MODO_ASSISTENTE = process.env.AGENTE_MODO_ASSISTENTE !== "false";
 const CONFIANCA_MIN_PLANO = Math.max(0.45, Math.min(Number(process.env.AGENTE_CONFIANCA_PLANO || 0.68), 0.95));
+
+// ============================================================
+// FONTE UNICA DAS REGRAS DE NEGOCIO
+// ============================================================
+// Estas regras sao permanentes do SISTEMA, nao resultados atuais da planilha.
+// Dados mutaveis (status, valores, engenheiros, percentuais etc.) SEMPRE vem do banco.
+const REGRAS_NEGOCIO_CENTRAIS = `
+REGRAS DE NEGOCIO CONFIRMADAS:
+- "obras" = registros das origens EM_ANDAMENTO + PAVIMENTAÇÃO.
+- "obras em andamento" = EM_ANDAMENTO com status de andamento + PAVIMENTAÇÃO em execução/andamento.
+- EM_PROJETO e EM_LICITAÇÃO ficam fora de "obras", salvo pedido explícito.
+- projetos = EM_PROJETO.
+- licitações/processos licitatórios = EM_LICITAÇÃO.
+- pavimentações = PAVIMENTAÇÃO.
+- "habilitação em andamento" é etapa de licitação; não é obra física em andamento.
+- recurso/fonte pode mudar de chave em dados_extras conforme a origem; nunca invente uma chave.
+- valor_total, valor_executado, pagamentos e saldo_devedor são conceitos diferentes.
+- novo alvo explícito no turno atual vence filtros incompatíveis herdados do contexto anterior.
+- "em geral/no geral" em ranking remove filtros específicos herdados, mas preserva a intenção.
+- empates são calculados dinamicamente a partir do resultado atual; nunca salve nomes de vencedores.
+`;
+
 
 
 // Descricao da tabela que a IA recebe (o "schema"). Se mudar a
@@ -797,6 +818,94 @@ const EXEMPLOS_SEMANTICOS = [
   },
 ];
 
+
+// ============================================================
+// PADROES MANUAIS APROVADOS - APOIO EXCEPCIONAL
+// ============================================================
+// Le apenas padroes que o administrador colocou manualmente em agent_patterns.
+// NUNCA faz INSERT/UPDATE/DELETE nessa tabela.
+// A leitura usa to_jsonb para tolerar tanto a estrutura antiga quanto a nova.
+let cachePadroesAprovados = { quando: 0, itens: [] };
+const CACHE_PADROES_MS = Math.max(30000, Number(process.env.AGENTE_PADROES_CACHE_MS || 120000));
+const USAR_PADROES_MANUAIS = process.env.AGENTE_PADROES_BANCO !== "false";
+
+async function carregarPadroesAprovados() {
+  if (!USAR_PADROES_MANUAIS) return [];
+  const agora = Date.now();
+  if (cachePadroesAprovados.itens.length && agora - cachePadroesAprovados.quando < CACHE_PADROES_MS) {
+    return cachePadroesAprovados.itens;
+  }
+
+  try {
+    const r = await queryReadOnly(
+      `SELECT to_jsonb(p) AS padrao
+       FROM agent_patterns p
+       WHERE COALESCE((to_jsonb(p)->>'ativo')::boolean, TRUE) = TRUE
+         AND COALESCE((to_jsonb(p)->>'aprovado')::boolean, TRUE) = TRUE
+       LIMIT 200`
+    );
+    const itens = (r.rows || []).map((x) => x.padrao).filter((x) => x && typeof x === "object");
+    cachePadroesAprovados = { quando: agora, itens };
+    return itens;
+  } catch (e) {
+    // A tabela de padroes e opcional. Se nao existir/estiver indisponivel,
+    // o agente continua normalmente com plano + ferramentas + regras centrais.
+    console.warn("AGENTE/PADROES: apoio indisponivel:", e.message);
+    cachePadroesAprovados = { quando: agora, itens: [] };
+    return [];
+  }
+}
+
+function textoPadraoManual(p = {}) {
+  const partes = [
+    p.nome, p.titulo, p.categoria, p.intencao, p.descricao, p.regra,
+    p.pergunta_exemplo, p.tags, p.exemplos_positivos, p.exemplos_negativos,
+    p.plano_json, p.plano, p.sql_modelo, p.sql_exemplo, p.observacao
+  ];
+  return partes
+    .map((x) => typeof x === "string" ? x : (x && typeof x === "object" ? JSON.stringify(x) : ""))
+    .filter(Boolean)
+    .join(" ");
+}
+
+function scorePadraoManual(padrao = {}, pergunta = "") {
+  const q = new Set(tokensRelevantes(pergunta));
+  if (!q.size) return 0;
+  const base = tokensRelevantes(textoPadraoManual(padrao));
+  let score = 0;
+  for (const t of base) {
+    if (q.has(t)) score += 3;
+    else if ([...q].some((x) => x.length >= 5 && (t.startsWith(x) || x.startsWith(t)))) score += 1;
+  }
+  return score;
+}
+
+async function padroesManuaisRelevantes(pergunta = "", limite = 2) {
+  const itens = await carregarPadroesAprovados();
+  if (!itens.length) return "(nenhum padrao manual necessario)";
+
+  const melhores = itens
+    .map((p) => ({ p, score: scorePadraoManual(p, pergunta) }))
+    .filter((x) => x.score >= 5)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, Math.max(1, Math.min(limite, 3)));
+
+  if (!melhores.length) return "(nenhum padrao manual suficientemente parecido)";
+
+  return melhores.map(({ p }, i) => {
+    const nome = p.nome || p.titulo || p.chave || `padrao_${i + 1}`;
+    const regra = p.regra || p.descricao || p.observacao || "";
+    const plano = p.plano_json || p.plano || "";
+    const sql = p.sql_modelo || p.sql_exemplo || "";
+    return [
+      `PADRAO APROVADO ${i + 1}: ${nome}`,
+      regra ? `REGRA: ${typeof regra === "string" ? regra : JSON.stringify(regra)}` : "",
+      plano ? `PLANO DE REFERENCIA: ${typeof plano === "string" ? plano : JSON.stringify(plano)}` : "",
+      sql ? `SQL DE REFERENCIA (somente estrutura; adapte aos dados atuais): ${sql}` : ""
+    ].filter(Boolean).join("\n");
+  }).join("\n\n");
+}
+
 function scoreExemploSemantico(exemplo, pergunta = "") {
   const q = new Set(tokensRelevantes(pergunta));
   const base = tokensRelevantes(`${exemplo.pergunta || ""} ${exemplo.tags || ""} ${exemplo.regra || ""}`);
@@ -1429,7 +1538,7 @@ function escopoNegocioObrigatorio(pergunta, historico = []) {
     const estado = ultimoEstadoDoHistorico(historico);
     const escopoEstado = normalizarTexto(estado?.escopo || "");
     if (escopoEstado === "obras") return "aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO')";
-    if (escopoEstado === "obras_em_andamento") return "aba_origem = 'EM_ANDAMENTO'";
+    if (escopoEstado === "obras_em_andamento") return "aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO')";
     if (escopoEstado === "pavimentacoes") return "aba_origem = 'PAVIMENTAÇÃO'";
     if (escopoEstado === "projetos") return "aba_origem = 'EM_PROJETO'";
     if (escopoEstado === "licitacoes") return "aba_origem = 'EM_LICITAÇÃO'";
@@ -1450,10 +1559,10 @@ function escopoNegocioObrigatorio(pergunta, historico = []) {
   if (/\bpaviment/.test(p)) return "aba_origem = 'PAVIMENTAÇÃO'";
 
   if (/\bobras?\b/.test(p)) {
-    // Regra especifica ja definida no projeto: "obras em andamento" refere-se
-    // a aba EM_ANDAMENTO. Pavimentacoes em execucao sao uma categoria separada.
-    if (/\b(em andamento|andamento|em execucao|em execucao|executando|sendo feit[ao]s?)\b/.test(p)) {
-      return "aba_origem = 'EM_ANDAMENTO'";
+    // Regra unica: "obras em andamento" abrange EM_ANDAMENTO + PAVIMENTAÇÃO.
+    // O filtro de status especifico e aplicado por condicaoObrasEmAndamento().
+    if (/\b(em andamento|andamento|em execucao|execucao|executando|sendo feit[ao]s?)\b/.test(p)) {
+      return "aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO')";
     }
     if (/\bobras? fisic/.test(p)) return "aba_origem = 'EM_ANDAMENTO'";
 
@@ -2428,6 +2537,7 @@ async function gerarSQL(pergunta, historico = [], correcao = null) {
 
   const contextoBanco = await contextoAtualDoBanco();
   const amostrasBanco = await amostrasRelevantesDoBanco(pergunta);
+  const padroesApoio = await padroesManuaisRelevantes(pergunta, 2);
 
   const blocoCorrecao = correcao
     ? `\nA consulta anterior falhou/rejeitou. SQL=${JSON.stringify((correcao.sql || "").slice(0, 600))} ERRO=${JSON.stringify((correcao.erro || "").slice(0, 220))}. Corrija a consulta sem mudar a intencao da pergunta.`
@@ -2438,6 +2548,12 @@ Sua funcao e transformar a pergunta do cidadao em UMA consulta PostgreSQL precis
 
 SCHEMA DE NEGOCIO:
 ${SCHEMA}
+
+REGRAS DE NEGOCIO - FONTE UNICA:
+${REGRAS_NEGOCIO_CENTRAIS}
+
+PADROES MANUAIS APROVADOS SEMELHANTES (APOIO, NAO OBRIGATORIOS):
+${padroesApoio}
 
 METADADOS ATUAIS DO DATASET:
 ${contextoBanco}
@@ -2469,7 +2585,7 @@ REGRAS SQL:
 - Para categorias, escolha valores REAIS listados nos metadados; nao invente categoria.
 - "quantas obras" = COUNT(*), mas RESPEITE o tipo/origem pedido e TODOS os filtros mencionados (bairro, status, responsavel etc.). Nunca descarte o filtro de pessoa ao contar.
 - REGRA DE NEGOCIO: quando o cidadao diz apenas "obra/obras" de forma generica, considere obras fisicas + pavimentacoes; PROJETOS e LICITACOES ficam separados, salvo quando forem pedidos explicitamente.
-- REGRA DE NEGOCIO: "obras em andamento" = obras da origem/categoria EM_ANDAMENTO. Nao some processos de licitacao cuja etapa se chama "Habilitacao em andamento".
+- REGRA DE NEGOCIO: "obras em andamento" = EM_ANDAMENTO em andamento + PAVIMENTAÇÃO em execucao/andamento. Nao inclua processos de licitacao cuja etapa se chama "Habilitacao em andamento".
 - Em "qual engenheiro/responsavel tem MAIS/MENOS obras/projetos/pavimentacoes/licitacoes?", NAO filtre engenheiro por palavras como "tem", "possui", "mais" ou "menos". Agrupe por engenheiro com GROUP BY, conte os registros e ordene pela contagem.
 - Para ranking de responsavel, use aliases padrao para o Node auditar sem recalcular: engenheiro, COUNT(*)::int AS quantidade_registros e, quando o pedido for "obras" generico, tambem SUM(CASE WHEN aba_origem='EM_ANDAMENTO' THEN 1 ELSE 0 END)::int AS obras_fisicas, SUM(CASE WHEN aba_origem='PAVIMENTAÇÃO' THEN 1 ELSE 0 END)::int AS pavimentacoes, SUM(CASE WHEN aba_origem='EM_PROJETO' THEN 1 ELSE 0 END)::int AS projetos, SUM(CASE WHEN aba_origem='EM_LICITAÇÃO' THEN 1 ELSE 0 END)::int AS licitacoes. Para "obras" generico, filtre aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO') antes de agrupar.
 - "engenheiro", "responsavel" ou "arquiteto" pode ser CAMPO/perfil pedido, nao necessariamente o inicio de um nome. Verbos/interrogativos depois dessas palavras (tem, possui, esta, qual, mais, menos, com) NUNCA sao nomes de pessoa.
@@ -3081,18 +3197,14 @@ function redigirLocal(pergunta, linhas) {
   if (linhas.length === 1) {
     const l = linhas[0] || {};
 
-    // Resposta explicativa para a pergunta "quantas obras estao em andamento?".
-    // O primeiro numero e o total principal; os outros sao contextos relacionados
-    // que NAO devem ser somados automaticamente.
+    // "obras em andamento" segue a regra unica do sistema:
+    // EM_ANDAMENTO em andamento + PAVIMENTAÇÃO em execução/andamento.
     if ("obras_em_andamento" in l) {
-      const obras = Number(l.obras_em_andamento) || 0;
+      const total = Number(l.obras_em_andamento) || 0;
+      const fisicas = Number(l.obras_fisicas_em_andamento) || 0;
       const pav = Number(l.pavimentacoes_em_execucao) || 0;
-      const lic = Number(l.licitacoes_com_etapa_em_andamento) || 0;
-      return `Existem ${obras} obras em andamento.\n\n` +
-        `Para nao misturar etapas diferentes, a planilha tambem registra:\n` +
-        `• ${pav === 1 ? "1 pavimentação" : `${pav} pavimentações`} em execução;\n` +
-        `• ${lic} processo${lic === 1 ? "" : "s"} de licitacao com alguma etapa em andamento.\n\n` +
-        `Esses grupos ficam separados do total principal de obras em andamento.`;
+      return `Existem ${total} obras em andamento no total` +
+        ` (${fisicas} da origem EM_ANDAMENTO + ${pav} pavimentações em execução).`;
     }
 
     if ("quantidade_obras" in l) {
@@ -3647,12 +3759,19 @@ async function planejarPassoFerramenta(pergunta, historico, consultas = [], erro
   const resultados = serializarConsultasFerramenta(consultas);
   const pistas = pistasInterpretacaoPergunta(pergunta);
   const conhecimento = exemplosRelevantes(pergunta, 4);
+  const padroesApoio = await padroesManuaisRelevantes(pergunta, 2);
 
   const prompt = `Voce e o PLANEJADOR de um assistente que conversa livremente com uma base de obras publicas.
 Voce NAO responde usando conhecimento proprio. Voce possui uma unica ferramenta: CONSULTAR_BANCO, que executa SELECT somente leitura na tabela obras.
 
 SCHEMA DE NEGOCIO:
 ${SCHEMA}
+
+REGRAS DE NEGOCIO - FONTE UNICA:
+${REGRAS_NEGOCIO_CENTRAIS}
+
+PADROES MANUAIS APROVADOS SEMELHANTES (APOIO, NAO OBRIGATORIOS):
+${padroesApoio}
 
 METADADOS REAIS DO BANCO:
 ${contextoBanco}
@@ -3684,7 +3803,7 @@ REGRAS DE COMPORTAMENTO:
 - Se os dados ja retornados forem suficientes para responder TUDO o que foi pedido, finalize. Se faltar algo, faca outra consulta complementar.
 - Nunca invente nomes, valores, percentuais, quantidades, bairros, empresas, status ou responsaveis.
 - \"obras\" generico significa EM_ANDAMENTO + PAVIMENTAÇÃO. Projeto e licitacao sao categorias separadas.
-- \"obras em andamento\" significa origem EM_ANDAMENTO. Etapa de licitacao com a palavra andamento nao e obra em andamento.
+- \"obras em andamento\" = EM_ANDAMENTO em andamento + PAVIMENTAÇÃO em execucao/andamento. Etapa de licitacao com a palavra andamento nao e obra em andamento.
 - Se o usuario pedir explicitamente projeto, pavimentacao ou licitacao, use a origem correspondente.
 - Se pedir \"tudo/todas as categorias/todos os registros\", ai sim pode considerar todas as origens.
 - Para valores: valor_total, valor_executado e valores pagos sao conceitos diferentes. Nao substitua um pelo outro.
@@ -4392,20 +4511,32 @@ function classificarIntencaoCanonica(pergunta = "", historico = []) {
 
 function reconciliarPlanoComIntencaoCanonica(plano = {}, canonica = {}, pergunta = "") {
   if (!plano) plano = {};
-  const forteLocal = Number(canonica?.confianca || 0) >= 0.92 && canonica?.acao && canonica.acao !== "outro";
-  const acao = forteLocal ? canonica.acao : (plano.acao || canonica.acao || "outro");
-  const campos = [...new Set([...(plano.campos || []), ...(canonica.campos || [])])];
+  // A IA e a interpretacao PRINCIPAL. A classificacao local por regex existe
+  // apenas para preencher lacunas ou servir de fallback quando a IA estiver insegura.
+  const iaConfiavel = Number(plano?.confianca || 0) >= 0.70 && plano?.acao && plano.acao !== "outro";
+  const acao = iaConfiavel ? plano.acao : (canonica.acao || plano.acao || "outro");
+
+  const camposIA = Array.isArray(plano.campos) ? plano.campos : [];
+  const campos = camposIA.length
+    ? [...new Set(camposIA)]
+    : [...new Set(canonica.campos || [])];
+
+  const escolher = (valorIA, vazio, valorLocal) =>
+    iaConfiavel && valorIA && valorIA !== vazio ? valorIA : (valorLocal || valorIA || vazio);
+
   return {
     ...plano,
     acao,
     campos,
-    escopo: plano.escopo && plano.escopo !== "indefinido" ? plano.escopo : (canonica.escopo || "indefinido"),
-    agrupamento: plano.agrupamento && plano.agrupamento !== "nenhum" ? plano.agrupamento : (canonica.agrupamento || "nenhum"),
-    metrica: plano.metrica && plano.metrica !== "nenhuma" ? plano.metrica : (canonica.metrica || "nenhuma"),
-    ordem: plano.ordem && plano.ordem !== "nenhuma" ? plano.ordem : (canonica.ordem || "nenhuma"),
-    usar_contexto: plano.novo_alvo ? false : (plano.usar_contexto || canonica.usar_contexto || false),
-    reset_filtros: plano.reset_filtros === true || canonica.reset_filtros === true,
-    confianca: Math.max(Number(plano.confianca || 0), Number(canonica.confianca || 0.5)),
+    escopo: escolher(plano.escopo, "indefinido", canonica.escopo),
+    agrupamento: escolher(plano.agrupamento, "nenhum", canonica.agrupamento),
+    metrica: escolher(plano.metrica, "nenhuma", canonica.metrica),
+    ordem: escolher(plano.ordem, "nenhuma", canonica.ordem),
+    usar_contexto: plano.novo_alvo ? false : (
+      iaConfiavel ? plano.usar_contexto === true : (plano.usar_contexto || canonica.usar_contexto || false)
+    ),
+    reset_filtros: iaConfiavel ? plano.reset_filtros === true : (plano.reset_filtros === true || canonica.reset_filtros === true),
+    confianca: iaConfiavel ? Number(plano.confianca) : Math.max(Number(plano.confianca || 0), Number(canonica.confianca || 0.5)),
     intencao_canonica_local: canonica.acao || "outro",
     pergunta_normalizada: normalizarTexto(pergunta),
   };
@@ -4475,6 +4606,7 @@ async function interpretarPerguntaComoAssistente(pergunta = "", historico = []) 
   if (!USAR_MODO_ASSISTENTE) return null;
 
   const canonicaLocal = classificarIntencaoCanonica(pergunta, historico);
+  const padroesApoio = await padroesManuaisRelevantes(pergunta, 2);
   const estado = ultimoEstadoDoHistorico(historico);
   const resumoEstado = estado ? {
     escopo: estado.escopo || null,
@@ -4487,7 +4619,9 @@ async function interpretarPerguntaComoAssistente(pergunta = "", historico = []) 
     `NAO escreva SQL e NAO responda a pergunta. Apenas transforme a mensagem em um plano curto.\n\n` +
     `Mensagem atual: ${JSON.stringify(pergunta)}\n` +
     `Estado recente da conversa: ${JSON.stringify(resumoEstado)}\n` +
-    `Classificacao estrutural local (PISTA, nao verdade absoluta): ${JSON.stringify(canonicaLocal)}\n\n` +
+    `REGRAS DE NEGOCIO (fonte unica):\n${REGRAS_NEGOCIO_CENTRAIS}\n` +
+    `Padroes manuais aprovados semelhantes (APOIO, nunca obrigatorios):\n${padroesApoio}\n\n` +
+    `Classificacao estrutural local (PISTA/FALLBACK, nao verdade absoluta): ${JSON.stringify(canonicaLocal)}\n\n` +
     `Retorne SOMENTE JSON valido no formato:\n` +
     `{"acao":"consultar_campo|descrever|listar|contar|somar|buscar_relacionado|comparar|ranking|continuar_contexto|outro",` +
     `"campos":["..."],"escopo":"obras|projetos|pavimentacoes|licitacoes|registros|indefinido",` +
@@ -4809,22 +4943,22 @@ export async function responderPergunta(pergunta, historico = []) {
   const semantica = await tentarResolucaoSemantica(pergunta, historico);
   if (semantica) return semantica;
 
-  // Antes da IA, tenta a camada de alta confianca. Ela entende operacoes e
-  // filtros de forma generica, incluindo termos livres, sem perguntas fixas.
-  const direta = await tentarCamadaDireta(pergunta, historico);
-  if (direta) return direta;
-
-  // Modo principal: a IA trabalha como agente de consulta com ferramentas.
-  // O fluxo antigo permanece logo abaixo como contingencia automatica.
+  // MODO PRINCIPAL: depois do plano/semantica, a IA usa ferramentas controladas.
+  // A camada deterministica antiga fica DEPOIS, como fallback de seguranca.
   if (USAR_AGENTE_FERRAMENTAS) {
     try {
       return await responderComFerramentas(pergunta, historico);
     } catch (e) {
-      console.error("AGENTE/FERRAMENTAS: falhou; tentando fallback local antes de chamar a IA novamente:", e.message);
-      const local = await tentarFallbackLocalUniversal(pergunta, historico, e.message);
-      if (local) return local;
+      console.error("AGENTE/FERRAMENTAS: falhou; tentando fallback deterministico:", e.message);
     }
   }
+
+  // Fallback deterministico antigo: util quando a IA/provedor falha.
+  const direta = await tentarCamadaDireta(pergunta, historico);
+  if (direta) return direta;
+
+  const localAposFerramentas = await tentarFallbackLocalUniversal(pergunta, historico, "fallback apos ferramentas");
+  if (localAposFerramentas) return localAposFerramentas;
 
   // 1. Gera SQL. A IA interpreta a frase livremente. Se os provedores
   // estiverem fora do ar, tentamos o mecanismo deterministico como contingencia.
