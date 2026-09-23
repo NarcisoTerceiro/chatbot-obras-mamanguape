@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING (Node.js)
+// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + DATA LINKING (Node.js)
 // ============================================================
 // Arquitetura baseada em duas referencias usadas no projeto:
 // 1) Conversational SQL Agent: schema/view + SQL dinamico + memoria de conversa.
@@ -21,7 +21,7 @@ const MAX_REPAROS = Math.max(0, Math.min(Number(process.env.AGENTE_MAX_REPAROS |
 const MAX_RESULTADOS = Math.max(20, Math.min(Number(process.env.AGENTE_MAX_RESULTADOS || 200), 500));
 const MAX_LINHAS_PARA_IA = Math.max(10, Math.min(Number(process.env.AGENTE_MAX_LINHAS_IA || 60), 100));
 const CACHE_SCHEMA_MS = Math.max(60_000, Math.min(Number(process.env.AGENTE_CACHE_SCHEMA_MS || 300_000), 30 * 60_000));
-const MAX_HISTORICO_PROMPT = 8;
+const MAX_HISTORICO_PROMPT = 6;
 
 let cacheSchema = { quando: 0, contexto: null };
 
@@ -79,9 +79,9 @@ function resumoHistorico(historico = []) {
 
   return itens.map((m) => {
     const papel = m?.memoriaResumo ? "MEMORIA_RESUMIDA" : (m?.role === "assistant" ? "ASSISTENTE" : "USUARIO");
-    const conteudo = textoSeguro(m?.content || "", m?.memoriaResumo ? 1600 : 650);
-    const sql = !m?.memoriaResumo && m?.role === "assistant" && m?.sql ? `\nSQL_ANTERIOR: ${textoSeguro(m.sql, 1400)}` : "";
-    const estado = m?.estado ? `\nESTADO_ANTERIOR: ${jsonSeguro(m.estado, 1500)}` : "";
+    const conteudo = textoSeguro(m?.content || "", m?.memoriaResumo ? 1200 : 420);
+    const sql = !m?.memoriaResumo && m?.role === "assistant" && m?.sql ? `\nSQL_ANTERIOR: ${textoSeguro(m.sql, 800)}` : "";
+    const estado = m?.estado ? `\nESTADO_ANTERIOR: ${jsonSeguro(m.estado, 800)}` : "";
     return `${papel}: ${conteudo}${sql}${estado}`;
   }).join("\n\n");
 }
@@ -181,8 +181,30 @@ async function carregarSchemaContexto() {
   if (!colunas.length) throw new Error(`A relacao public.${relacao} existe, mas nao consegui ler suas colunas.`);
 
   const nomes = new Set(colunas.map((c) => c.column_name));
-  const amostraR = await queryReadOnly(`SELECT * FROM public.${relacao} LIMIT 3`);
+  // Uma unica linha de amostra e suficiente para mostrar formatos sem gastar TPM.
+  const amostraR = await queryReadOnly(`SELECT * FROM public.${relacao} LIMIT 1`);
   const amostras = amostraR.rows || [];
+
+  // Catalogo de objetos reais: ajuda a IA a fazer schema/data linking sem
+  // depender de uma lista fixa de sinonimos escrita no JavaScript.
+  // Ex.: a propria base pode conter um registro com "UBS" e outro com
+  // "Posto de Saude"; o modelo passa a enxergar ambos antes de montar a SQL.
+  let objetosCatalogo = [];
+  if (nomes.has("objeto")) {
+    try {
+      const extras = [
+        nomes.has("tipo_negocio") ? "tipo_negocio" : null,
+        nomes.has("bairro") ? "bairro" : null,
+      ].filter(Boolean);
+      const campos = ["objeto", ...extras].join(", ");
+      const rr = await queryReadOnly(
+        `SELECT DISTINCT ${campos} FROM public.${relacao} WHERE objeto IS NOT NULL AND BTRIM(objeto::text) <> '' ORDER BY objeto LIMIT 120`
+      );
+      objetosCatalogo = rr.rows || [];
+    } catch {
+      objetosCatalogo = [];
+    }
+  }
 
   const categorias = {};
   const camposDistintos = ["tipo_negocio", "subtipo_negocio", "status", "status_original", "bairro", "engenheiro", "empresa", "recurso", "tipo_recurso", "aba_origem"]
@@ -204,6 +226,7 @@ async function carregarSchemaContexto() {
     colunas,
     amostras,
     categorias,
+    objetosCatalogo,
     temViewSemantica: relacao === "obras_chatbot",
   };
   cacheSchema = { quando: agora, contexto };
@@ -214,11 +237,26 @@ function schemaParaPrompt(ctx) {
   const colunas = ctx.colunas
     .map((c) => `- ${c.column_name}: ${c.data_type}${c.udt_name && c.udt_name !== c.data_type ? ` (${c.udt_name})` : ""}`)
     .join("\n");
+
+  // Mantem somente os valores de negocio mais uteis e limita cada lista.
+  // Isso reduz TPM sem esconder do agente os valores reais importantes.
   const valores = Object.entries(ctx.categorias || {})
     .filter(([, arr]) => arr?.length)
-    .map(([k, arr]) => `- ${k}: ${arr.join(" | ")}`)
+    .map(([k, arr]) => `- ${k}: ${arr.slice(0, 24).join(" | ")}`)
     .join("\n");
-  return `RELACAO AUTORIZADA: public.${ctx.relacao}\n\nCOLUNAS REAIS:\n${colunas}\n\nVALORES/CATEGORIAS REAIS (amostra de distintos):\n${valores || "(nao coletados)"}\n\nAMOSTRAS DE LINHAS REAIS:\n${jsonSeguro(ctx.amostras, 7000)}`;
+
+  const objetos = (ctx.objetosCatalogo || []).slice(0, 100).map((r) => {
+    const partes = [];
+    if (r.tipo_negocio) partes.push(r.tipo_negocio);
+    partes.push(r.objeto);
+    if (r.bairro) partes.push(`bairro=${r.bairro}`);
+    return `- ${partes.join(" | ")}`;
+  }).join("\n");
+
+  return `RELACAO AUTORIZADA: public.${ctx.relacao}\n\nCOLUNAS REAIS:\n${colunas}` +
+    `\n\nVALORES REAIS IMPORTANTES:\n${valores || "(nao coletados)"}` +
+    `\n\nCATALOGO DE OBJETOS REAIS (use para ligacao semantica; nao invente nomes):\n${objetos || "(nao coletado)"}` +
+    `\n\nUMA AMOSTRA DE FORMATO:\n${jsonSeguro(ctx.amostras, 2500)}`;
 }
 
 function regrasNegocio(ctx) {
@@ -268,6 +306,9 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `- Para 'quanto falta', use valor_total - valor_executado quando essas colunas existirem.\n` +
     `- 'status de X' pede o campo status do alvo X; nao transforme a palavra status em filtro.\n` +
     `- Nao invente valores de status, nomes, bairros, engenheiros ou empresas; use os valores reais do schema/contexto.\n` +
+    `- LIGACAO SEMANTICA: quando o usuario pedir uma CLASSE ou CONCEITO amplo (sigla, tipo de equipamento, servico ou categoria), nao filtre apenas a palavra literal. Considere abreviacoes, forma por extenso e sinonimos realmente equivalentes em portugues e compare com o CATALOGO DE OBJETOS REAIS. Use OR com ILIKE apenas para equivalencias semanticamente justificadas.\n` +
+    `- Para alvo proprio/especifico (nome de bairro, rua, equipamento com nome proprio), seja conservador: nao expanda para conceitos diferentes.\n` +
+    `- Em busca ampla por assunto, voce pode procurar em objeto, categoria e dados_extras::text quando essas colunas existirem; mantenha o tipo_negocio correto.\n` +
     `- Se um termo livre puder ser nome parcial, use ILIKE/LOWER de forma tolerante.\n` +
     `- Retorne colunas suficientes para responder, mas nao SELECT * sem necessidade.\n` +
     `- Retorne SOMENTE JSON {"description":"...","query":"SELECT ..."}. Se nao puder responder com o schema, use query="".\n\n` +
@@ -277,7 +318,7 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `PERGUNTA ATUAL: ${JSON.stringify(pergunta)}`;
 
   const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
-    max_tokens: 620,
+    max_tokens: 420,
     temperature: 0,
     reasoning_effort: "low",
   });
@@ -379,7 +420,7 @@ async function repararSQL({ pergunta, historico, ctx, sqlAtual, erro = null, lin
     `Se a SQL atual deve ser mantida (por exemplo, 0 linhas e isso e plausivel), retorne fixedQuery exatamente igual a SQL atual.`;
 
   const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
-    max_tokens: 620,
+    max_tokens: 420,
     temperature: 0,
     reasoning_effort: "low",
   });
@@ -449,16 +490,54 @@ async function executarComSelfHealing({ pergunta, historico, ctx, sqlInicial }) 
 // ------------------------------------------------------------
 // Resposta natural a partir do resultado real
 // ------------------------------------------------------------
+function limparRespostaParaWhatsApp(texto = "") {
+  let t = String(texto || "").replace(/\r/g, "").trim();
+  if (!t) return t;
+
+  // Remove separadores tipicos de tabela Markdown (|---|---| etc.).
+  const linhas = t.split("\n");
+  const saida = [];
+  for (const linhaOriginal of linhas) {
+    const linha = linhaOriginal.trim();
+    if (!linha) {
+      if (saida.length && saida[saida.length - 1] !== "") saida.push("");
+      continue;
+    }
+    if (/^\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?$/.test(linha)) continue;
+
+    // Se a IA ainda devolver uma linha de tabela, converte para texto simples.
+    if (/^\|.*\|$/.test(linha)) {
+      const celulas = linha.slice(1, -1).split("|").map((x) => x.trim()).filter(Boolean);
+      if (celulas.length) {
+        saida.push(`• ${celulas.join(" — ")}`);
+        continue;
+      }
+    }
+    saida.push(linhaOriginal.trimEnd());
+  }
+
+  t = saida.join("\n")
+    // Evita a frase mecanica herdada do estilo antigo. O total ja aparece nos dados/consulta.
+    .replace(/\n?\*?\s*(?:não há mais registros|nao ha mais registros|não foram encontrados outros registros|nao foram encontrados outros registros)[^\n.!?]*[.!?]?\s*\*?/gi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return t;
+}
+
 function fallbackResposta(pergunta, rows = []) {
   if (!rows.length) return "Não encontrei registros que correspondam a essa pergunta nos dados atuais.";
   if (rows.length === 1) {
     const r = rows[0];
     const chaves = Object.keys(r);
     if (chaves.length === 1) return `${String(r[chaves[0]] ?? "Não informado")}`;
-    return chaves.map((k) => `${k}: ${r[k] ?? "Não informado"}`).join(" | ");
+    return chaves.map((k) => `• ${k}: ${r[k] ?? "Não informado"}`).join("\n");
   }
   const exibidas = rows.slice(0, 15);
-  const linhas = exibidas.map((r, i) => `${i + 1}. ${Object.entries(r).slice(0, 5).map(([k, v]) => `${k}: ${v ?? ""}`).join(" | ")}`);
+  const linhas = exibidas.map((r, i) => {
+    const campos = Object.entries(r).slice(0, 5).map(([k, v]) => `${k}: ${v ?? ""}`).join(" — ");
+    return `${i + 1}. ${campos}`;
+  });
   return `${linhas.join("\n")}${rows.length > exibidas.length ? `\n… e mais ${rows.length - exibidas.length}.` : ""}`;
 }
 
@@ -469,6 +548,8 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
     `Se o resultado estiver vazio, diga claramente que nao encontrou registros com os criterios.\n` +
     `Se for contagem/soma/ranking, destaque o resultado de forma direta.\n` +
     `Se for lista grande, seja conciso e liste no maximo 20 itens, avisando se houver mais.\n` +
+    `FORMATO WHATSAPP: NUNCA use tabela Markdown, pipes |, linhas --- ou cabecalho de tabela. Use lista simples com marcadores.\n` +
+    `Nao finalize com frases mecanicas como "nao ha mais registros" ou "nao foram encontrados outros registros"; apenas responda o que foi pedido.\n` +
     `Diferencie obra, projeto e licitacao conforme os campos da view/tabela.\n` +
     `Recurso e tipo_recurso sao campos diferentes; nao troque um pelo outro.\n` +
     `Nao mostre SQL ao usuario na resposta natural.\n\n` +
@@ -481,11 +562,11 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
 
   try {
     const resposta = await chamarIAbruta([{ role: "user", content: prompt }], {
-      max_tokens: 650,
+      max_tokens: 480,
       temperature: 0,
       reasoning_effort: "low",
     });
-    const limpa = String(resposta || "").trim();
+    const limpa = limparRespostaParaWhatsApp(String(resposta || "").trim());
     return limpa || fallbackResposta(pergunta, rows);
   } catch (e) {
     console.warn("AGENTE SQL: falha na redacao por IA; usando fallback local:", e.message);
@@ -528,7 +609,7 @@ export async function responderPergunta(pergunta, historico = []) {
       return {
         resposta: "Não consegui transformar essa pergunta em uma consulta segura aos dados. Pode reformular?",
         erro: "sql_nao_gerada",
-        modoAgente: "sql_agent_self_healing_v1",
+        modoAgente: "sql_agent_self_healing_v2_semantica_429",
       };
     }
 
@@ -554,14 +635,14 @@ export async function responderPergunta(pergunta, historico = []) {
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
       tentativas: execucao.tentativas,
-      modoAgente: "sql_agent_self_healing_v1",
+      modoAgente: "sql_agent_self_healing_v2_semantica_429",
     };
   } catch (e) {
     console.error("SQL AGENT: falha final:", e);
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "sql_agent_self_healing_v1_erro",
+      modoAgente: "sql_agent_self_healing_v2_semantica_429_erro",
     };
   }
 }
