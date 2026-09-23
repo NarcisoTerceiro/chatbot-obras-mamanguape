@@ -47,6 +47,13 @@ const adminPool = process.env.DATABASE_ADMIN_URL
   ? new Pool(montarConfig(process.env.DATABASE_ADMIN_URL))
   : null;
 
+// Memoria conversacional persistente (opcional).
+// Se DATABASE_MEMORY_URL nao existir, reaproveita DATABASE_ADMIN_URL.
+// O chatbot continua consultando obras somente pela DATABASE_URL read-only.
+const memoryPool = process.env.DATABASE_MEMORY_URL
+  ? new Pool(montarConfig(process.env.DATABASE_MEMORY_URL))
+  : adminPool;
+
 // Executa uma query. Uso interno.
 export async function query(sql, params = []) {
   const client = await pool.connect();
@@ -270,6 +277,225 @@ export async function registrarUsoConhecimento(ids = []) {
     if (!tabelaConhecimentoAusente(e)) {
       console.warn("DB: falha ao registrar uso de conhecimento:", e.message);
     }
+  }
+}
+
+
+// ============================================================
+//  MEMORIA CONVERSACIONAL PERSISTENTE DO SQL AGENT
+// ============================================================
+// A tabela e criada pelo arquivo 01_criar_chat_history.sql.
+// Falha fechada/graciosa: se a tabela/credencial nao existir, o server usa
+// apenas a memoria local em RAM e o chatbot continua funcionando.
+
+function tabelaHistoricoAusente(e) {
+  return e?.code === "42P01" || /chat_history.*does not exist/i.test(e?.message || "");
+}
+
+export async function carregarHistoricoAgente(sessionId, limite = 20) {
+  if (!memoryPool || !sessionId) return [];
+  const max = Math.max(1, Math.min(Number(limite) || 20, 50));
+  try {
+    const sid = String(sessionId).slice(0, 128);
+    const [r, resumo] = await Promise.all([
+      memoryPool.query(
+        `SELECT role, content, sql, linhas, estado
+           FROM public.chat_history
+          WHERE session_id = $1
+          ORDER BY created_at DESC, id DESC
+          LIMIT $2`,
+        [sid, max]
+      ),
+      carregarResumoAgente(sid),
+    ]);
+    const recentes = (r.rows || []).reverse().map((x) => ({
+      role: x.role === "assistant" ? "assistant" : "user",
+      content: String(x.content || ""),
+      sql: x.sql || null,
+      linhas: x.linhas ?? null,
+      estado: x.estado && typeof x.estado === "object" ? x.estado : null,
+    }));
+    return resumo ? [resumo, ...recentes] : recentes;
+  } catch (e) {
+    if (!tabelaHistoricoAusente(e)) console.warn("DB: falha ao carregar chat_history:", e.message);
+    return [];
+  }
+}
+
+export async function salvarHistoricoAgente(sessionId, mensagens = []) {
+  if (!memoryPool || !sessionId || !Array.isArray(mensagens) || !mensagens.length) return false;
+  const sid = String(sessionId).slice(0, 128);
+  const client = await memoryPool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const m of mensagens.slice(-6)) {
+      if (!m?.content) continue;
+      await client.query(
+        `INSERT INTO public.chat_history (session_id, role, content, sql, linhas, estado)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+        [
+          sid,
+          m.role === "assistant" ? "assistant" : "user",
+          String(m.content).slice(0, 12000),
+          m.sql ? String(m.sql).slice(0, 12000) : null,
+          Number.isFinite(Number(m.linhas)) ? Number(m.linhas) : null,
+          JSON.stringify(m.estado && typeof m.estado === "object" ? m.estado : {}),
+        ]
+      );
+    }
+    await client.query("COMMIT");
+    // Limpeza global limitada a no maximo uma execucao a cada 6 horas.
+    void limparMemoriaPersistenteAntiga().catch(() => {});
+    return true;
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    if (!tabelaHistoricoAusente(e)) console.warn("DB: falha ao salvar chat_history:", e.message);
+    return false;
+  } finally {
+    client.release();
+  }
+}
+
+
+// ============================================================
+//  RETENCAO E COMPACTACAO DA MEMORIA PERSISTENTE
+// ============================================================
+// Objetivo:
+// - manter no maximo cerca de 20 a 30 mensagens recentes por sessao;
+// - guardar um resumo curto do historico antigo em chat_memory_summary;
+// - apagar historico e resumos sem atividade ha mais de 30 dias;
+// - nunca armazenar o telefone bruto: session_id ja chega como hash do server.
+
+const MEMORIA_MANTER_RECENTES = Math.max(10, Math.min(Number(process.env.MEMORIA_MANTER_RECENTES || 20), 50));
+const MEMORIA_GATILHO_COMPACTACAO = Math.max(
+  MEMORIA_MANTER_RECENTES + 2,
+  Math.min(Number(process.env.MEMORIA_GATILHO_COMPACTACAO || 30), 80)
+);
+const MEMORIA_RETENCAO_DIAS = Math.max(1, Math.min(Number(process.env.MEMORIA_RETENCAO_DIAS || 30), 365));
+let ultimaLimpezaMemoria = 0;
+const LIMPEZA_MEMORIA_INTERVALO_MS = 6 * 60 * 60 * 1000;
+
+export async function carregarResumoAgente(sessionId) {
+  if (!memoryPool || !sessionId) return null;
+  try {
+    const r = await memoryPool.query(
+      `SELECT resumo, estado, updated_at
+         FROM public.chat_memory_summary
+        WHERE session_id = $1
+        LIMIT 1`,
+      [String(sessionId).slice(0, 128)]
+    );
+    const x = r.rows?.[0];
+    if (!x?.resumo) return null;
+    return {
+      role: "assistant",
+      content: `[RESUMO DA CONVERSA ANTERIOR] ${String(x.resumo)}`,
+      estado: x.estado && typeof x.estado === "object" ? x.estado : {},
+      memoriaResumo: true,
+    };
+  } catch (e) {
+    if (!tabelaHistoricoAusente(e) && e?.code !== "42P01") {
+      console.warn("DB: falha ao carregar chat_memory_summary:", e.message);
+    }
+    return null;
+  }
+}
+
+export async function prepararCompactacaoHistoricoAgente(
+  sessionId,
+  { manter = MEMORIA_MANTER_RECENTES, gatilho = MEMORIA_GATILHO_COMPACTACAO } = {}
+) {
+  if (!memoryPool || !sessionId) return { necessario: false, mensagens: [], resumoAnterior: null };
+  const sid = String(sessionId).slice(0, 128);
+  const keep = Math.max(2, Math.min(Number(manter) || MEMORIA_MANTER_RECENTES, 50));
+  const trigger = Math.max(keep + 2, Math.min(Number(gatilho) || MEMORIA_GATILHO_COMPACTACAO, 80));
+  try {
+    const contagem = await memoryPool.query(
+      `SELECT COUNT(*)::int AS total FROM public.chat_history WHERE session_id = $1`,
+      [sid]
+    );
+    const total = Number(contagem.rows?.[0]?.total || 0);
+    if (total <= trigger) return { necessario: false, total, mensagens: [], resumoAnterior: await carregarResumoAgente(sid) };
+
+    const excesso = Math.max(1, total - keep);
+    const antigos = await memoryPool.query(
+      `SELECT id, role, content, sql, linhas, estado, created_at
+         FROM public.chat_history
+        WHERE session_id = $1
+        ORDER BY created_at ASC, id ASC
+        LIMIT $2`,
+      [sid, excesso]
+    );
+    return {
+      necessario: antigos.rows.length > 0,
+      total,
+      manter: keep,
+      mensagens: antigos.rows || [],
+      resumoAnterior: await carregarResumoAgente(sid),
+    };
+  } catch (e) {
+    if (!tabelaHistoricoAusente(e)) console.warn("DB: falha ao preparar compactacao de memoria:", e.message);
+    return { necessario: false, mensagens: [], resumoAnterior: null };
+  }
+}
+
+export async function concluirCompactacaoHistoricoAgente(sessionId, { ids = [], resumo = "", estado = {} } = {}) {
+  if (!memoryPool || !sessionId || !Array.isArray(ids) || !ids.length) return false;
+  const sid = String(sessionId).slice(0, 128);
+  const unicos = [...new Set(ids.map(Number).filter(Number.isInteger))];
+  if (!unicos.length) return false;
+  const client = await memoryPool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO public.chat_memory_summary (session_id, resumo, estado, updated_at)
+       VALUES ($1, $2, $3::jsonb, NOW())
+       ON CONFLICT (session_id) DO UPDATE SET
+         resumo = EXCLUDED.resumo,
+         estado = EXCLUDED.estado,
+         updated_at = NOW()`,
+      [sid, String(resumo || "").slice(0, 6000), JSON.stringify(estado && typeof estado === "object" ? estado : {})]
+    );
+    await client.query(
+      `DELETE FROM public.chat_history WHERE session_id = $1 AND id = ANY($2::bigint[])`,
+      [sid, unicos]
+    );
+    await client.query("COMMIT");
+    return true;
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    if (!tabelaHistoricoAusente(e) && e?.code !== "42P01") {
+      console.warn("DB: falha ao concluir compactacao de memoria:", e.message);
+    }
+    return false;
+  } finally {
+    client.release();
+  }
+}
+
+export async function limparMemoriaPersistenteAntiga({ dias = MEMORIA_RETENCAO_DIAS, forcar = false } = {}) {
+  if (!memoryPool) return false;
+  const agora = Date.now();
+  if (!forcar && agora - ultimaLimpezaMemoria < LIMPEZA_MEMORIA_INTERVALO_MS) return true;
+  ultimaLimpezaMemoria = agora;
+  const d = Math.max(1, Math.min(Number(dias) || MEMORIA_RETENCAO_DIAS, 365));
+  try {
+    await memoryPool.query(
+      `DELETE FROM public.chat_history
+        WHERE created_at < NOW() - make_interval(days => $1::int)`,
+      [d]
+    );
+    await memoryPool.query(
+      `DELETE FROM public.chat_memory_summary
+        WHERE updated_at < NOW() - make_interval(days => $1::int)`,
+      [d]
+    );
+    return true;
+  } catch (e) {
+    if (!tabelaHistoricoAusente(e) && e?.code !== "42P01") {
+      console.warn("DB: falha na limpeza automatica da memoria:", e.message);
+    }
+    return false;
   }
 }
 
