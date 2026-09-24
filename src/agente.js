@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + DATA LINKING (Node.js)
+// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + DATA LINKING (Node.js) - V4
 // ============================================================
 // Arquitetura baseada em duas referencias usadas no projeto:
 // 1) Conversational SQL Agent: schema/view + SQL dinamico + memoria de conversa.
@@ -498,26 +498,48 @@ function limparRespostaParaWhatsApp(texto = "") {
   const linhas = t.split("\n");
   const saida = [];
   for (const linhaOriginal of linhas) {
-    const linha = linhaOriginal.trim();
+    let linha = linhaOriginal.trim();
     if (!linha) {
       if (saida.length && saida[saida.length - 1] !== "") saida.push("");
       continue;
     }
     if (/^\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?$/.test(linha)) continue;
 
+    // Normaliza rotulos tecnicos quando vierem em negrito Markdown.
+    linha = linha
+      .replace(/\*\*(id|objeto)\s*:\*\*/gi, "$1:")
+      .replace(/\*\*(id|objeto)\*\*\s*:/gi, "$1:");
+
+    // Nao mostramos identificadores internos do banco.
+    if (/^(?:[-•*]\s*)?id\s*:\s*[^—\-\n]+$/i.test(linha)) continue;
+
+    // Ex.: "1. id: 3 — objeto: UBS X — recurso: FEDERAL"
+    // vira "1. UBS X — Recurso: FEDERAL".
+    linha = linha
+      .replace(/^(\s*(?:[-•*]|\d+[.)])\s*)\**id\**\s*:\s*[^—\-\n]+(?:\s*[—-]\s*)?/i, "$1")
+      .replace(/^(\s*(?:[-•*]|\d+[.)])\s*)\**objeto\**\s*:\s*/i, "$1")
+      .replace(/\b\**objeto\**\s*:\s*/gi, "")
+      .replace(/\b\**id\**\s*:\s*[^—\-\n]+(?:\s*[—-]\s*)?/gi, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+
+    if (!linha) continue;
+
     // Se a IA ainda devolver uma linha de tabela, converte para texto simples.
     if (/^\|.*\|$/.test(linha)) {
       const celulas = linha.slice(1, -1).split("|").map((x) => x.trim()).filter(Boolean);
-      if (celulas.length) {
-        saida.push(`• ${celulas.join(" — ")}`);
+      // Descarta coluna ID quando a primeira celula for so um numero/identificador.
+      const uteis = celulas.filter((c, i) => !(i === 0 && /^\d+$/.test(c)));
+      if (uteis.length) {
+        saida.push(`• ${uteis.join(" — ")}`);
         continue;
       }
     }
-    saida.push(linhaOriginal.trimEnd());
+    saida.push(linha);
   }
 
   t = saida.join("\n")
-    // Evita a frase mecanica herdada do estilo antigo. O total ja aparece nos dados/consulta.
+    // Evita a frase mecanica herdada do estilo antigo.
     .replace(/\n?\*?\s*(?:não há mais registros|nao ha mais registros|não foram encontrados outros registros|nao foram encontrados outros registros)[^\n.!?]*[.!?]?\s*\*?/gi, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
@@ -525,18 +547,80 @@ function limparRespostaParaWhatsApp(texto = "") {
   return t;
 }
 
+function rotuloHumano(campo = "") {
+  const mapa = {
+    bairro: "Bairro",
+    status: "Status",
+    categoria: "Categoria",
+    engenheiro: "Engenheiro",
+    empresa: "Empresa",
+    valor_total: "Valor total",
+    valor_executado: "Valor executado",
+    percentual_executado: "Percentual executado",
+    recurso: "Recurso",
+    tipo_recurso: "Tipo de recurso",
+    contrato: "Contrato",
+    convenio: "Convênio",
+    aditivo: "Aditivo",
+    data_inicio: "Data de início",
+    data_prev_termino: "Previsão de término",
+    quanto_falta: "Valor restante",
+    saldo_devedor: "Saldo devedor",
+    observacoes: "Observações",
+    quantidade: "Quantidade",
+  };
+  return mapa[campo] || campo.replace(/_/g, " ");
+}
+
+function valorFallback(campo, valor) {
+  if (valor === null || valor === undefined || valor === "") return null;
+  if (["valor_total", "valor_executado", "quanto_falta", "saldo_devedor", "aditivo"].includes(campo)) {
+    const n = Number(valor);
+    if (Number.isFinite(n)) {
+      return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(n);
+    }
+  }
+  if (campo === "percentual_executado") {
+    const n = Number(valor);
+    if (Number.isFinite(n)) return `${new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 2 }).format(n)}%`;
+  }
+  return String(valor);
+}
+
 function fallbackResposta(pergunta, rows = []) {
   if (!rows.length) return "Não encontrei registros que correspondam a essa pergunta nos dados atuais.";
+
+  const camposTecnicosOcultos = new Set(["id", "objeto"]);
   if (rows.length === 1) {
     const r = rows[0];
-    const chaves = Object.keys(r);
-    if (chaves.length === 1) return `${String(r[chaves[0]] ?? "Não informado")}`;
-    return chaves.map((k) => `• ${k}: ${r[k] ?? "Não informado"}`).join("\n");
+    const chavesVisiveis = Object.keys(r).filter((k) => k !== "id");
+
+    // Agregacoes com uma unica coluna devem sair diretas, sem nome tecnico.
+    if (chavesVisiveis.length === 1 && chavesVisiveis[0] !== "objeto") {
+      return `${valorFallback(chavesVisiveis[0], r[chavesVisiveis[0]]) ?? "Não informado"}`;
+    }
+
+    const linhas = [];
+    if (r.objeto) linhas.push(`• ${r.objeto}`);
+    for (const [k, v] of Object.entries(r)) {
+      if (camposTecnicosOcultos.has(k)) continue;
+      const fmt = valorFallback(k, v);
+      if (fmt === null) continue;
+      linhas.push(`  ${rotuloHumano(k)}: ${fmt}`);
+    }
+    return linhas.join("\n") || "Encontrei o registro, mas não há detalhes adicionais informados.";
   }
-  const exibidas = rows.slice(0, 15);
+
+  const exibidas = rows.slice(0, 20);
   const linhas = exibidas.map((r, i) => {
-    const campos = Object.entries(r).slice(0, 5).map(([k, v]) => `${k}: ${v ?? ""}`).join(" — ");
-    return `${i + 1}. ${campos}`;
+    const nome = r.objeto ? String(r.objeto) : null;
+    const detalhes = Object.entries(r)
+      .filter(([k, v]) => !camposTecnicosOcultos.has(k) && v !== null && v !== undefined && v !== "")
+      .slice(0, 3)
+      .map(([k, v]) => `${rotuloHumano(k)}: ${valorFallback(k, v)}`)
+      .join(" — ");
+    if (nome) return `${i + 1}. ${nome}${detalhes ? ` — ${detalhes}` : ""}`;
+    return `${i + 1}. ${detalhes || "Registro encontrado"}`;
   });
   return `${linhas.join("\n")}${rows.length > exibidas.length ? `\n… e mais ${rows.length - exibidas.length}.` : ""}`;
 }
@@ -550,6 +634,8 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
     `Se for lista grande, seja conciso e liste no maximo 20 itens, avisando se houver mais.\n` +
     `FORMATO WHATSAPP: NUNCA use tabela Markdown, pipes |, linhas --- ou cabecalho de tabela. Use lista simples com marcadores.\n` +
     `Nao finalize com frases mecanicas como "nao ha mais registros" ou "nao foram encontrados outros registros"; apenas responda o que foi pedido.\n` +
+    `NUNCA mostre ID/identificador interno. NUNCA escreva o nome tecnico da coluna "objeto". Use diretamente o nome da obra/projeto/licitacao.\n` +
+    `Exemplo correto: "1. Reforma e ampliacao da UBS do Cristo Rei — Recurso: FEDERAL". Exemplo proibido: "1. id: 3 — objeto: Reforma...".\n` +
     `Diferencie obra, projeto e licitacao conforme os campos da view/tabela.\n` +
     `Recurso e tipo_recurso sao campos diferentes; nao troque um pelo outro.\n` +
     `Nao mostre SQL ao usuario na resposta natural.\n\n` +
@@ -609,7 +695,7 @@ export async function responderPergunta(pergunta, historico = []) {
       return {
         resposta: "Não consegui transformar essa pergunta em uma consulta segura aos dados. Pode reformular?",
         erro: "sql_nao_gerada",
-        modoAgente: "sql_agent_self_healing_v2_semantica_429",
+        modoAgente: "sql_agent_self_healing_v4_ram30",
       };
     }
 
@@ -635,14 +721,14 @@ export async function responderPergunta(pergunta, historico = []) {
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
       tentativas: execucao.tentativas,
-      modoAgente: "sql_agent_self_healing_v2_semantica_429",
+      modoAgente: "sql_agent_self_healing_v4_ram30",
     };
   } catch (e) {
     console.error("SQL AGENT: falha final:", e);
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "sql_agent_self_healing_v2_semantica_429_erro",
+      modoAgente: "sql_agent_self_healing_v4_ram30_erro",
     };
   }
 }

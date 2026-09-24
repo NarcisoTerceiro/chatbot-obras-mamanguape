@@ -63,6 +63,10 @@ const provedorDescansando = new Map();
 const DESCANSO_PADRAO_MS = 15 * 1000;
 const TIMEOUT_IA_MS = 18 * 1000;
 const MAX_SAIDA_GLOBAL = 700;
+// Em 429, tenta outro modelo/provedor primeiro. Se todos estiverem limitados,
+// pode aguardar uma unica janela curta indicada pelo Retry-After e tentar de novo.
+const MAX_ESPERA_429_MS = Math.max(0, Math.min(Number(process.env.IA_MAX_ESPERA_429_MS || 14000), 30000));
+const RETENTAR_429 = process.env.IA_RETENTAR_429 !== "false";
 
 function limiteSaida(body) {
   const pedido = Number(body.max_completion_tokens ?? body.max_tokens ?? 384);
@@ -91,13 +95,26 @@ async function fetchComTimeout(url, opcoes) {
 }
 
 const modelosGroqIndisponiveis = new Set();
+const modelosGroqDescansando = new Map();
+
+function dormir(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 async function chamarGroq(body) {
   let ultimoErro = null;
   const limite = limiteSaida(body);
 
+  let proximoModeloEm = null;
   for (const model of GROQ_MODELOS) {
     if (modelosGroqIndisponiveis.has(model)) continue;
+    const agora = Date.now();
+    const ate = modelosGroqDescansando.get(model) || 0;
+    if (ate > agora) {
+      proximoModeloEm = proximoModeloEm === null ? ate : Math.min(proximoModeloEm, ate);
+      continue;
+    }
+    modelosGroqDescansando.delete(model);
     const corpo = { ...body, model };
     delete corpo.max_tokens;
     corpo.max_completion_tokens = limite;
@@ -126,7 +143,15 @@ async function chamarGroq(body) {
       }
       const err = new Error(`groq respondeu ${resp.status}: ${erroTxt.slice(0, 320)}`);
       err.status = resp.status;
-      if (resp.status === 429) err.retryAfterMs = retryDepoisMs(resp, erroTxt);
+      if (resp.status === 429) {
+        err.retryAfterMs = retryDepoisMs(resp, erroTxt);
+        const ate = Date.now() + Math.max(1000, err.retryAfterMs || DESCANSO_PADRAO_MS);
+        modelosGroqDescansando.set(model, ate);
+        proximoModeloEm = proximoModeloEm === null ? ate : Math.min(proximoModeloEm, ate);
+        ultimoErro = err;
+        console.warn(`DEBUG Groq: ${model} atingiu 429; tentando outro modelo antes de desistir.`);
+        continue;
+      }
       throw err;
     }
 
@@ -137,6 +162,15 @@ async function chamarGroq(body) {
     return texto;
   }
 
+  if (!ultimoErro && proximoModeloEm !== null) {
+    const err = new Error("Todos os modelos Groq estao temporariamente em rate limit.");
+    err.status = 429;
+    err.retryAfterMs = Math.max(500, proximoModeloEm - Date.now());
+    throw err;
+  }
+  if (ultimoErro?.status === 429 && proximoModeloEm !== null) {
+    ultimoErro.retryAfterMs = Math.max(500, proximoModeloEm - Date.now());
+  }
   throw ultimoErro || new Error("Nenhum modelo Groq disponivel para esta conta.");
 }
 
@@ -196,17 +230,25 @@ async function chamarGemini(body) {
   return texto;
 }
 
-async function chamarIA(body) {
+async function chamarIA(body, tentativa429 = 0) {
   if (PROVEDORES.length === 0) {
     throw new Error("Nenhuma chave de IA configurada (GROQ_API_KEY ou GEMINI_API_KEY).");
   }
 
   const agora = Date.now();
   const ordem = PROVEDORES.filter((p) => (provedorDescansando.get(p.nome) || 0) <= agora);
+
   if (ordem.length === 0) {
     const proximo = Math.min(...PROVEDORES.map((p) => provedorDescansando.get(p.nome) || agora));
-    const erro = new Error(`Provedores temporariamente indisponiveis. Tente novamente em ${Math.max(1, Math.ceil((proximo - agora) / 1000))}s.`);
+    const espera = Math.max(250, proximo - agora);
+    if (RETENTAR_429 && tentativa429 === 0 && espera <= MAX_ESPERA_429_MS) {
+      console.warn(`DEBUG IA: todos provedores em cooldown; aguardando ${Math.ceil(espera / 1000)}s para uma retentativa.`);
+      await dormir(espera + 150);
+      return chamarIA(body, 1);
+    }
+    const erro = new Error(`Provedores temporariamente indisponiveis. Tente novamente em ${Math.max(1, Math.ceil(espera / 1000))}s.`);
     erro.status = 429;
+    erro.retryAfterMs = espera;
     throw erro;
   }
 
@@ -221,15 +263,33 @@ async function chamarIA(body) {
       console.error(`IA (${prov.nome}) falhou:`, e.message);
 
       if (e.status === 429) {
-        const pausa = Math.max(5_000, Math.min(e.retryAfterMs || DESCANSO_PADRAO_MS, 60_000));
+        const pausa = Math.max(1000, Math.min(e.retryAfterMs || DESCANSO_PADRAO_MS, 60_000));
         provedorDescansando.set(prov.nome, Date.now() + pausa);
-        console.log(`DEBUG ${prov.nome} em limite - ignorando por ${Math.ceil(pausa / 1000)}s`);
-      } else if (prov.nome === "gemini" && (e.status === 401 || e.status === 403)) {
-        // Credencial errada nao melhora tentando a cada mensagem. No proximo deploy
-        // (apos corrigir a chave no Render) este estado e zerado automaticamente.
+        console.log(`DEBUG ${prov.nome} em limite - cooldown de ${Math.ceil(pausa / 1000)}s; tentando outro provedor se existir.`);
+        // NAO interrompe: o proximo provedor (por exemplo Gemini) e tentado imediatamente.
+        continue;
+      }
+
+      if (prov.nome === "gemini" && (e.status === 401 || e.status === 403)) {
         provedorDescansando.set(prov.nome, Date.now() + 10 * 60 * 1000);
         console.error("DEBUG Gemini: confira GEMINI_API_KEY no Render (chave do Google AI Studio).");
       }
+      // Erro de um provedor nao impede tentar o seguinte.
+    }
+  }
+
+  // Se TODOS falharam por 429, faz uma unica espera curta baseada no menor
+  // cooldown. Isso cobre exatamente o caso em que a Groq pede ~10-12s.
+  if (ultimoErro?.status === 429 && RETENTAR_429 && tentativa429 === 0) {
+    const agora2 = Date.now();
+    const futuros = PROVEDORES
+      .map((p) => provedorDescansando.get(p.nome) || 0)
+      .filter((t) => t > agora2);
+    const espera = futuros.length ? Math.min(...futuros) - agora2 : (ultimoErro.retryAfterMs || DESCANSO_PADRAO_MS);
+    if (espera > 0 && espera <= MAX_ESPERA_429_MS) {
+      console.warn(`DEBUG IA: rate limit geral; aguardando ${Math.ceil(espera / 1000)}s e tentando uma ultima vez.`);
+      await dormir(espera + 150);
+      return chamarIA(body, 1);
     }
   }
 

@@ -17,17 +17,11 @@ import { getObras, getDiagnostico } from "./sheets.js";
 import { sincronizar } from "./ingestao.js";
 import { responderPergunta } from "./agente.js";
 import { buscarObrasPorTermos, buscarObras, buscarPorEngenheiro } from "./search.js";
-import { interpretarPergunta, redigirResposta, calcularComCodeExecution, gerarCodigoPython, chamarIAbruta } from "./groq.js";
+import { interpretarPergunta, redigirResposta, calcularComCodeExecution, gerarCodigoPython } from "./groq.js";
 import { executarAgregacao, executarReceita } from "./agregacao.js";
 import { sandboxDisponivel, executarNoSandbox } from "./sandboxClient.js";
 import { enviarTexto } from "./whatsapp.js";
-import {
-  queryReadOnly,
-  carregarHistoricoAgente,
-  salvarHistoricoAgente,
-  prepararCompactacaoHistoricoAgente,
-  concluirCompactacaoHistoricoAgente,
-} from "./db.js";
+import { queryReadOnly } from "./db.js";
 
 const app = express();
 // Guarda os bytes originais para validar a assinatura HMAC enviada pela Meta.
@@ -105,7 +99,7 @@ const LIMITE_RESUMIDO = 15;
 // "e tem mais alguma por la?", que dependem do recorte anterior.
 const memoriaPorUsuario = new Map();
 const MEMORIA_VALIDADE_MS = 30 * 60 * 1000; // 30 minutos; o agente envia so contexto curto
-const MAX_HISTORICO = 20; // memoria recente; o banco compacta automaticamente acima de 30 mensagens
+const MAX_HISTORICO = 10; // somente RAM: guarda os 10 turnos/mensagens mais recentes por ate 30 minutos
 
 // Evita responder duas vezes ao mesmo evento da Meta. E uma protecao local;
 // para varias instancias, substitua por Redis/PostgreSQL com chave unica.
@@ -124,12 +118,6 @@ function mascararTelefone(numero) {
   return s.length <= 4 ? "****" : `***${s.slice(-4)}`;
 }
 
-// O banco de memoria nunca recebe o numero bruto do WhatsApp.
-function sessionIdSeguro(prefixo, valor) {
-  return crypto.createHash("sha256")
-    .update(`${prefixo}:${String(valor || "")}`)
-    .digest("hex");
-}
 
 function memoriaVazia() {
   return { historico: [], obras: [], termos: [], tipo: "", falhas: 0, mostradas: 0 };
@@ -153,82 +141,17 @@ function lerMemoria(de) {
 }
 
 function salvarMemoria(de, dados) {
-  const recebido = Array.isArray(dados.historico) ? dados.historico : [];
-  const resumo = recebido.find((m) => m?.memoriaResumo === true) || null;
-  const recentes = recebido.filter((m) => m?.memoriaResumo !== true).slice(-MAX_HISTORICO);
   memoriaPorUsuario.set(de, {
-    // Preserva o resumo antigo separado dos turnos recentes quando ele existir.
-    historico: resumo ? [resumo, ...recentes] : recentes,
+    historico: (dados.historico || []).slice(-MAX_HISTORICO),
     obras: dados.obras || [],
     termos: dados.termos || [],
     tipo: dados.tipo || "",
     falhas: dados.falhas || 0,
     mostradas: dados.mostradas || 0,
+    // O relogio reinicia a cada nova mensagem. A sessao expira apos
+    // 30 minutos sem atividade e nada e gravado no PostgreSQL.
     time: Date.now(),
   });
-}
-
-function resumoFallbackMemoria(resumoAnterior = "", mensagens = []) {
-  const anteriores = String(resumoAnterior || "")
-    .replace(/^\[RESUMO DA CONVERSA ANTERIOR\]\s*/i, "")
-    .trim();
-  const trechos = (mensagens || []).slice(-10).map((m) => {
-    const papel = m?.role === "assistant" ? "BOT" : "USUARIO";
-    const txt = String(m?.content || "").replace(/\s+/g, " ").trim().slice(0, 260);
-    return txt ? `${papel}: ${txt}` : "";
-  }).filter(Boolean);
-  return [anteriores, ...trechos].filter(Boolean).join(" | ").slice(-3500);
-}
-
-async function compactarMemoriaPersistente(sessionId) {
-  try {
-    const lote = await prepararCompactacaoHistoricoAgente(sessionId);
-    if (!lote?.necessario || !lote.mensagens?.length) return null;
-
-    const resumoAnterior = lote.resumoAnterior?.content || "";
-    const estadoAnterior = lote.resumoAnterior?.estado && typeof lote.resumoAnterior.estado === "object"
-      ? lote.resumoAnterior.estado
-      : {};
-    const ultimoEstado = [...lote.mensagens].reverse().find((m) => m?.role === "assistant" && m?.estado && typeof m.estado === "object")?.estado
-      || estadoAnterior;
-
-    const bloco = lote.mensagens.map((m) => {
-      const papel = m.role === "assistant" ? "ASSISTENTE" : "USUARIO";
-      return `${papel}: ${String(m.content || "").replace(/\s+/g, " ").trim().slice(0, 700)}`;
-    }).join("\n");
-
-    let resumo = resumoFallbackMemoria(resumoAnterior, lote.mensagens);
-    try {
-      const resposta = await chamarIAbruta([
-        {
-          role: "system",
-          content: "Resuma uma conversa de chatbot de obras publicas para preservar contexto futuro. Seja factual e curto. Guarde somente: assunto/escopo atual, filtros relevantes, conjunto ou item em foco, responsavel em foco e pedidos pendentes. Nao invente dados e nao explique seu raciocinio. Maximo 900 caracteres.",
-        },
-        {
-          role: "user",
-          content: `RESUMO ANTERIOR (pode estar vazio):\n${resumoAnterior || "(nenhum)"}\n\nMENSAGENS ANTIGAS A COMPACTAR:\n${bloco}`.slice(0, 9000),
-        },
-      ], { max_tokens: 260, temperature: 0, reasoning_effort: "low" });
-      const limpo = String(resposta || "").replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/\s+/g, " ").trim();
-      if (limpo) resumo = limpo.slice(0, 1400);
-    } catch (e) {
-      console.warn("MEMORIA: IA de resumo indisponivel; usando compactacao local:", e.message);
-    }
-
-    const ok = await concluirCompactacaoHistoricoAgente(sessionId, {
-      ids: lote.mensagens.map((m) => m.id),
-      resumo,
-      estado: ultimoEstado || {},
-    });
-    if (ok) {
-      console.log(`MEMORIA: sessao compactada; ${lote.mensagens.length} mensagens antigas viraram resumo.`);
-      return { resumo, estado: ultimoEstado || {} };
-    }
-    return null;
-  } catch (e) {
-    console.warn("MEMORIA: compactacao falhou sem interromper o chatbot:", e.message);
-    return null;
-  }
 }
 
 // MELHORIA 6: log estruturado das perguntas que o bot nao conseguiu responder.
@@ -346,18 +269,14 @@ app.get("/testar-agente", async (req, res) => {
   const pergunta = req.query.q;
   if (!pergunta) return res.json({ erro: "passe a pergunta em ?q=..." });
 
-  // Mantem memoria tambem no teste pelo navegador. Use ?sessao=nome para
-  // separar conversas. Sem sessao, usa "padrao" por 30 minutos.
+  // Memoria somente em RAM. Use ?sessao=nome para separar conversas de teste.
+  // A sessao expira apos 30 minutos sem atividade e nao grava nada no banco.
   const sessao = String(req.query.sessao || req.get("x-test-session") || "padrao")
     .replace(/[^a-zA-Z0-9_.-]/g, "_")
     .slice(0, 80);
   const chaveTeste = `__teste_sql_agent__:${sessao}`;
-  const sessionPersistente = sessionIdSeguro("teste_sql_agent", sessao);
   const memoriaTeste = lerMemoria(chaveTeste);
-  let historicoTeste = memoriaTeste.historico || [];
-  if (!historicoTeste.length) {
-    historicoTeste = await carregarHistoricoAgente(sessionPersistente, MAX_HISTORICO);
-  }
+  const historicoTeste = memoriaTeste.historico || [];
 
   try {
     const r = await responderPergunta(pergunta, historicoTeste);
@@ -375,8 +294,6 @@ app.get("/testar-agente", async (req, res) => {
       ...memoriaTeste,
       historico: [...historicoTeste, ...novasMensagens],
     });
-    await salvarHistoricoAgente(sessionPersistente, novasMensagens);
-    await compactarMemoriaPersistente(sessionPersistente);
 
     res.json({
       pergunta,
@@ -826,14 +743,7 @@ async function processarMensagem(mensagem) {
   // ============================================================
   if (USAR_AGENTE_SQL) {
     const memoriaAg = lerMemoria(de);
-    const sessionPersistente = sessionIdSeguro("whatsapp", de);
-    let historicoAg = memoriaAg.historico || [];
-
-    // Igual ao modelo conversacional do artigo: se a memoria local sumiu
-    // (restart/deploy), recupera os ultimos turnos do PostgreSQL.
-    if (!historicoAg.length) {
-      historicoAg = await carregarHistoricoAgente(sessionPersistente, MAX_HISTORICO);
-    }
+    const historicoAg = memoriaAg.historico || [];
 
     let respostaAg;
     let resultadoAg = null;
@@ -861,11 +771,8 @@ async function processarMensagem(mensagem) {
       historico: [...historicoAg, ...novasMensagens].slice(-MAX_HISTORICO),
     });
 
-    // Persistencia e opcional: se chat_history nao existir, db.js apenas
-    // registra o aviso e o fluxo continua com a memoria local.
-    await salvarHistoricoAgente(sessionPersistente, novasMensagens);
-    await compactarMemoriaPersistente(sessionPersistente);
-
+    // Nao persiste conversa no PostgreSQL. O contexto existe apenas em RAM
+    // por ate 30 minutos sem atividade.
     await enviarTexto(de, respostaAg);
     return; // nao executa o sistema antigo
   }
