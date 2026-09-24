@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + DATA LINKING (Node.js) - V4
+// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS EXPLICATIVAS (Node.js) - V7
 // ============================================================
 // Arquitetura baseada em duas referencias usadas no projeto:
 // 1) Conversational SQL Agent: schema/view + SQL dinamico + memoria de conversa.
@@ -84,6 +84,35 @@ function resumoHistorico(historico = []) {
     const estado = m?.estado ? `\nESTADO_ANTERIOR: ${jsonSeguro(m.estado, 800)}` : "";
     return `${papel}: ${conteudo}${sql}${estado}`;
   }).join("\n\n");
+}
+
+function ancoraContextoRecente(historico = []) {
+  if (!Array.isArray(historico) || !historico.length) return "(sem recorte anterior)";
+  for (let i = historico.length - 1; i >= 0; i--) {
+    const m = historico[i];
+    if (m?.role !== "assistant" || !m?.sql) continue;
+    const sql = textoSeguro(m.sql, 1800);
+    if (!sql) continue;
+    return `ULTIMA CONSULTA/RECORTE CONFIRMADO:\n${sql}\n` +
+      `REGRA DE CONTINUIDADE: se a pergunta atual NAO nomear claramente um novo universo, alvo ou filtro incompatível, preserve o mesmo recorte/filtros desta consulta. Pedir outro campo, valor, recurso, status, quantidade ou perguntar "quais" NAO reinicia o assunto.`;
+  }
+  return "(sem recorte anterior)";
+}
+
+function consultaAgregadaSeca(pergunta = "", sql = "") {
+  const p = normalizar(pergunta);
+  const s = String(sql || "");
+  const pedeMedida = /\b(valor|valores|investid|investimento|gasto|gastos|custo|custos|soma|somar|media|média|executado|executada|saldo)\b/.test(p);
+  if (!pedeMedida) return false;
+  const temAgregado = /\b(?:sum|avg)\s*\(/i.test(s);
+  const jaDetalha = /\bover\s*\(/i.test(s) || /\bgroup\s+by\b/i.test(s) || /\bobjeto\b/i.test(s);
+  return temAgregado && !jaDetalha;
+}
+
+function existencialComLimitUm(pergunta = "", sql = "") {
+  const p = normalizar(pergunta);
+  const perguntaExistencial = /\b(existe|existem|ha|tem algum|tem alguma|tem alguns|tem algumas)\b/.test(p);
+  return perguntaExistencial && /\blimit\s+1\b/i.test(String(sql || ""));
 }
 
 function stripThink(texto = "") {
@@ -206,6 +235,23 @@ async function carregarSchemaContexto() {
     }
   }
 
+  // Catalogo das chaves JSON reais. Isso e essencial para campos que variam por aba
+  // e nao merecem virar uma coluna fixa na view (ex.: "DATA DE ENVIO", etapas de
+  // licitacao, numeros de proposta etc.). O agente passa a descobrir esses campos
+  // pelo schema/dados, em vez de confundir um nome parecido com uma coluna canonica.
+  let chavesDadosExtras = [];
+  if (nomes.has("dados_extras")) {
+    try {
+      const rr = await queryReadOnly(
+        `SELECT DISTINCT jsonb_object_keys(COALESCE(dados_extras, '{}'::jsonb)) AS chave ` +
+        `FROM public.${relacao} ORDER BY chave LIMIT 180`
+      );
+      chavesDadosExtras = (rr.rows || []).map((x) => x.chave).filter(Boolean);
+    } catch {
+      chavesDadosExtras = [];
+    }
+  }
+
   const categorias = {};
   const camposDistintos = ["tipo_negocio", "subtipo_negocio", "status", "status_original", "bairro", "engenheiro", "empresa", "recurso", "tipo_recurso", "aba_origem"]
     .filter((c) => nomes.has(c));
@@ -227,6 +273,7 @@ async function carregarSchemaContexto() {
     amostras,
     categorias,
     objetosCatalogo,
+    chavesDadosExtras,
     temViewSemantica: relacao === "obras_chatbot",
   };
   cacheSchema = { quando: agora, contexto };
@@ -253,7 +300,10 @@ function schemaParaPrompt(ctx) {
     return `- ${partes.join(" | ")}`;
   }).join("\n");
 
+  const chavesExtras = (ctx.chavesDadosExtras || []).slice(0, 180).join(" | ");
+
   return `RELACAO AUTORIZADA: public.${ctx.relacao}\n\nCOLUNAS REAIS:\n${colunas}` +
+    `\n\nCHAVES REAIS DE dados_extras (JSONB):\n${chavesExtras || "(nenhuma coletada)"}` +
     `\n\nVALORES REAIS IMPORTANTES:\n${valores || "(nao coletados)"}` +
     `\n\nCATALOGO DE OBJETOS REAIS (use para ligacao semantica; nao invente nomes):\n${objetos || "(nao coletado)"}` +
     `\n\nUMA AMOSTRA DE FORMATO:\n${jsonSeguro(ctx.amostras, 2500)}`;
@@ -294,6 +344,8 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `REGRAS DE CONVERSA:\n` +
     `- Use o historico para resolver 'essas', 'delas', 'dele', 'qual delas', 'e o valor?', 'e quem cuida?' etc.\n` +
     `- Follow-up deve preservar o RECORTE anterior, mesmo que a consulta imediatamente anterior tenha apenas projetado/agrupado um campo.\n` +
+    `- Perguntar um NOVO CAMPO ou MEDIDA do conjunto atual (valor, recurso, status, responsavel, contrato, data, percentual, etc.) NAO e um novo assunto. Preserve os filtros WHERE do recorte anterior.\n` +
+    `- Se o conjunto atual for, por exemplo, projetos concluidos e o usuario perguntar se eles tem valor, consulte ESSES projetos concluidos. Se nenhum tiver valor, retorne 0 linhas/resultado vazio correto; NAO amplie para todas as obras so para achar dados.\n` +
     `- Um novo alvo explicito no turno atual substitui contexto incompatível anterior.\n` +
     `- Se o usuario disser 'em geral/no total' em um ranking, remova filtros de status herdados, mas mantenha o universo pedido.\n\n` +
     `REGRAS SQL:\n` +
@@ -301,7 +353,14 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `- Consulte SOMENTE public.${ctx.relacao}.\n` +
     `- Nao consulte information_schema, pg_catalog, auth, storage ou outras tabelas.\n` +
     `- Prefira agregacoes SQL reais (COUNT, SUM, AVG, GROUP BY, ORDER BY) quando a pergunta pedir calculo/ranking.\n` +
-    `- Para 'quais engenheiros dessas obras?', prefira SELECT DISTINCT engenheiro preservando o recorte das obras.\n` +
+    `- SOMA/MEDIA EXPLICAVEL: quando somar ou calcular media de um conjunto e houver nomes/valores por registro, prefira retornar a composicao junto do agregado, por exemplo objeto + valor_total + SUM(valor_total) OVER () AS total_investido. Assim a resposta consegue explicar de onde saiu o total.\n` +
+    `- EXISTENCIA/ALGUM: perguntas do tipo "existe/tem algum" NAO devem ser respondidas escolhendo um registro arbitrario com LIMIT 1. Use COUNT, agrupamento por tipo_negocio ou liste o conjunto real. Se nao houver universo claro nem recorte anterior, resuma por tipo_negocio em vez de escolher um item ao acaso.\n` +
+    `- Para 'quais engenheiros dessas obras?', se o usuario quer apenas a lista de nomes, SELECT DISTINCT engenheiro e valido; se ele pedir quem e responsavel por cada obra, retorne objeto + engenheiro.\n` +
+    `- FOLLOW-UP DE CAMPO SOBRE UM CONJUNTO: quando o usuario perguntar 'quais os recursos?', 'quais os status?', 'quais os engenheiros?', 'quais os contratos?' etc. sobre varios registros ja em contexto, prefira UMA LINHA POR REGISTRO com objeto + campo pedido. So use DISTINCT campo sozinho quando ele pedir explicitamente valores unicos/diferentes ou apenas os nomes sem associar a cada registro.\n` +
+    `- RECURSOS: quando a pergunta envolver recurso de obras/projetos/licitacoes e as colunas existirem, retorne objeto, recurso e tipo_recurso. Esses campos tem significados diferentes e a resposta deve manter a associacao de cada registro.\n` +
+    `- CAMPO LIVRE/JSONB: se o usuario pedir um campo especifico que NAO exista como coluna canonica, procure o nome correspondente nas CHAVES REAIS DE dados_extras. Quando houver correspondencia clara, leia a chave exata com dados_extras->>'CHAVE' e use um alias legivel.\n` +
+    `- NUNCA substitua um campo pedido por outro apenas porque o nome parece parecido. Uma data especifica, etapa, numero, observacao ou indicador pode viver em dados_extras e NAO significa automaticamente data_inicio, data_prev_termino ou outro campo canonico.\n` +
+    `- Se houver coluna canonica E chave JSON com sentidos diferentes, preserve a semantica pedida pelo usuario e escolha a fonte que corresponde ao nome/conceito solicitado.\n` +
     `- Para 'valor total investido' de um conjunto, some valor_total, salvo quando o usuario pedir explicitamente valor executado/pago.\n` +
     `- Para 'quanto falta', use valor_total - valor_executado quando essas colunas existirem.\n` +
     `- 'status de X' pede o campo status do alvo X; nao transforme a palavra status em filtro.\n` +
@@ -314,6 +373,7 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `- Retorne SOMENTE JSON {"description":"...","query":"SELECT ..."}. Se nao puder responder com o schema, use query="".\n\n` +
     `SCHEMA E DADOS REAIS:\n${schemaParaPrompt(ctx)}\n\n` +
     `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
+    `ANCORA DO CONTEXTO ATUAL:\n${ancoraContextoRecente(historico)}\n\n` +
     (correcao ? `CONTEXTO DE CORRECAO: ${correcao}\n\n` : "") +
     `PERGUNTA ATUAL: ${JSON.stringify(pergunta)}`;
 
@@ -400,10 +460,12 @@ function diagnosticoErroPG(e) {
 // ------------------------------------------------------------
 // Estagio 2: avaliacao e self-healing
 // ------------------------------------------------------------
-async function repararSQL({ pergunta, historico, ctx, sqlAtual, erro = null, linhas = [] }) {
+async function repararSQL({ pergunta, historico, ctx, sqlAtual, erro = null, linhas = [], motivoSemantico = "" }) {
   const erroTexto = erro
     ? `ERRO POSTGRESQL REAL:\n${jsonSeguro(erro, 4000)}`
-    : `A consulta executou sem erro, mas retornou 0 linhas. Isso PODE ser correto. So altere a SQL se houver um motivo concreto no schema/valores reais indicando filtro, coluna ou semantica errados. Nao force resultado nao-vazio.`;
+    : motivoSemantico
+      ? `ALERTA SEMANTICO APOS EXECUCAO:\n${motivoSemantico}\nA consulta trouxe linha(s), mas os campos que deveriam responder ao pedido vieram vazios/nulos. Verifique as CHAVES REAIS DE dados_extras e se a SQL usou um campo apenas parecido com o que o usuario pediu. Nao force um valor se o dado realmente nao existir.`
+      : `A consulta executou sem erro, mas retornou 0 linhas. Isso PODE ser correto. So altere a SQL se houver um motivo concreto no schema/valores reais indicando filtro, coluna ou semantica errados. Nao force resultado nao-vazio.`;
 
   const prompt = `Voce e o AVALIADOR/REFINADOR de um SQL Agent PostgreSQL.\n` +
     `Sua tarefa e corrigir UMA consulta somente quando houver motivo tecnico ou semantico concreto.\n` +
@@ -412,6 +474,8 @@ async function repararSQL({ pergunta, historico, ctx, sqlAtual, erro = null, lin
     `SEGURANCA: somente SELECT/WITH SELECT em public.${ctx.relacao}.\n\n` +
     `SCHEMA REAL:\n${schemaParaPrompt(ctx)}\n\n` +
     `HISTORICO:\n${resumoHistorico(historico)}\n\n` +
+    `ANCORA DO CONTEXTO ATUAL:\n${ancoraContextoRecente(historico)}\n\n` +
+    `IMPORTANTE: resultado vazio pode ser a resposta correta. Nunca remova filtros herdados do recorte anterior apenas para produzir linhas.\n` +
     `PERGUNTA ORIGINAL: ${JSON.stringify(pergunta)}\n` +
     `SQL ATUAL: ${sqlAtual}\n` +
     `${erroTexto}\n` +
@@ -425,6 +489,30 @@ async function repararSQL({ pergunta, historico, ctx, sqlAtual, erro = null, lin
     reasoning_effort: "low",
   });
   return extrairSQLDaResposta(bruto);
+}
+
+function resultadoSoComCamposVazios(rows = []) {
+  if (!Array.isArray(rows) || !rows.length) return false;
+
+  // Campos que normalmente apenas identificam/localizam o registro e nao sao a
+  // informacao pedida em uma consulta de campo. Se so eles tiverem valor e os
+  // demais campos vierem vazios, vale uma tentativa de reparo semantico.
+  const contexto = new Set([
+    "id", "objeto", "bairro", "categoria", "tipo_negocio", "subtipo_negocio", "aba_origem"
+  ]);
+
+  const chavesAlvo = [...new Set(rows.flatMap((r) => Object.keys(r || {})))]
+    .filter((k) => !contexto.has(k));
+
+  // SELECT apenas de identificacao/listagem continua valido.
+  if (!chavesAlvo.length) return false;
+
+  const temAlgumValor = rows.some((r) => chavesAlvo.some((k) => {
+    const v = r?.[k];
+    return v !== null && v !== undefined && String(v).trim() !== "";
+  }));
+
+  return !temAlgumValor;
 }
 
 async function executarComSelfHealing({ pergunta, historico, ctx, sqlInicial }) {
@@ -459,9 +547,29 @@ async function executarComSelfHealing({ pergunta, historico, ctx, sqlInicial }) 
       // Best-result tracking: uma execucao valida nunca e perdida.
       if (!melhor || rows.length > melhor.rows.length) melhor = atual;
 
-      // EARLY ACCEPT: consulta executou e retornou ao menos uma linha.
-      // Nao deixamos a IA 'corrigir' uma consulta que ja funcionou.
-      if (rows.length > 0) return { ...atual, tentativas, earlyAccept: true };
+      // EARLY ACCEPT com uma excecao importante: uma linha pode existir, mas o
+      // campo projetado para responder ao usuario pode estar NULL. Nesse caso a
+      // SQL executou tecnicamente, porem ainda pode ter escolhido o campo errado
+      // (especialmente quando o dado real esta em dados_extras).
+      if (rows.length > 0 && !resultadoSoComCamposVazios(rows)) {
+        return { ...atual, tentativas, earlyAccept: true };
+      }
+
+      if (rows.length > 0 && resultadoSoComCamposVazios(rows)) {
+        if (tentativa >= MAX_REPAROS) break;
+        const reparo = await repararSQL({
+          pergunta,
+          historico,
+          ctx,
+          sqlAtual: validacao.sql,
+          linhas: rows,
+          motivoSemantico: "Os registros foram localizados, mas todos os campos de resposta alem dos identificadores/contexto vieram vazios. Confirme se o campo solicitado existe como chave em dados_extras e se a consulta selecionou a chave correta."
+        });
+        const candidata = limparSQL(reparo.query);
+        if (!candidata || candidata === validacao.sql) break;
+        sqlAtual = candidata;
+        continue;
+      }
 
       // Resultado vazio: pode ser correto. Faz no maximo os reparos configurados,
       // preservando esta consulta como melhor resultado caso as proximas piorem.
@@ -562,6 +670,7 @@ function rotuloHumano(campo = "") {
     contrato: "Contrato",
     convenio: "Convênio",
     aditivo: "Aditivo",
+    data_envio: "Data de envio",
     data_inicio: "Data de início",
     data_prev_termino: "Previsão de término",
     quanto_falta: "Valor restante",
@@ -630,7 +739,14 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
   const prompt = `Voce e o redator final de um chatbot de obras publicas no WhatsApp.\n` +
     `Responda APENAS com base nos dados retornados pela consulta. Nao invente, nao estime e nao corrija valores por memoria.\n` +
     `Se o resultado estiver vazio, diga claramente que nao encontrou registros com os criterios.\n` +
-    `Se for contagem/soma/ranking, destaque o resultado de forma direta.\n` +
+    `Se for contagem/soma/ranking, destaque o resultado de forma direta e acrescente uma explicacao curta do que foi contado/somado, sem repetir a pergunta mecanicamente.\n` +
+    `RESPOSTAS DEVEM SER EXPLICATIVAS, nao secas: comece com uma frase curta respondendo diretamente e depois mostre os detalhes que ajudam a entender o resultado. Nao escreva apenas uma lista de valores quando os dados permitem dizer a qual obra/projeto/licitacao cada valor pertence.\n` +
+    `Quando houver um total/soma/media acompanhado de linhas individuais, informe o agregado UMA VEZ e em seguida mostre a composicao: nome de cada registro + valor que entrou no calculo. Explique que o total resulta da soma/media desses valores, sem inventar causalidade.\n` +
+    `Quando a pergunta for um follow-up e nenhum registro do RECORTE ATUAL atender ao novo criterio, diga isso explicitamente (ex.: "Nos 4 projetos concluidos, nenhum possui valor total cadastrado"). Nao troque silenciosamente para a base inteira.\n` +
+    `Quando houver varios registros e a pergunta pedir um campo (recurso, status, engenheiro, empresa, contrato, valor etc.), associe o campo a CADA nome retornado. Ex.: "• Reforma da UBS do Cristo Rei — Recurso: FEDERAL — Tipo de recurso: Recurso Proprio".\n` +
+    `Para recurso, se recurso e tipo_recurso vierem no resultado, explique os dois separadamente. Nunca transforme tipo_recurso em recurso nem o contrario.\n` +
+    `Quando a consulta retornar um campo vindo de dados_extras com alias legivel, responda usando o significado desse campo; nao renomeie para outro conceito parecido.\n` +
+    `Se houver exatamente 2 ou mais itens, pode abrir com "Encontrei X registros nesse recorte" ou equivalente, desde que seja natural e util.\n` +
     `Se for lista grande, seja conciso e liste no maximo 20 itens, avisando se houver mais.\n` +
     `FORMATO WHATSAPP: NUNCA use tabela Markdown, pipes |, linhas --- ou cabecalho de tabela. Use lista simples com marcadores.\n` +
     `Nao finalize com frases mecanicas como "nao ha mais registros" ou "nao foram encontrados outros registros"; apenas responda o que foi pedido.\n` +
@@ -648,7 +764,7 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
 
   try {
     const resposta = await chamarIAbruta([{ role: "user", content: prompt }], {
-      max_tokens: 480,
+      max_tokens: 620,
       temperature: 0,
       reasoning_effort: "low",
     });
@@ -695,8 +811,26 @@ export async function responderPergunta(pergunta, historico = []) {
       return {
         resposta: "Não consegui transformar essa pergunta em uma consulta segura aos dados. Pode reformular?",
         erro: "sql_nao_gerada",
-        modoAgente: "sql_agent_self_healing_v4_ram30",
+        modoAgente: "sql_agent_self_healing_v7_ram30",
       };
+    }
+
+    // Refinamentos gerais de qualidade. Nao sao regras de uma frase especifica:
+    // evitam respostas existenciais arbitrarias e agregados numericos sem composicao.
+    if (existencialComLimitUm(texto, gerada.query)) {
+      const refinada = await gerarSQL(
+        texto, historico, ctx,
+        "A consulta usou LIMIT 1 para uma pergunta existencial. Nao escolha um registro arbitrario. Refaça usando COUNT/agrupamento ou listagem do conjunto real, preservando o recorte da conversa."
+      );
+      if (refinada.query) gerada = refinada;
+    }
+
+    if (consultaAgregadaSeca(texto, gerada.query)) {
+      const refinada = await gerarSQL(
+        texto, historico, ctx,
+        "A consulta retornaria apenas um agregado seco. Preserve EXATAMENTE o mesmo recorte e refaça de forma explicavel: traga objeto + valor componente e o agregado por window function (SUM/AVG ... OVER()), para a resposta mostrar de onde saiu o total. Nao remova filtros anteriores."
+      );
+      if (refinada.query) gerada = refinada;
     }
 
     console.log("SQL AGENT - SQL INICIAL:", gerada.query);
@@ -721,14 +855,14 @@ export async function responderPergunta(pergunta, historico = []) {
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
       tentativas: execucao.tentativas,
-      modoAgente: "sql_agent_self_healing_v4_ram30",
+      modoAgente: "sql_agent_self_healing_v7_ram30",
     };
   } catch (e) {
     console.error("SQL AGENT: falha final:", e);
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "sql_agent_self_healing_v4_ram30_erro",
+      modoAgente: "sql_agent_self_healing_v7_ram30_erro",
     };
   }
 }
