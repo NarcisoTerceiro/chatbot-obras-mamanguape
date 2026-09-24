@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS EXPLICATIVAS (Node.js) - V7
+// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V8
 // ============================================================
 // Arquitetura baseada em duas referencias usadas no projeto:
 // 1) Conversational SQL Agent: schema/view + SQL dinamico + memoria de conversa.
@@ -113,6 +113,15 @@ function existencialComLimitUm(pergunta = "", sql = "") {
   const p = normalizar(pergunta);
   const perguntaExistencial = /\b(existe|existem|ha|tem algum|tem alguma|tem alguns|tem algumas)\b/.test(p);
   return perguntaExistencial && /\blimit\s+1\b/i.test(String(sql || ""));
+}
+
+function existencialComAgregadoSeco(pergunta = "", sql = "") {
+  const p = normalizar(pergunta);
+  const s = String(sql || "");
+  const perguntaExistencial = /\b(existe|existem|ha|tem algum|tem alguma|tem alguns|tem algumas)\b/.test(p);
+  const conta = /\bcount\s*\(/i.test(s);
+  const trazNomes = /\bobjeto\b/i.test(s);
+  return perguntaExistencial && conta && !trazNomes;
 }
 
 function stripThink(texto = "") {
@@ -633,6 +642,10 @@ function limparRespostaParaWhatsApp(texto = "") {
 
     if (!linha) continue;
 
+    // Remove explicacoes tecnicas de implementacao que nao interessam ao usuario final.
+    // Mantemos apenas dados de negocio: nomes, valores, status, recursos, responsaveis etc.
+    if (/(?:\bSQL\b|\bSELECT\b|\bWHERE\b|\bview\s+[`'"]?obras_chatbot|\btipo_negocio\b|\bconcluido\s*=\s*true\b|\bfiltrando\s+(?:a\s+)?view\b)/i.test(linha)) continue;
+
     // Se a IA ainda devolver uma linha de tabela, converte para texto simples.
     if (/^\|.*\|$/.test(linha)) {
       const celulas = linha.slice(1, -1).split("|").map((x) => x.trim()).filter(Boolean);
@@ -739,8 +752,10 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
   const prompt = `Voce e o redator final de um chatbot de obras publicas no WhatsApp.\n` +
     `Responda APENAS com base nos dados retornados pela consulta. Nao invente, nao estime e nao corrija valores por memoria.\n` +
     `Se o resultado estiver vazio, diga claramente que nao encontrou registros com os criterios.\n` +
-    `Se for contagem/soma/ranking, destaque o resultado de forma direta e acrescente uma explicacao curta do que foi contado/somado, sem repetir a pergunta mecanicamente.\n` +
+    `Se for contagem/soma/ranking, destaque o resultado de forma direta e depois mostre os dados que sustentam a resposta em linguagem comum. EXPLICAR significa mostrar nomes, valores, status, responsaveis ou outros detalhes uteis dos registros; NAO significa explicar como o banco foi consultado.\n` +
+    `NUNCA mencione SQL, consulta, SELECT, WHERE, view, tabela, coluna, filtro tecnico, booleano, tipo_negocio, concluido=true ou qualquer mecanismo interno. O usuario quer o RESULTADO e os registros encontrados, nao a forma tecnica de obtencao.\n` +
     `RESPOSTAS DEVEM SER EXPLICATIVAS, nao secas: comece com uma frase curta respondendo diretamente e depois mostre os detalhes que ajudam a entender o resultado. Nao escreva apenas uma lista de valores quando os dados permitem dizer a qual obra/projeto/licitacao cada valor pertence.\n` +
+    `Em perguntas existenciais como "tem algum?", "existe algum?" ou "ha algum?", se houver poucos resultados, informe a quantidade E liste os nomes encontrados. Se vierem ate 20 registros, mostre todos. Nao responda apenas com a contagem quando os nomes estiverem disponiveis.\n` +
     `Quando houver um total/soma/media acompanhado de linhas individuais, informe o agregado UMA VEZ e em seguida mostre a composicao: nome de cada registro + valor que entrou no calculo. Explique que o total resulta da soma/media desses valores, sem inventar causalidade.\n` +
     `Quando a pergunta for um follow-up e nenhum registro do RECORTE ATUAL atender ao novo criterio, diga isso explicitamente (ex.: "Nos 4 projetos concluidos, nenhum possui valor total cadastrado"). Nao troque silenciosamente para a base inteira.\n` +
     `Quando houver varios registros e a pergunta pedir um campo (recurso, status, engenheiro, empresa, contrato, valor etc.), associe o campo a CADA nome retornado. Ex.: "• Reforma da UBS do Cristo Rei — Recurso: FEDERAL — Tipo de recurso: Recurso Proprio".\n` +
@@ -811,7 +826,7 @@ export async function responderPergunta(pergunta, historico = []) {
       return {
         resposta: "Não consegui transformar essa pergunta em uma consulta segura aos dados. Pode reformular?",
         erro: "sql_nao_gerada",
-        modoAgente: "sql_agent_self_healing_v7_ram30",
+        modoAgente: "sql_agent_self_healing_v8_ram30",
       };
     }
 
@@ -820,7 +835,15 @@ export async function responderPergunta(pergunta, historico = []) {
     if (existencialComLimitUm(texto, gerada.query)) {
       const refinada = await gerarSQL(
         texto, historico, ctx,
-        "A consulta usou LIMIT 1 para uma pergunta existencial. Nao escolha um registro arbitrario. Refaça usando COUNT/agrupamento ou listagem do conjunto real, preservando o recorte da conversa."
+        "A consulta usou LIMIT 1 para uma pergunta existencial. Nao escolha um registro arbitrario. Refaça listando o conjunto real encontrado, preservando o recorte da conversa. Prefira objeto + campos relevantes + COUNT(*) OVER() AS total_encontrados, com no maximo 20 itens para exibicao."
+      );
+      if (refinada.query) gerada = refinada;
+    }
+
+    if (existencialComAgregadoSeco(texto, gerada.query)) {
+      const refinada = await gerarSQL(
+        texto, historico, ctx,
+        "A pergunta e existencial e a consulta retornaria apenas uma contagem. Preserve EXATAMENTE o mesmo recorte, mas traga tambem os registros encontrados para o usuario ver quais sao. Prefira objeto + status/tipo relevante + COUNT(*) OVER() AS total_encontrados. Se houver ate 20, liste todos; nao explique SQL nem filtros na resposta."
       );
       if (refinada.query) gerada = refinada;
     }
@@ -855,14 +878,14 @@ export async function responderPergunta(pergunta, historico = []) {
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
       tentativas: execucao.tentativas,
-      modoAgente: "sql_agent_self_healing_v7_ram30",
+      modoAgente: "sql_agent_self_healing_v8_ram30",
     };
   } catch (e) {
     console.error("SQL AGENT: falha final:", e);
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "sql_agent_self_healing_v7_ram30_erro",
+      modoAgente: "sql_agent_self_healing_v8_ram30_erro",
     };
   }
 }
