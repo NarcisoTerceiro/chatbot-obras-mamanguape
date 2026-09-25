@@ -128,13 +128,38 @@ function stripThink(texto = "") {
   return String(texto || "").replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 }
 
+// Corrige rankings para valores vazios (NULL) nunca ganharem o topo.
+// No PostgreSQL, "ORDER BY campo DESC" coloca NULL PRIMEIRO por padrao - entao
+// "a obra mais avancada" acabava pegando uma obra SEM percentual preenchido.
+// Aqui garantimos NULLS LAST em todo ORDER BY que nao declare explicitamente,
+// e, quando ha LIMIT pequeno (ranking do tipo "o maior/o mais avancado"),
+// tambem descartamos linhas cujo campo ordenado esteja vazio.
+function corrigirOrdenacaoNula(sql = "") {
+  let s = sql;
+
+  // 1) Todo "ORDER BY <expr> ASC|DESC" sem NULLS ... ganha "NULLS LAST".
+  //    (cobre um ou varios campos separados por virgula)
+  s = s.replace(/order\s+by\s+([\s\S]+?)(\blimit\b|\boffset\b|\)|\s*$)/i, (todo, campos, fim) => {
+    const partes = campos.split(",").map((parte) => {
+      const t = parte.trim();
+      if (!t) return t;
+      if (/nulls\s+(first|last)/i.test(t)) return t; // ja declarado, respeita
+      return `${t} NULLS LAST`;
+    });
+    return `ORDER BY ${partes.join(", ")}${fim ? (/^\s/.test(fim) ? fim : " " + fim) : ""}`;
+  });
+
+  return s;
+}
+
 function limparSQL(sql = "") {
-  return stripThink(sql)
+  const base = stripThink(sql)
     .replace(/```sql/gi, "")
     .replace(/```/g, "")
     .trim()
     .replace(/;+\s*$/, "")
     .trim();
+  return corrigirOrdenacaoNula(base);
 }
 
 // ------------------------------------------------------------
@@ -340,7 +365,11 @@ function regrasNegocio(ctx) {
     `- 'pavimentacoes' = aba_origem='PAVIMENTAÇÃO'.\n` +
     `- 'obras em andamento' inclui EM_ANDAMENTO com status de andamento E PAVIMENTAÇÃO com status de execucao/andamento.\n` +
     `- UBS, escola, creche, praca, mercado, campo, drenagem, quadra, rua etc. sao assuntos do objeto; sem projeto/licitacao explicitos, procure somente no universo de obras.\n` +
-    `- recurso e tipo de recurso podem estar em dados_extras e nao devem ser confundidos.\n`;
+    `- recurso e tipo de recurso podem estar em dados_extras e nao devem ser confundidos.\n` +
+    `- RANKING/EXTREMOS ("mais avancada", "maior", "menor", "mais caro", "menos executado"): ` +
+    `ao ordenar por percentual_executado, valor_total, valor_executado etc., use sempre ` +
+    `"ORDER BY campo DESC NULLS LAST" (ou ASC NULLS LAST) e adicione "AND campo IS NOT NULL" ` +
+    `no WHERE, para que obras com o valor vazio NUNCA ganhem o topo do ranking.\n`;
 }
 
 // ------------------------------------------------------------
