@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V8
+// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V12
 // ============================================================
 // Arquitetura baseada em duas referencias usadas no projeto:
 // 1) Conversational SQL Agent: schema/view + SQL dinamico + memoria de conversa.
@@ -97,6 +97,42 @@ function ancoraContextoRecente(historico = []) {
       `REGRA DE CONTINUIDADE: se a pergunta atual NAO nomear claramente um novo universo, alvo ou filtro incompatível, preserve o mesmo recorte/filtros desta consulta. Pedir outro campo, valor, recurso, status, quantidade ou perguntar "quais" NAO reinicia o assunto.`;
   }
   return "(sem recorte anterior)";
+}
+
+
+function referenciaPessoaRecente(historico = [], pergunta = "") {
+  const p = normalizar(pergunta);
+  const dependeDePessoa = /\b(ele|ela|dele|dela|esse engenheiro|essa engenheira|esse arquiteto|essa arquiteta|esse responsavel|essa responsavel)\b/.test(p);
+  if (!dependeDePessoa || !Array.isArray(historico)) return null;
+
+  // Procura o ultimo responsavel citado naturalmente na conversa.
+  // E generico: nao guarda nomes fixos e nao persiste nada no banco.
+  const rx = /\b((?:Eng\.?|Arq\.?)\s+[A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇ][A-Za-zÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇáàâãéèêíïóôõöúç]+(?:\s+[A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇ][A-Za-zÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇáàâãéèêíïóôõöúç]+){1,4})\b/g;
+  for (let i = historico.length - 1; i >= 0; i--) {
+    const m = historico[i];
+    if (!m?.content) continue;
+    const encontrados = [...String(m.content).matchAll(rx)];
+    if (encontrados.length) return encontrados[encontrados.length - 1][1];
+  }
+  return null;
+}
+
+function contextoReferenciaPessoa(historico = [], pergunta = "") {
+  const pessoa = referenciaPessoaRecente(historico, pergunta);
+  if (!pessoa) return "(nenhuma referencia pessoal recente)";
+  return `REFERENCIA PESSOAL RECENTE: ${pessoa}\nREGRA: pronomes como ele/ela/dele/dela apontam para essa pessoa ate que o usuario nomeie outra. Se pedir \"em geral\", remova filtros de status/andamento do assunto anterior, mas MANTENHA o filtro dessa pessoa.`;
+}
+
+function referenciaPessoaPerdida(pergunta = "", historico = [], sql = "") {
+  const pessoa = referenciaPessoaRecente(historico, pergunta);
+  if (!pessoa) return null;
+  const p = normalizar(pergunta);
+  const pedeConjuntoDaPessoa = /\b(obras?|projetos?|licitacoes?|registros?)\b/.test(p);
+  if (!pedeConjuntoDaPessoa) return null;
+  const s = normalizar(sql);
+  const nomeSemTitulo = normalizar(pessoa.replace(/^(eng\.?|arq\.?)\s*/i, ""));
+  const preservou = /\bengenheiro\b/.test(s) && (s.includes(normalizar(pessoa)) || s.includes(nomeSemTitulo));
+  return preservou ? null : pessoa;
 }
 
 function consultaAgregadaSeca(pergunta = "", sql = "") {
@@ -385,7 +421,8 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `- Perguntar um NOVO CAMPO ou MEDIDA do conjunto atual (valor, recurso, status, responsavel, contrato, data, percentual, etc.) NAO e um novo assunto. Preserve os filtros WHERE do recorte anterior.\n` +
     `- Se o conjunto atual for, por exemplo, projetos concluidos e o usuario perguntar se eles tem valor, consulte ESSES projetos concluidos. Se nenhum tiver valor, retorne 0 linhas/resultado vazio correto; NAO amplie para todas as obras so para achar dados.\n` +
     `- Um novo alvo explicito no turno atual substitui contexto incompatível anterior.\n` +
-    `- Se o usuario disser 'em geral/no total' em um ranking, remova filtros de status herdados, mas mantenha o universo pedido.\n\n` +
+    `- Se o usuario disser 'em geral/no total', remova filtros de status/andamento herdados quando eles apenas limitavam o conjunto anterior, mas preserve entidades explicitamente referenciadas, principalmente a pessoa apontada por ele/ela/dele/dela.\n` +
+    `- PRONOME DE PESSOA: se a resposta anterior identificou um engenheiro/arquiteto e o usuario perguntar 'ela tem quantas obras em geral?', 'quais obras ela tem?', 'e os projetos dele?' etc., filtre pelo mesmo engenheiro/responsavel. Nunca transforme isso em contagem de toda a base.\n\n` +
     `REGRAS SQL:\n` +
     `- Apenas SELECT ou WITH ... SELECT. Nunca escreva dados.\n` +
     `- Consulte SOMENTE public.${ctx.relacao}.\n` +
@@ -412,6 +449,8 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `SCHEMA E DADOS REAIS:\n${schemaParaPrompt(ctx)}\n\n` +
     `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
     `ANCORA DO CONTEXTO ATUAL:\n${ancoraContextoRecente(historico)}\n\n` +
+    `REFERENCIA DE PESSOA NO CONTEXTO:\n${contextoReferenciaPessoa(historico, pergunta)}\n\n` +
+    `REFERENCIA DE PESSOA NO CONTEXTO:\n${contextoReferenciaPessoa(historico, pergunta)}\n\n` +
     (correcao ? `CONTEXTO DE CORRECAO: ${correcao}\n\n` : "") +
     `PERGUNTA ATUAL: ${JSON.stringify(pergunta)}`;
 
@@ -855,8 +894,21 @@ export async function responderPergunta(pergunta, historico = []) {
       return {
         resposta: "Não consegui transformar essa pergunta em uma consulta segura aos dados. Pode reformular?",
         erro: "sql_nao_gerada",
-        modoAgente: "sql_agent_self_healing_v8_ram30",
+        modoAgente: "sql_agent_self_healing_v12_ram30",
       };
+    }
+
+    // Garante continuidade quando o usuario usa pronome para uma pessoa citada
+    // no turno anterior (ex.: "ela tem quantas obras em geral?").
+    const pessoaPerdida = referenciaPessoaPerdida(texto, historico, gerada.query);
+    if (pessoaPerdida) {
+      const refinada = await gerarSQL(
+        texto, historico, ctx,
+        `A pergunta atual usa um pronome que se refere a ${pessoaPerdida}, citado(a) no contexto recente. ` +
+        `A SQL perdeu essa entidade e consultou um universo mais amplo. Refaça preservando o filtro de engenheiro/responsavel dessa pessoa. ` +
+        `Se o usuario disse "em geral", remova apenas filtros de status/andamento anteriores; NAO remova o filtro da pessoa.`
+      );
+      if (refinada.query) gerada = refinada;
     }
 
     // Refinamentos gerais de qualidade. Nao sao regras de uma frase especifica:
@@ -907,14 +959,14 @@ export async function responderPergunta(pergunta, historico = []) {
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
       tentativas: execucao.tentativas,
-      modoAgente: "sql_agent_self_healing_v8_ram30",
+      modoAgente: "sql_agent_self_healing_v12_ram30",
     };
   } catch (e) {
     console.error("SQL AGENT: falha final:", e);
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "sql_agent_self_healing_v8_ram30_erro",
+      modoAgente: "sql_agent_self_healing_v12_ram30_erro",
     };
   }
 }
