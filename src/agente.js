@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V10
+// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V8
 // ============================================================
 // Arquitetura baseada em duas referencias usadas no projeto:
 // 1) Conversational SQL Agent: schema/view + SQL dinamico + memoria de conversa.
@@ -45,60 +45,13 @@ function textoSeguro(s = "", max = 1200) {
     .slice(0, max);
 }
 
-
-function respostaMetaSistema(pergunta = "") {
+function respostaSocial(pergunta = "") {
   const p = normalizar(pergunta);
-
-  // Perguntas sobre o que o proprio chatbot consegue consultar sao META.
-  // Elas nao devem herdar o assunto anterior nem virar uma consulta SQL sobre
-  // o ultimo recorte da conversa.
-  const ehMeta =
-    /\b(o que|que dados|quais dados|quais informacoes|que informacoes|que tipo de informacao)\b.*\b(voce|vc|bot|sistema)\b.*\b(acesso|consulta|consultar|sabe|consegue|tem)\b/.test(p) ||
-    /\b(voce|vc|bot|sistema)\b.*\b(tem|possui|consegue)\b.*\bacesso\b/.test(p) ||
-    /\b(o que posso perguntar|que posso perguntar|quais perguntas posso fazer|como voce pode ajudar|como vc pode ajudar)\b/.test(p);
-
-  // Evita capturar uma pergunta sobre um registro especifico, como
-  // "voce tem acesso a obra X?". Nesse caso o agente deve pesquisar os dados.
-  const pareceRegistroEspecifico = /\b(obra|projeto|licitacao|pavimentacao)\b.{3,}/.test(p) &&
-    !/\b(o que posso perguntar|como voce pode ajudar|que dados|quais dados|quais informacoes|que informacoes)\b/.test(p);
-
-  if (!ehMeta || pareceRegistroEspecifico) return null;
-
-  return (
-    "Tenho acesso aos dados cadastrados no sistema sobre obras, pavimentações, projetos e licitações de Mamanguape.\n\n" +
-    "Posso consultar, quando essas informações estiverem preenchidas:\n" +
-    "• nome e localização/bairro\n" +
-    "• status e andamento\n" +
-    "• engenheiro ou responsável técnico e empresa\n" +
-    "• valor total, valor executado, saldo e percentual executado\n" +
-    "• recurso e tipo de recurso\n" +
-    "• contrato, convênio e aditivos\n" +
-    "• datas, prazos e observações\n\n" +
-    "Também posso fazer contagens, somas, comparações e responder perguntas de continuação sobre esses dados. Se alguma informação não estiver cadastrada, eu aviso em vez de inventar."
-  );
-}
-
-function respostaSocial(pergunta = "", historico = []) {
-  const p = normalizar(pergunta);
-  const temConversaAnterior = Array.isArray(historico) && historico.some((m) =>
-    m && (m.role === "user" || m.role === "assistant") && String(m.content || "").trim()
-  );
-
-  // Saudacao isolada: se ja houve conversa nesta sessao, responde como retorno
-  // natural, sem tentar transformar "oi" em consulta ao banco.
-  if (/^(oi|ola|opa|e ai|ei|bom dia|boa tarde|boa noite|oi de novo|ola de novo)[!. ]*$/.test(p)) {
-    return temConversaAnterior
-      ? "Olá novamente! Como posso ajudar? Pode fazer outra pergunta sobre obras, projetos ou licitações."
-      : "Olá! Como posso ajudar? Pode me perguntar sobre obras, projetos, licitações, valores, responsáveis, recursos e andamento.";
+  if (/^(oi|ola|opa|e ai|bom dia|boa tarde|boa noite)[!. ]*$/.test(p)) {
+    return "Olá! Pode me perguntar sobre obras, projetos, licitações, valores, responsáveis, recursos e andamento.";
   }
-
-  // Agradecimento/encerramento curto. So intercepta quando a mensagem for
-  // essencialmente social; se vier uma nova pergunta junto, segue para o agente.
-  if (/^(muito )?(obrigad[oa]|obg|brigad[oa]|valeu|vlw)( mesmo)?[!. ]*$/.test(p) || /^(show|blz|beleza)[!. ]*$/.test(p)) {
-    return "Por nada! Fico à disposição. Se precisar, é só mandar outra pergunta.";
-  }
-  if (/^(tchau|ate mais|até mais|falou|fui|encerramos|era so isso|era só isso)[!. ]*$/.test(p)) {
-    return "Até mais! Quando precisar, pode chamar novamente.";
+  if (/^(obrigad[oa]|valeu|vlw|show|blz|beleza)[!. ]*$/.test(p)) {
+    return "Por nada! Pode mandar outra pergunta sobre os dados.";
   }
   return null;
 }
@@ -169,33 +122,6 @@ function existencialComAgregadoSeco(pergunta = "", sql = "") {
   const conta = /\bcount\s*\(/i.test(s);
   const trazNomes = /\bobjeto\b/i.test(s);
   return perguntaExistencial && conta && !trazNomes;
-}
-
-function pedidoObrasEmAndamento(pergunta = "") {
-  const p = normalizar(pergunta);
-  return /\bobras?\b/.test(p) && /\bem andamento\b/.test(p) && !/\b(projetos?|licitacoes?|licitacao)\b/.test(p);
-}
-
-function consultaPerdeuFiltroObrasEmAndamento(pergunta = "", sql = "", ctx = {}) {
-  if (!ctx?.temViewSemantica || !pedidoObrasEmAndamento(pergunta)) return false;
-  const s = String(sql || "");
-  const temUniversoObra = /\btipo_negocio\s*=\s*['"]obra['"]/i.test(s);
-  const temFlagAndamento = /\bem_andamento_obra\s*(?:=|is)\s*(?:true|['"]?t['"]?)/i.test(s);
-  return !(temUniversoObra && temFlagAndamento);
-}
-
-function pedidoListaCompleta(pergunta = "") {
-  const p = normalizar(pergunta);
-  const pedeLista = /\b(quais|liste|listar|lista|mostre|mostrar|me diga|me passe|todos|todas)\b/.test(p);
-  const pediuTop = /\b(top|primeir[oa]s?|ultim[oa]s?|maior(?:es)?|menor(?:es)?|mais cara|mais caro|mais avancad[oa])\b/.test(p);
-  const pediuNumero = /\b\d{1,3}\b/.test(p);
-  return pedeLista && !pediuTop && !pediuNumero;
-}
-
-function removerLimiteFinalArbitrario(pergunta = "", sql = "") {
-  const s = limparSQL(sql);
-  if (!pedidoListaCompleta(pergunta)) return s;
-  return s.replace(/\s+LIMIT\s+\d+\s*$/i, "").trim();
 }
 
 function stripThink(texto = "") {
@@ -400,7 +326,7 @@ function regrasNegocio(ctx) {
       `- tipo_negocio='projeto' representa somente projetos.\n` +
       `- tipo_negocio='licitacao' representa somente licitacoes.\n` +
       `- subtipo_negocio='pavimentacao' identifica especificamente pavimentacoes.\n` +
-      `- Para 'obras em andamento', use OBRIGATORIAMENTE tipo_negocio='obra' AND em_andamento_obra = true. Nunca responda esse pedido com a view inteira, apenas LIMIT, ou status generico sem esse recorte.\n` +
+      `- Para 'obras em andamento', use tipo_negocio='obra' AND em_andamento_obra = true.\n` +
       `- 'concluido' e um booleano normalizado quando existir.\n` +
       `- recurso e tipo_recurso SAO conceitos diferentes. Nunca substitua um pelo outro.\n` +
       `- UBS, escola, creche, praca, mercado, campo, drenagem, quadra, rua etc. sao assuntos/alvos no objeto. Se o usuario nao disser projeto ou licitacao, trate esses alvos como obras.\n` +
@@ -452,8 +378,6 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `- Para alvo proprio/especifico (nome de bairro, rua, equipamento com nome proprio), seja conservador: nao expanda para conceitos diferentes.\n` +
     `- Em busca ampla por assunto, voce pode procurar em objeto, categoria e dados_extras::text quando essas colunas existirem; mantenha o tipo_negocio correto.\n` +
     `- Se um termo livre puder ser nome parcial, use ILIKE/LOWER de forma tolerante.\n` +
-    `- LISTAS COMPLETAS: se o usuario pedir 'quais', 'liste', 'mostre', 'todos/todas' e nao limitar a quantidade, NAO use LIMIT 10/20 arbitrariamente. Deixe o limite de seguranca do sistema controlar a consulta.\n` +
-    `- Para listas de obras em andamento, preserve o filtro tipo_negocio='obra' AND em_andamento_obra=true e traga os registros desse recorte; nunca use somente SELECT ... FROM public.obras_chatbot LIMIT N.\n` +
     `- Retorne colunas suficientes para responder, mas nao SELECT * sem necessidade.\n` +
     `- Retorne SOMENTE JSON {"description":"...","query":"SELECT ..."}. Se nao puder responder com o schema, use query="".\n\n` +
     `SCHEMA E DADOS REAIS:\n${schemaParaPrompt(ctx)}\n\n` +
@@ -493,7 +417,7 @@ function relacoesReferenciadas(sql = "") {
   return refs;
 }
 
-function validarSQL(sql, ctx, pergunta = "") {
+function validarSQL(sql, ctx) {
   const s = limparSQL(sql);
   if (!s) return { ok: false, motivo: "consulta vazia" };
   if (!/^(select|with)\b/i.test(s)) return { ok: false, motivo: "somente SELECT/WITH SELECT e permitido" };
@@ -515,15 +439,6 @@ function validarSQL(sql, ctx, pergunta = "") {
 
   if (!relacoesReferenciadas(s).some((r) => r.toLowerCase().split(".").pop() === permitido)) {
     return { ok: false, motivo: `a consulta precisa usar public.${ctx.relacao}` };
-  }
-
-  // Guardrail semantico de negocio: esse recorte e fundamental no projeto e
-  // nao pode ser perdido por uma geracao que simplesmente liste as primeiras linhas.
-  if (consultaPerdeuFiltroObrasEmAndamento(pergunta, s, ctx)) {
-    return {
-      ok: false,
-      motivo: "pedido de obras em andamento exige tipo_negocio='obra' AND em_andamento_obra=true; nao use a view inteira nem LIMIT arbitrario"
-    };
   }
 
   return { ok: true, sql: s };
@@ -615,7 +530,7 @@ async function executarComSelfHealing({ pergunta, historico, ctx, sqlInicial }) 
   const tentativas = [];
 
   for (let tentativa = 0; tentativa <= MAX_REPAROS; tentativa++) {
-    const validacao = validarSQL(sqlAtual, ctx, pergunta);
+    const validacao = validarSQL(sqlAtual, ctx);
     if (!validacao.ok) {
       tentativas.push({ tentativa, sql: sqlAtual, erro: `guardrail: ${validacao.motivo}` });
       if (tentativa >= MAX_REPAROS) break;
@@ -847,9 +762,7 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
     `Para recurso, se recurso e tipo_recurso vierem no resultado, explique os dois separadamente. Nunca transforme tipo_recurso em recurso nem o contrario.\n` +
     `Quando a consulta retornar um campo vindo de dados_extras com alias legivel, responda usando o significado desse campo; nao renomeie para outro conceito parecido.\n` +
     `Se houver exatamente 2 ou mais itens, pode abrir com "Encontrei X registros nesse recorte" ou equivalente, desde que seja natural e util.\n` +
-    `Se for lista grande, priorize clareza: informe primeiro o TOTAL real do recorte quando ele estiver disponivel e depois liste os itens. Se o usuario pediu explicitamente quais/todos e houver ate 30 registros retornados, pode listar todos de forma compacta; nao invente um total a partir de LIMIT.\n` +
-    `Nunca diga "tenho acesso a X obras". Diga "Encontrei X obras" ou "Existem X obras" somente quando esse X representar o conjunto real retornado/contabilizado, nao um limite tecnico.\n` +
-    `Percentual_executado deve ser descrito como "X% executado" ou "execucao de X%". NUNCA escreva "X% concluido" se o status ainda for Em andamento.\n` +
+    `Se for lista grande, seja conciso e liste no maximo 20 itens, avisando se houver mais.\n` +
     `FORMATO WHATSAPP: NUNCA use tabela Markdown, pipes |, linhas --- ou cabecalho de tabela. Use lista simples com marcadores.\n` +
     `Nao finalize com frases mecanicas como "nao ha mais registros" ou "nao foram encontrados outros registros"; apenas responda o que foi pedido.\n` +
     `NUNCA mostre ID/identificador interno. NUNCA escreva o nome tecnico da coluna "objeto". Use diretamente o nome da obra/projeto/licitacao.\n` +
@@ -866,7 +779,7 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
 
   try {
     const resposta = await chamarIAbruta([{ role: "user", content: prompt }], {
-      max_tokens: 900,
+      max_tokens: 620,
       temperature: 0,
       reasoning_effort: "low",
     });
@@ -897,10 +810,7 @@ export async function responderPergunta(pergunta, historico = []) {
   const texto = textoSeguro(pergunta, 1600);
   if (!texto) return { resposta: "Pode enviar sua pergunta sobre as obras?", erro: "pergunta_vazia" };
 
-  const meta = respostaMetaSistema(texto);
-  if (meta) return { resposta: meta, social: true, modoAgente: "meta_sistema" };
-
-  const social = respostaSocial(texto, historico);
+  const social = respostaSocial(texto);
   if (social) return { resposta: social, social: true, modoAgente: "social" };
 
   try {
@@ -916,25 +826,12 @@ export async function responderPergunta(pergunta, historico = []) {
       return {
         resposta: "Não consegui transformar essa pergunta em uma consulta segura aos dados. Pode reformular?",
         erro: "sql_nao_gerada",
-        modoAgente: "sql_agent_self_healing_v10_ram30",
+        modoAgente: "sql_agent_self_healing_v8_ram30",
       };
     }
 
     // Refinamentos gerais de qualidade. Nao sao regras de uma frase especifica:
-    // evitam perda de recorte de negocio, respostas existenciais arbitrarias e
-    // agregados numericos sem composicao.
-    if (consultaPerdeuFiltroObrasEmAndamento(texto, gerada.query, ctx)) {
-      const refinada = await gerarSQL(
-        texto, historico, ctx,
-        "A consulta perdeu o recorte obrigatorio de OBRAS EM ANDAMENTO. Refaça preservando todos os filtros atuais e incluindo obrigatoriamente tipo_negocio='obra' AND em_andamento_obra=true. Nao consulte a view inteira e nao use LIMIT arbitrario para fingir o total."
-      );
-      if (refinada.query) gerada = refinada;
-    }
-
-    // Se o usuario pediu uma lista completa sem quantidade especifica, remove
-    // apenas um LIMIT final arbitrario. O limite de seguranca MAX_RESULTADOS
-    // continua sendo aplicado na execucao.
-    gerada.query = removerLimiteFinalArbitrario(texto, gerada.query);
+    // evitam respostas existenciais arbitrarias e agregados numericos sem composicao.
     if (existencialComLimitUm(texto, gerada.query)) {
       const refinada = await gerarSQL(
         texto, historico, ctx,
@@ -981,14 +878,14 @@ export async function responderPergunta(pergunta, historico = []) {
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
       tentativas: execucao.tentativas,
-      modoAgente: "sql_agent_self_healing_v10_ram30",
+      modoAgente: "sql_agent_self_healing_v8_ram30",
     };
   } catch (e) {
     console.error("SQL AGENT: falha final:", e);
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "sql_agent_self_healing_v10_ram30_erro",
+      modoAgente: "sql_agent_self_healing_v8_ram30_erro",
     };
   }
 }
