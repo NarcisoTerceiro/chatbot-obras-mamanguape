@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V12
+// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V13
 // ============================================================
 // Arquitetura baseada em duas referencias usadas no projeto:
 // 1) Conversational SQL Agent: schema/view + SQL dinamico + memoria de conversa.
@@ -45,14 +45,28 @@ function textoSeguro(s = "", max = 1200) {
     .slice(0, max);
 }
 
-function respostaSocial(pergunta = "") {
+function respostaSocial(pergunta = "", historico = []) {
   const p = normalizar(pergunta);
-  if (/^(oi|ola|opa|e ai|bom dia|boa tarde|boa noite)[!. ]*$/.test(p)) {
-    return "Olá! Pode me perguntar sobre obras, projetos, licitações, valores, responsáveis, recursos e andamento.";
+  const temConversaAtiva = Array.isArray(historico) && historico.some((m) =>
+    m && m.memoriaResumo !== true && textoSeguro(m.content || "", 120).length > 0
+  );
+
+  // Saudacoes curtas nunca devem virar SQL. Aceita variacoes naturais como
+  // "oi", "oii", "oiii", "oie", "olaa", alem de bom dia/tarde/noite.
+  if (/^(?:o+i+|oie+|ola+|opa+|e ai+|bom dia+|boa tarde+|boa noite+)[!.? ]*$/.test(p)) {
+    return temConversaAtiva
+      ? "Olá novamente! Como posso ajudar?"
+      : "Olá! Como posso ajudar? Pode me perguntar sobre obras, projetos, licitações, valores, responsáveis, recursos e andamento.";
   }
-  if (/^(obrigad[oa]|valeu|vlw|show|blz|beleza)[!. ]*$/.test(p)) {
-    return "Por nada! Pode mandar outra pergunta sobre os dados.";
+
+  if (/^(?:muito )?(?:obrigad[oa]|obg|obgd|valeu|vlw|show|blz|beleza|agradecido)[!.? ]*$/.test(p)) {
+    return "Por nada! Se precisar de mais alguma informação, é só chamar.";
   }
+
+  if (/^(?:tchau|ate mais|até mais|falou|era so isso|era só isso|por hoje e so|por hoje é só)[!.? ]*$/.test(p)) {
+    return "Até mais! Quando precisar, pode chamar.";
+  }
+
   return null;
 }
 
@@ -439,6 +453,7 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `- Para 'valor total investido' de um conjunto, some valor_total, salvo quando o usuario pedir explicitamente valor executado/pago.\n` +
     `- Para 'quanto falta', use valor_total - valor_executado quando essas colunas existirem.\n` +
     `- 'status de X' pede o campo status do alvo X; nao transforme a palavra status em filtro.\n` +
+    `- LICITACOES E ETAPA REAL: ao listar/detalhar licitacoes ou responder sobre seu status, se a coluna status_original existir selecione status_original junto de status. status_original representa a etapa especifica cadastrada (ex.: Habilitacao em andamento, Edital publicado) e deve ser preferida na resposta ao rotulo generico 'Em licitacao'.\n` +
     `- Nao invente valores de status, nomes, bairros, engenheiros ou empresas; use os valores reais do schema/contexto.\n` +
     `- LIGACAO SEMANTICA: quando o usuario pedir uma CLASSE ou CONCEITO amplo (sigla, tipo de equipamento, servico ou categoria), nao filtre apenas a palavra literal. Considere abreviacoes, forma por extenso e sinonimos realmente equivalentes em portugues e compare com o CATALOGO DE OBJETOS REAIS. Use OR com ILIKE apenas para equivalencias semanticamente justificadas.\n` +
     `- Para alvo proprio/especifico (nome de bairro, rua, equipamento com nome proprio), seja conservador: nao expanda para conceitos diferentes.\n` +
@@ -728,6 +743,9 @@ function limparRespostaParaWhatsApp(texto = "") {
   }
 
   t = saida.join("\n")
+    // percentual_executado mede execucao, nao conclusao. Corrige uma
+    // formulacao enganosa caso o redator use "X% concluido".
+    .replace(/(\d+(?:[.,]\d+)?\s*%)\s*(?:conclu[ií]do|de conclus[aã]o)/gi, "$1 executado")
     // Evita a frase mecanica herdada do estilo antigo.
     .replace(/\n?\*?\s*(?:não há mais registros|nao ha mais registros|não foram encontrados outros registros|nao foram encontrados outros registros)[^\n.!?]*[.!?]?\s*\*?/gi, "")
     .replace(/\n{3,}/g, "\n\n")
@@ -740,6 +758,7 @@ function rotuloHumano(campo = "") {
   const mapa = {
     bairro: "Bairro",
     status: "Status",
+    status_original: "Etapa/status atual",
     categoria: "Categoria",
     engenheiro: "Engenheiro",
     empresa: "Empresa",
@@ -836,6 +855,8 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
     `NUNCA mostre ID/identificador interno. NUNCA escreva o nome tecnico da coluna "objeto". Use diretamente o nome da obra/projeto/licitacao.\n` +
     `Exemplo correto: "1. Reforma e ampliacao da UBS do Cristo Rei — Recurso: FEDERAL". Exemplo proibido: "1. id: 3 — objeto: Reforma...".\n` +
     `Diferencie obra, projeto e licitacao conforme os campos da view/tabela.\n` +
+    `PERCENTUAL: percentual_executado e percentual de EXECUCAO. Escreva sempre 'X% executado' ou 'X% de execucao'. NUNCA escreva 'X% concluido' para uma obra que ainda esta em andamento.\n` +
+    `LICITACAO: se status_original vier no resultado, use-o como etapa/status especifico da licitacao (ex.: 'Habilitacao em andamento', 'Edital publicado'). Nao esconda essa etapa atras do rotulo generico 'Em licitacao'.\n` +
     `Recurso e tipo_recurso sao campos diferentes; nao troque um pelo outro.\n` +
     `Nao mostre SQL ao usuario na resposta natural.\n\n` +
     `PERGUNTA: ${JSON.stringify(pergunta)}\n` +
@@ -878,7 +899,7 @@ export async function responderPergunta(pergunta, historico = []) {
   const texto = textoSeguro(pergunta, 1600);
   if (!texto) return { resposta: "Pode enviar sua pergunta sobre as obras?", erro: "pergunta_vazia" };
 
-  const social = respostaSocial(texto);
+  const social = respostaSocial(texto, historico);
   if (social) return { resposta: social, social: true, modoAgente: "social" };
 
   try {
@@ -894,7 +915,7 @@ export async function responderPergunta(pergunta, historico = []) {
       return {
         resposta: "Não consegui transformar essa pergunta em uma consulta segura aos dados. Pode reformular?",
         erro: "sql_nao_gerada",
-        modoAgente: "sql_agent_self_healing_v12_ram30",
+        modoAgente: "sql_agent_self_healing_v13_ram30",
       };
     }
 
@@ -959,14 +980,14 @@ export async function responderPergunta(pergunta, historico = []) {
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
       tentativas: execucao.tentativas,
-      modoAgente: "sql_agent_self_healing_v12_ram30",
+      modoAgente: "sql_agent_self_healing_v13_ram30",
     };
   } catch (e) {
     console.error("SQL AGENT: falha final:", e);
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "sql_agent_self_healing_v12_ram30_erro",
+      modoAgente: "sql_agent_self_healing_v13_ram30_erro",
     };
   }
 }
