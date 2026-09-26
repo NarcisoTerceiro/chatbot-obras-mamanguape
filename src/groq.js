@@ -643,7 +643,10 @@ export async function calcularComCodeExecution(pergunta, obras) {
 
   const resp = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": GEMINI_KEY_CE,
+    },
     body: JSON.stringify(body),
   });
 
