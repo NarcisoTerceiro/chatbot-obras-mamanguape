@@ -70,6 +70,22 @@ function respostaSocial(pergunta = "", historico = []) {
   return null;
 }
 
+// Perguntas genericas sobre "licitacoes nao analisadas" sao ambiguas na base:
+// existem campos separados para PROPOSTA ANALISADA e HABILITACAO ANALISADA.
+// Nesses casos, o sistema pede a dimensao correta ANTES de deixar a IA gerar SQL.
+function respostaAmbiguidadeAnaliseLicitacao(pergunta = "") {
+  const p = normalizar(pergunta);
+  const falaDeLicitacao = /\blicita(?:cao|coes)\b/.test(p);
+  const falaDeNaoAnalisada = /\bnao\b[\s\S]{0,40}\banalisad/.test(p) || /\banalisad[\s\S]{0,40}\bnao\b/.test(p);
+  const especificouProposta = /\bpropost/.test(p);
+  const especificouHabilitacao = /\bhabilit/.test(p);
+
+  if (falaDeLicitacao && falaDeNaoAnalisada && !especificouProposta && !especificouHabilitacao) {
+    return "Você quer as propostas não analisadas ou as habilitações não analisadas?";
+  }
+  return null;
+}
+
 function jsonSeguro(valor, max = 12_000) {
   try {
     const t = JSON.stringify(valor, (_k, v) => {
@@ -447,6 +463,8 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `- Para 'quais engenheiros dessas obras?', se o usuario quer apenas a lista de nomes, SELECT DISTINCT engenheiro e valido; se ele pedir quem e responsavel por cada obra, retorne objeto + engenheiro.\n` +
     `- FOLLOW-UP DE CAMPO SOBRE UM CONJUNTO: quando o usuario perguntar 'quais os recursos?', 'quais os status?', 'quais os engenheiros?', 'quais os contratos?' etc. sobre varios registros ja em contexto, prefira UMA LINHA POR REGISTRO com objeto + campo pedido. So use DISTINCT campo sozinho quando ele pedir explicitamente valores unicos/diferentes ou apenas os nomes sem associar a cada registro.\n` +
     `- RECURSOS: quando a pergunta envolver recurso de obras/projetos/licitacoes e as colunas existirem, retorne objeto, recurso e tipo_recurso. Esses campos tem significados diferentes e a resposta deve manter a associacao de cada registro.\n` +
+    `- ANALISE DE LICITACAO: "proposta analisada/nao analisada" refere-se EXCLUSIVAMENTE a chave dados_extras->>'PROPOSTA ANALISADA'. "habilitacao analisada/nao analisada" refere-se EXCLUSIVAMENTE a dados_extras->>'HABILITAÇÃO ANALISADA' (ou a chave real equivalente exibida no schema). NUNCA deduza esses conceitos por status ou status_original.\n` +
+    `- Para valor Sim/Nao desses campos de analise, compare o valor da chave diretamente (aceitando variacao de acento/caixa quando necessario). Nao use status_original NOT ILIKE '%analis%' como substituto.\n` +
     `- CAMPO LIVRE/JSONB: se o usuario pedir um campo especifico que NAO exista como coluna canonica, procure o nome correspondente nas CHAVES REAIS DE dados_extras. Quando houver correspondencia clara, leia a chave exata com dados_extras->>'CHAVE' e use um alias legivel.\n` +
     `- NUNCA substitua um campo pedido por outro apenas porque o nome parece parecido. Uma data especifica, etapa, numero, observacao ou indicador pode viver em dados_extras e NAO significa automaticamente data_inicio, data_prev_termino ou outro campo canonico.\n` +
     `- Se houver coluna canonica E chave JSON com sentidos diferentes, preserve a semantica pedida pelo usuario e escolha a fonte que corresponde ao nome/conceito solicitado.\n` +
@@ -847,6 +865,7 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
     `Quando a pergunta for um follow-up e nenhum registro do RECORTE ATUAL atender ao novo criterio, diga isso explicitamente (ex.: "Nos 4 projetos concluidos, nenhum possui valor total cadastrado"). Nao troque silenciosamente para a base inteira.\n` +
     `Quando houver varios registros e a pergunta pedir um campo (recurso, status, engenheiro, empresa, contrato, valor etc.), associe o campo a CADA nome retornado. Ex.: "• Reforma da UBS do Cristo Rei — Recurso: FEDERAL — Tipo de recurso: Recurso Proprio".\n` +
     `Para recurso, se recurso e tipo_recurso vierem no resultado, explique os dois separadamente. Nunca transforme tipo_recurso em recurso nem o contrario.\n` +
+    `Para licitacoes, NUNCA diga que proposta ou habilitacao foi/nao foi analisada apenas com base em status/status_original (como "Em analise de propostas"). So faca essa afirmacao quando o resultado trouxer explicitamente o campo de proposta/habilitacao analisada.\n` +
     `Quando a consulta retornar um campo vindo de dados_extras com alias legivel, responda usando o significado desse campo; nao renomeie para outro conceito parecido.\n` +
     `Se houver exatamente 2 ou mais itens, pode abrir com "Encontrei X registros nesse recorte" ou equivalente, desde que seja natural e util.\n` +
     `Se for lista grande, seja conciso e liste no maximo 20 itens, avisando se houver mais.\n` +
@@ -901,6 +920,15 @@ export async function responderPergunta(pergunta, historico = []) {
 
   const social = respostaSocial(texto, historico);
   if (social) return { resposta: social, social: true, modoAgente: "social" };
+
+  const ambiguidadeAnalise = respostaAmbiguidadeAnaliseLicitacao(texto);
+  if (ambiguidadeAnalise) {
+    return {
+      resposta: ambiguidadeAnalise,
+      social: false,
+      modoAgente: "clarificacao_analise_licitacao",
+    };
+  }
 
   try {
     const ctx = await carregarSchemaContexto();
