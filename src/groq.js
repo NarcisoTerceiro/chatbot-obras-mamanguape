@@ -62,7 +62,7 @@ const OPERACOES_VALIDAS = new Set([
 const provedorDescansando = new Map();
 const DESCANSO_PADRAO_MS = 15 * 1000;
 const TIMEOUT_IA_MS = 18 * 1000;
-const MAX_SAIDA_GLOBAL = 700;
+const MAX_SAIDA_GLOBAL = 1000;
 // Em 429, tenta outro modelo/provedor primeiro. Se todos estiverem limitados,
 // pode aguardar uma unica janela curta indicada pelo Retry-After e tentar de novo.
 const MAX_ESPERA_429_MS = Math.max(0, Math.min(Number(process.env.IA_MAX_ESPERA_429_MS || 14000), 30000));

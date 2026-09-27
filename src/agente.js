@@ -868,7 +868,7 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
 
   try {
     const resposta = await chamarIAbruta([{ role: "user", content: prompt }], {
-      max_tokens: 620,
+      max_tokens: 1000,
       temperature: 0,
       reasoning_effort: "low",
     });
