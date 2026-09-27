@@ -86,6 +86,56 @@ function respostaAmbiguidadeAnaliseLicitacao(pergunta = "") {
   return null;
 }
 
+
+// Estes dois campos pertencem ao universo de LICITACOES, nao ao de obras.
+// Para evitar que a IA escolha tipo_negocio='obra' por engano, o Node monta
+// diretamente a consulta quando a pergunta cita explicitamente proposta ou
+// habilitacao + analisada/nao analisada.
+//
+// Isso nao substitui o agente SQL geral. E apenas um mapeamento semantico de
+// campos reais da planilha para garantir que a pergunta use a categoria certa.
+function sqlAnaliseLicitacao(pergunta = "", ctx = null) {
+  const p = normalizar(pergunta);
+  const falaDeAnalise = /\banalisad/.test(p);
+  if (!falaDeAnalise) return null;
+
+  const proposta = /\bpropost/.test(p);
+  const habilitacao = /\bhabilit/.test(p);
+  if (!proposta && !habilitacao) return null;
+
+  const querNao =
+    /\bnao\b[\s\S]{0,40}\banalisad/.test(p) ||
+    /\banalisad[\s\S]{0,40}\bnao\b/.test(p);
+
+  const chave = proposta ? "PROPOSTA ANALISADA" : "HABILITAÇÃO ANALISADA";
+  const alias = proposta ? "proposta_analisada" : "habilitacao_analisada";
+  const relacao = ctx?.relacao || "obras_chatbot";
+
+  // A planilha usa Sim/Nao. Aceitamos "Não" e "Nao" para tolerar eventual
+  // normalizacao futura dos dados.
+  const condicao = querNao
+    ? `LOWER(BTRIM(COALESCE(dados_extras->>'${chave}', ''))) IN ('não','nao')`
+    : `LOWER(BTRIM(COALESCE(dados_extras->>'${chave}', ''))) = 'sim'`;
+
+  return `
+    SELECT
+      id,
+      objeto,
+      tipo_negocio,
+      status,
+      status_original,
+      engenheiro,
+      recurso,
+      tipo_recurso,
+      dados_extras->>'${chave}' AS ${alias},
+      COUNT(*) OVER()::int AS total_registros
+    FROM public.${relacao}
+    WHERE tipo_negocio = 'licitacao'
+      AND ${condicao}
+    ORDER BY objeto
+  `.trim();
+}
+
 function jsonSeguro(valor, max = 12_000) {
   try {
     const t = JSON.stringify(valor, (_k, v) => {
@@ -463,7 +513,7 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `- Para 'quais engenheiros dessas obras?', se o usuario quer apenas a lista de nomes, SELECT DISTINCT engenheiro e valido; se ele pedir quem e responsavel por cada obra, retorne objeto + engenheiro.\n` +
     `- FOLLOW-UP DE CAMPO SOBRE UM CONJUNTO: quando o usuario perguntar 'quais os recursos?', 'quais os status?', 'quais os engenheiros?', 'quais os contratos?' etc. sobre varios registros ja em contexto, prefira UMA LINHA POR REGISTRO com objeto + campo pedido. So use DISTINCT campo sozinho quando ele pedir explicitamente valores unicos/diferentes ou apenas os nomes sem associar a cada registro.\n` +
     `- RECURSOS: quando a pergunta envolver recurso de obras/projetos/licitacoes e as colunas existirem, retorne objeto, recurso e tipo_recurso. Esses campos tem significados diferentes e a resposta deve manter a associacao de cada registro.\n` +
-    `- ANALISE DE LICITACAO: "proposta analisada/nao analisada" refere-se EXCLUSIVAMENTE a chave dados_extras->>'PROPOSTA ANALISADA'. "habilitacao analisada/nao analisada" refere-se EXCLUSIVAMENTE a dados_extras->>'HABILITAÇÃO ANALISADA' (ou a chave real equivalente exibida no schema). NUNCA deduza esses conceitos por status ou status_original.\n` +
+    `- ANALISE DE LICITACAO: "proposta analisada/nao analisada" refere-se EXCLUSIVAMENTE a chave dados_extras->>'PROPOSTA ANALISADA'. "habilitacao analisada/nao analisada" refere-se EXCLUSIVAMENTE a dados_extras->>'HABILITAÇÃO ANALISADA' (ou a chave real equivalente exibida no schema). Esses campos pertencem SEMPRE a tipo_negocio='licitacao'; NUNCA use tipo_negocio='obra' ou 'projeto' para perguntas de proposta/habilitacao analisada. NUNCA deduza esses conceitos por status ou status_original.\n` +
     `- Para valor Sim/Nao desses campos de analise, compare o valor da chave diretamente (aceitando variacao de acento/caixa quando necessario). Nao use status_original NOT ILIKE '%analis%' como substituto.\n` +
     `- CAMPO LIVRE/JSONB: se o usuario pedir um campo especifico que NAO exista como coluna canonica, procure o nome correspondente nas CHAVES REAIS DE dados_extras. Quando houver correspondencia clara, leia a chave exata com dados_extras->>'CHAVE' e use um alias legivel.\n` +
     `- NUNCA substitua um campo pedido por outro apenas porque o nome parece parecido. Uma data especifica, etapa, numero, observacao ou indicador pode viver em dados_extras e NAO significa automaticamente data_inicio, data_prev_termino ou outro campo canonico.\n` +
@@ -873,7 +923,7 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
     `Nao finalize com frases mecanicas como "nao ha mais registros" ou "nao foram encontrados outros registros"; apenas responda o que foi pedido.\n` +
     `NUNCA mostre ID/identificador interno. NUNCA escreva o nome tecnico da coluna "objeto". Use diretamente o nome da obra/projeto/licitacao.\n` +
     `Exemplo correto: "1. Reforma e ampliacao da UBS do Cristo Rei — Recurso: FEDERAL". Exemplo proibido: "1. id: 3 — objeto: Reforma...".\n` +
-    `Diferencie obra, projeto e licitacao conforme os campos da view/tabela.\n` +
+    `Diferencie obra, projeto e licitacao conforme os campos da view/tabela. Se tipo_negocio='licitacao', chame os registros de licitacoes, nunca de obras.\n` +
     `PERCENTUAL: percentual_executado e percentual de EXECUCAO. Escreva sempre 'X% executado' ou 'X% de execucao'. NUNCA escreva 'X% concluido' para uma obra que ainda esta em andamento.\n` +
     `LICITACAO: se status_original vier no resultado, use-o como etapa/status especifico da licitacao (ex.: 'Habilitacao em andamento', 'Edital publicado'). Nao esconda essa etapa atras do rotulo generico 'Em licitacao'.\n` +
     `Recurso e tipo_recurso sao campos diferentes; nao troque um pelo outro.\n` +
@@ -933,8 +983,14 @@ export async function responderPergunta(pergunta, historico = []) {
   try {
     const ctx = await carregarSchemaContexto();
 
-    // Estagio 1: gera SQL com schema real + memoria.
-    let gerada = await gerarSQL(texto, historico, ctx);
+    // Estagio 1: para campos de ANALISE DE LICITACAO, o Node garante o
+    // universo correto (tipo_negocio='licitacao'). Para todo o resto, o fluxo
+    // continua exatamente igual e a IA gera a SQL.
+    const sqlAnaliseDireta = sqlAnaliseLicitacao(texto, ctx);
+    let gerada = sqlAnaliseDireta
+      ? { query: sqlAnaliseDireta, descricao: "consulta segura de análise de licitação" }
+      : await gerarSQL(texto, historico, ctx);
+
     if (!gerada.query) {
       // Uma segunda tentativa curta so para formato/interpretacao, sem criar regra de frase.
       gerada = await gerarSQL(texto, historico, ctx, "A tentativa anterior nao produziu SQL. Gere uma consulta SELECT valida usando apenas o schema fornecido.");
