@@ -3,9 +3,9 @@
 //  Le a planilha configurada em GOOGLE_SHEETS_ID usando uma
 //  Conta de Servico (Service Account) so de leitura.
 //
-//  MODO AUTOMATICO: por padrao, o bot detecta sozinho todas as
-//  abas da planilha. Para limitar, defina SHEETS_TABS no .env
-//  (nomes separados por virgula).
+//  MODO AUTOMATICO: por padrao, o bot detecta sozinho TODAS as
+//  abas da planilha, inclusive abas novas criadas depois.
+//  Para limitar manualmente, defina SHEETS_TABS no .env.
 //
 //  LEITURA ROBUSTA (importante):
 //  - O cabecalho NAO e necessariamente a primeira linha. Muitas
@@ -105,6 +105,15 @@ const PALAVRAS_CABECALHO = [
   "objeto", "obra", "rua", "situacao", "status", "contrato", "empresa",
   "recurso", "engenheiro", "arquiteto", "valor", "bairro", "endereco",
   "fonte", "convenio", "proposta", "data", "prazo", "aditivo", "logradouro",
+  "pendencia", "descricao", "item", "assunto", "pagamento", "reajuste",
+  "contrapartida", "medicao",
+];
+
+// Algumas abas auxiliares são tabelas de UMA coluna. Só aceitamos uma linha
+// de uma célula como cabeçalho quando ela tiver um destes termos específicos,
+// evitando confundir títulos grandes (ex.: "VALORES DE RECURSOS...") com header.
+const PALAVRAS_CABECALHO_UMA_COLUNA = [
+  "pendencia", "descricao", "item", "assunto", "observacao"
 ];
 
 function normaliza(s) {
@@ -128,10 +137,19 @@ export function acharLinhaCabecalho(rows, maxLinhasAnalisadas = 15) {
   if (!rows || rows.length === 0) return -1;
   const limite = Math.min(rows.length, maxLinhasAnalisadas);
 
-  // Etapa 1: primeira linha com >= 2 celulas E palavra tipica de cabecalho.
+  // Etapa 1: primeira linha que realmente parece cabeçalho.
+  // Normalmente exigimos >= 2 células. Para abas auxiliares de uma coluna
+  // (como PENDÊNCIAS), aceitamos 1 célula somente com termos específicos.
   for (let i = 0; i < limite; i++) {
-    if (contarPreenchidas(rows[i]) >= 2 && pareceCabecalho(rows[i])) {
+    const preenchidas = contarPreenchidas(rows[i]);
+    if (preenchidas >= 2 && pareceCabecalho(rows[i])) {
       return i;
+    }
+
+    if (preenchidas === 1) {
+      const texto = normaliza((rows[i] || []).join(" "));
+      const ehHeaderUmaColuna = PALAVRAS_CABECALHO_UMA_COLUNA.some((p) => texto.includes(p));
+      if (ehHeaderUmaColuna) return i;
     }
   }
 
@@ -153,7 +171,20 @@ export function rowsToObjects(rows, tabName) {
   const idxCabecalho = acharLinhaCabecalho(rows);
   if (idxCabecalho < 0) return { obras: [], cabecalho: [], ignoradas: 0 };
 
-  const header = (rows[idxCabecalho] || []).map((h) => (h || "").toString().trim());
+  const headerBruto = (rows[idxCabecalho] || []).map((h) => (h || "").toString().trim());
+
+  // Não perde colunas só porque o cabeçalho está vazio ou repetido.
+  // Ex.: ["CONTRATO","OBRA","VALORES","","REAJUSTES","CONTRATO"]
+  // vira ["CONTRATO","OBRA","VALORES","COLUNA 4","REAJUSTES","CONTRATO [2]"].
+  const usados = new Map();
+  const header = headerBruto.map((h, idx) => {
+    const base = h || `COLUNA ${idx + 1}`;
+    const chave = normaliza(base);
+    const qtd = (usados.get(chave) || 0) + 1;
+    usados.set(chave, qtd);
+    return qtd === 1 ? base : `${base} [${qtd}]`;
+  });
+
   const obras = [];
   let ignoradas = 0;
 
@@ -170,7 +201,6 @@ export function rowsToObjects(rows, tabName) {
     const obj = { _aba: tabName };
     let campos = 0;
     header.forEach((col, j) => {
-      if (!col) return;
       const valor = (row[j] || "").toString().trim();
       if (valor) {
         obj[col] = valor;
@@ -187,7 +217,7 @@ export function rowsToObjects(rows, tabName) {
     obras.push(obj);
   }
 
-  return { obras, cabecalho: header.filter(Boolean), ignoradas };
+  return { obras, cabecalho: header, ignoradas };
 }
 
 // Retorna TODAS as obras de TODAS as abas.

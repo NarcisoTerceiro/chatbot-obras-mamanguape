@@ -3,8 +3,8 @@
 //  Le a planilha (via sheets.js / conta de servico), LIMPA e
 //  padroniza os dados, e popula a tabela "obras" no Supabase.
 //
-//  FLEXIVEL: acha as colunas pelo NOME (nao pela posicao), entao
-//  aguenta a planilha mudar de estrutura ou ganhar abas novas.
+//  FLEXIVEL: acha as colunas pelo NOME e aceita abas auxiliares/genéricas.
+//  Linhas de abas novas são preservadas no banco sem exigir código novo.
 //
 //  Estrategia de atualizacao: substitui tudo (TRUNCATE + INSERT).
 //  Assim o banco fica sempre IGUAL a planilha - simples e seguro.
@@ -27,7 +27,12 @@ function norm(s) {
 // Cada campo do banco -> nomes possiveis na planilha (sinonimos).
 // Para suportar uma planilha nova, e so acrescentar nomes aqui.
 const MAPA = {
-  objeto: ["objeto da obra", "objeto", "obra", "rua", "descricao", "nome da obra"],
+  objeto: [
+    "objeto da obra", "objeto", "obra", "rua", "descricao", "descrição",
+    "nome da obra", "nome", "item", "assunto", "pendencia", "pendência",
+    "pendencias para inicio/continuidade de obra",
+    "pendências para início/continuidade de obra"
+  ],
   bairro: ["bairro", "localizacao", "local", "distrito"],
   status: ["status", "situacao", "situacao atual", "fase"],
   valor_total: ["valor total da obra", "valor (r$)", "valor", "valor da obra", "valor contratado"],
@@ -91,7 +96,31 @@ function categoriaDaAba(aba) {
   if (n.includes("projeto")) return "Em projeto";
   if (n.includes("paviment")) return "Pavimentação";
   if (n.includes("pendenc")) return "Pendência";
-  return (aba || "").toString().trim();
+  // Qualquer aba nova continua identificável no banco pelo próprio nome.
+  return (aba || "").toString().trim() || "Outro";
+}
+
+// Em abas auxiliares pode não existir OBJETO/OBRA/RUA.
+// Nesse caso escolhemos um valor textual representativo sem descartar a linha.
+// A linha inteira continua preservada em dados_extras.
+function objetoGenericoDaLinha(obra) {
+  if (!obra || typeof obra !== "object") return null;
+
+  const preferidas = [
+    "obra", "objeto", "descricao", "descrição", "nome", "item", "assunto",
+    "pendencia", "pendência", "contrato", "titulo", "título"
+  ];
+
+  const entradas = Object.entries(obra)
+    .filter(([k, v]) => k !== "_aba" && v !== null && v !== undefined && String(v).trim() !== "");
+
+  for (const termo of preferidas) {
+    const achou = entradas.find(([k]) => norm(k).includes(norm(termo)));
+    if (achou) return String(achou[1]).trim();
+  }
+
+  // Último recurso: primeiro valor realmente preenchido da linha.
+  return entradas.length ? String(entradas[0][1]).trim() : null;
 }
 
 // Tenta extrair o bairro do NOME da obra quando a coluna bairro esta vazia.
@@ -123,21 +152,40 @@ for (const campo of Object.keys(MAPA)) {
 // aditivos, prazo, datas - tudo que a planilha tiver e nao for campo fixo entra
 // aqui, com o nome original da coluna. Se a planilha ganhar coluna nova amanha,
 // ela entra sozinha, sem mexer no codigo.
+function ehAbaCanonica(aba) {
+  const n = norm(aba);
+  return n === "em_andamento" ||
+         n === "em_licitacao" ||
+         n === "em_projeto" ||
+         n === "pavimentacao";
+}
+
 function coletarExtras(obra) {
   const extras = {};
-  for (const chave of Object.keys(obra)) {
-    if (chave === "_aba") continue;              // controle interno, ignora
-    if (NOMES_FIXOS_USADOS.has(norm(chave))) continue; // ja virou campo fixo
-    const valor = (obra[chave] || "").toString().trim();
-    if (valor) extras[chave.trim()] = valor;     // guarda com o nome original
+  const preservarTudo = !ehAbaCanonica(obra?._aba);
+
+  for (const chave of Object.keys(obra || {})) {
+    if (chave === "_aba") continue; // controle interno, ignora
+
+    // Nas 4 abas principais evitamos duplicar campos que já viraram colunas
+    // canônicas. Em abas auxiliares/nova, preservamos tudo para não perder dado.
+    if (!preservarTudo && NOMES_FIXOS_USADOS.has(norm(chave))) continue;
+
+    const bruto = obra[chave];
+    const valor = bruto === null || bruto === undefined ? "" : bruto.toString().trim();
+    if (valor) extras[chave.trim()] = valor;
   }
+
+  if (obra?._aba) extras["ABA ORIGEM"] = obra._aba;
   return Object.keys(extras).length ? extras : null;
 }
 
 // Transforma uma obra crua (da planilha) numa linha limpa pro banco.
 function limpar(obra) {
-  const objeto = pegar(obra, "objeto");
-  if (!objeto) return null; // sem nome, ignora
+  // Abas tradicionais usam OBJETO/OBRA/RUA. Abas auxiliares ou futuras
+  // podem ter outros cabeçalhos; não descartamos mais a linha só por isso.
+  const objeto = pegar(obra, "objeto") || objetoGenericoDaLinha(obra);
+  if (!objeto) return null; // só ignora linha realmente sem conteúdo útil
   const categoria = categoriaDaAba(obra._aba);
   const statusOriginal = (pegar(obra, "status") || "").toString().trim();
   const statusNormalizado = padronizarStatus(statusOriginal) || categoria;
