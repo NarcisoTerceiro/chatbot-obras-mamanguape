@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V13
+// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V13.1
 // ============================================================
 // Arquitetura baseada em duas referencias usadas no projeto:
 // 1) Conversational SQL Agent: schema/view + SQL dinamico + memoria de conversa.
@@ -166,17 +166,128 @@ function resumoHistorico(historico = []) {
   }).join("\n\n");
 }
 
-function ancoraContextoRecente(historico = []) {
-  if (!Array.isArray(historico) || !historico.length) return "(sem recorte anterior)";
+function ultimaConsultaConfirmada(historico = []) {
+  if (!Array.isArray(historico) || !historico.length) return "";
   for (let i = historico.length - 1; i >= 0; i--) {
     const m = historico[i];
-    if (m?.role !== "assistant" || !m?.sql) continue;
-    const sql = textoSeguro(m.sql, 1800);
-    if (!sql) continue;
-    return `ULTIMA CONSULTA/RECORTE CONFIRMADO:\n${sql}\n` +
-      `REGRA DE CONTINUIDADE: se a pergunta atual NAO nomear claramente um novo universo, alvo ou filtro incompatível, preserve o mesmo recorte/filtros desta consulta. Pedir outro campo, valor, recurso, status, quantidade ou perguntar "quais" NAO reinicia o assunto.`;
+    if (m?.role !== "assistant") continue;
+    const sql = textoSeguro(m?.sql || m?.estado?.sql || "", 4000);
+    if (sql) return limparSQL(sql);
   }
-  return "(sem recorte anterior)";
+  return "";
+}
+
+function ancoraContextoRecente(historico = []) {
+  const sql = ultimaConsultaConfirmada(historico);
+  if (!sql) return "(sem recorte anterior)";
+  return `ULTIMA CONSULTA/RECORTE CONFIRMADO:\n${textoSeguro(sql, 1800)}\n` +
+    `REGRA DE CONTINUIDADE: se a pergunta atual NAO nomear claramente um novo universo, alvo ou filtro incompatível, preserve o mesmo recorte/filtros desta consulta. Pedir outro campo, valor, recurso, status, quantidade ou perguntar "quais" NAO reinicia o assunto.`;
+}
+
+// Follow-ups extremamente curtos, como "quais são?", dependem integralmente do
+// recorte anterior. Nesses casos nao deixamos a preservacao do WHERE apenas a
+// cargo da IA: o Node reaplica deterministicamente o WHERE da ultima consulta.
+function followUpSomenteReferencia(pergunta = "") {
+  const p = normalizar(pergunta);
+  return /^(?:e\s+)?(?:quais(?:\s+sao)?|quem(?:\s+sao)?|qual(?:\s+e)?)[?.! ]*$/.test(p);
+}
+
+function extrairWhereSimples(sql = "") {
+  const s = limparSQL(sql);
+  const m = s.match(/\bwhere\b\s+([\s\S]*?)(?=\bgroup\s+by\b|\border\s+by\b|\blimit\b|\boffset\b|$)/i);
+  return m?.[1]?.trim() || "";
+}
+
+function substituirWhereSimples(sql = "", novoWhere = "") {
+  const s = limparSQL(sql);
+  if (!s || !novoWhere) return s;
+
+  const rxWhere = /\bwhere\b\s+[\s\S]*?(?=\bgroup\s+by\b|\border\s+by\b|\blimit\b|\boffset\b|$)/i;
+  if (rxWhere.test(s)) return s.replace(rxWhere, `WHERE ${novoWhere} `).trim();
+
+  const pos = s.search(/\b(group\s+by|order\s+by|limit|offset)\b/i);
+  if (pos >= 0) return `${s.slice(0, pos).trim()} WHERE ${novoWhere} ${s.slice(pos).trim()}`.trim();
+  return `${s} WHERE ${novoWhere}`.trim();
+}
+
+function preservarRecorteFollowUp(pergunta = "", historico = [], sqlAtual = "") {
+  if (!followUpSomenteReferencia(pergunta)) return limparSQL(sqlAtual);
+
+  const sqlAnterior = ultimaConsultaConfirmada(historico);
+  if (!sqlAnterior) return limparSQL(sqlAtual);
+
+  const whereAnterior = extrairWhereSimples(sqlAnterior);
+  if (!whereAnterior) return limparSQL(sqlAtual);
+
+  // Mantem o SELECT/projecao que a IA escolheu para responder ao novo pedido,
+  // mas restaura o conjunto de registros confirmado no turno anterior.
+  return substituirWhereSimples(sqlAtual, whereAnterior);
+}
+
+function ultimaPerguntaUsuario(historico = []) {
+  if (!Array.isArray(historico)) return "";
+  for (let i = historico.length - 1; i >= 0; i--) {
+    const m = historico[i];
+    if (m?.role !== "user" || m?.memoriaResumo === true) continue;
+    const conteudo = textoSeguro(m?.content || "", 1200);
+    if (conteudo) return conteudo;
+  }
+  return "";
+}
+
+// Resolve apenas universos inequívocos pelas regras de negocio. Se o usuario
+// citar mais de um universo na mesma pergunta, deixa a IA montar a combinacao.
+function universoNegocioDaPergunta(pergunta = "") {
+  const p = normalizar(pergunta);
+  if (!p) return null;
+
+  const falaObra = /\bobras?\b/.test(p);
+  const falaProjeto = /\bprojetos?\b/.test(p);
+  const falaLicitacao = /\blicita(?:cao|coes)\b/.test(p);
+  const universosExplicitos = [falaObra, falaProjeto, falaLicitacao].filter(Boolean).length;
+
+  if (universosExplicitos > 1) return null;
+  if (falaLicitacao) return "licitacao";
+  if (falaProjeto) return "projeto";
+  if (falaObra) return "obra";
+
+  // Regra oficial do projeto: alvos fisicos, sem projeto/licitacao explicitos,
+  // pertencem ao universo de obras.
+  const alvoFisico = /\b(ubs|unidade basica de saude|posto de saude|psf|escola|creche|praca|mercado|campo|drenagem|quadra|pavimentacao|rua)\b/.test(p);
+  return alvoFisico ? "obra" : null;
+}
+
+function adicionarCondicaoWhere(sql = "", condicao = "") {
+  const s = limparSQL(sql);
+  if (!s || !condicao) return s;
+
+  const whereAtual = extrairWhereSimples(s);
+  if (whereAtual) return substituirWhereSimples(s, `(${condicao}) AND (${whereAtual})`);
+
+  const pos = s.search(/\b(group\s+by|order\s+by|limit|offset)\b/i);
+  if (pos >= 0) return `${s.slice(0, pos).trim()} WHERE ${condicao} ${s.slice(pos).trim()}`.trim();
+  return `${s} WHERE ${condicao}`.trim();
+}
+
+function garantirUniversoNegocio(pergunta = "", historico = [], sqlAtual = "") {
+  const perguntaBase = followUpSomenteReferencia(pergunta)
+    ? ultimaPerguntaUsuario(historico)
+    : pergunta;
+  const esperado = universoNegocioDaPergunta(perguntaBase);
+  let s = limparSQL(sqlAtual);
+  if (!esperado || !s) return s;
+
+  // Se ja existe um filtro simples tipo_negocio='...', corrige eventual universo
+  // errado. Consultas que usam IN/OR deliberadamente ficam intocadas.
+  const rxIgual = /((?:\b[a-zA-Z_][\w$]*\.)?tipo_negocio\s*=\s*)'([^']+)'/i;
+  const m = s.match(rxIgual);
+  if (m) {
+    if (normalizar(m[2]) === esperado) return s;
+    return s.replace(rxIgual, `$1'${esperado}'`);
+  }
+
+  if (/\btipo_negocio\b/i.test(s)) return s;
+  return adicionarCondicaoWhere(s, `tipo_negocio = '${esperado}'`);
 }
 
 
@@ -1040,6 +1151,23 @@ export async function responderPergunta(pergunta, historico = []) {
         "A consulta retornaria apenas um agregado seco. Preserve EXATAMENTE o mesmo recorte e refaça de forma explicavel: traga objeto + valor componente e o agregado por window function (SUM/AVG ... OVER()), para a resposta mostrar de onde saiu o total. Nao remova filtros anteriores."
       );
       if (refinada.query) gerada = refinada;
+    }
+
+    // Protecao de continuidade: em perguntas puramente referenciais (ex.:
+    // "quais sao?"), restaura o WHERE do ultimo recorte confirmado. Isso evita
+    // misturar obra/projeto/licitacao quando a IA simplifica demais a SQL.
+    const sqlComRecorte = preservarRecorteFollowUp(texto, historico, gerada.query);
+    if (sqlComRecorte && sqlComRecorte !== limparSQL(gerada.query)) {
+      console.log("SQL AGENT - RECORTE DE FOLLOW-UP PRESERVADO");
+      gerada = { ...gerada, query: sqlComRecorte };
+    }
+
+    // Guardrail semantico do universo: garante obra/projeto/licitacao quando a
+    // regra de negocio e inequívoca. Em "quais sao?", usa a pergunta anterior.
+    const sqlComUniverso = garantirUniversoNegocio(texto, historico, gerada.query);
+    if (sqlComUniverso && sqlComUniverso !== limparSQL(gerada.query)) {
+      console.log("SQL AGENT - UNIVERSO DE NEGOCIO CORRIGIDO");
+      gerada = { ...gerada, query: sqlComUniverso };
     }
 
     console.log("SQL AGENT - SQL INICIAL:", gerada.query);
