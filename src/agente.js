@@ -351,6 +351,16 @@ function existencialComAgregadoSeco(pergunta = "", sql = "") {
   return perguntaExistencial && conta && !trazNomes;
 }
 
+
+function contagemComAgregadoSeco(pergunta = "", sql = "") {
+  const p = normalizar(pergunta);
+  const s = String(sql || "");
+  const pedeContagem = /\b(quantos?|quantas?|quantidade|numero de|n[uú]mero de)\b/.test(p);
+  const conta = /\bcount\s*\(/i.test(s);
+  const trazNomes = /\bobjeto\b/i.test(s);
+  return pedeContagem && conta && !trazNomes;
+}
+
 function stripThink(texto = "") {
   return String(texto || "").replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 }
@@ -635,6 +645,7 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `- LICITACOES E ETAPA REAL: ao listar/detalhar licitacoes ou responder sobre seu status, se a coluna status_original existir selecione status_original junto de status. status_original representa a etapa especifica cadastrada (ex.: Habilitacao em andamento, Edital publicado) e deve ser preferida na resposta ao rotulo generico 'Em licitacao'.\n` +
     `- Nao invente valores de status, nomes, bairros, engenheiros ou empresas; use os valores reais do schema/contexto.\n` +
     `- LIGACAO SEMANTICA: quando o usuario pedir uma CLASSE ou CONCEITO amplo (sigla, tipo de equipamento, servico ou categoria), nao filtre apenas a palavra literal. Considere abreviacoes, forma por extenso e sinonimos realmente equivalentes em portugues e compare com o CATALOGO DE OBJETOS REAIS. Use OR com ILIKE apenas para equivalencias semanticamente justificadas.\n` +
+    `- AREA DA SAUDE: considere apenas equipamentos/servicos claramente de saude, como UBS/unidade basica de saude, posto de saude, PSF, hospital, policlinica, unidade de saude e academia da saude quando existirem no catalogo real. CRECHE e ESCOLA pertencem a educacao e NAO devem entrar como saude apenas por inferencia. Nunca invente nomes de equipamentos para completar uma categoria.\n` +
     `- Para alvo proprio/especifico (nome de bairro, rua, equipamento com nome proprio), seja conservador: nao expanda para conceitos diferentes.\n` +
     `- Em busca ampla por assunto, voce pode procurar em objeto, categoria e dados_extras::text quando essas colunas existirem; mantenha o tipo_negocio correto.\n` +
     `- Se um termo livre puder ser nome parcial, use ILIKE/LOWER de forma tolerante.\n` +
@@ -1013,12 +1024,38 @@ function fallbackResposta(pergunta, rows = []) {
   return `${linhas.join("\n")}${rows.length > exibidas.length ? `\n… e mais ${rows.length - exibidas.length}.` : ""}`;
 }
 
+function respostaContagemDiretaSegura(pergunta = "", rows = []) {
+  if (!Array.isArray(rows) || rows.length !== 1) return null;
+  const r = rows[0] || {};
+  if (r.objeto) return null;
+
+  const candidatos = Object.entries(r).filter(([k, v]) =>
+    /(?:^count$|count_|_count$|^total|total_|quantidade|qtd)/i.test(k) &&
+    v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v))
+  );
+  if (candidatos.length !== 1) return null;
+
+  const n = Number(candidatos[0][1]);
+  const p = normalizar(pergunta);
+  if (/\bobras?\b/.test(p)) return n === 1 ? "Há 1 obra que corresponde a esses critérios." : `Há ${n} obras que correspondem a esses critérios.`;
+  if (/\bprojetos?\b/.test(p)) return n === 1 ? "Há 1 projeto que corresponde a esses critérios." : `Há ${n} projetos que correspondem a esses critérios.`;
+  if (/\blicita(?:cao|coes)\b/.test(p)) return n === 1 ? "Há 1 licitação que corresponde a esses critérios." : `Há ${n} licitações que correspondem a esses critérios.`;
+  return n === 1 ? "Encontrei 1 registro com esses critérios." : `Encontrei ${n} registros com esses critérios.`;
+}
+
 async function redigirResposta(pergunta, historico, sql, rows, ctx) {
+  // Se por qualquer motivo uma consulta de contagem ainda chegar apenas com o
+  // agregado, nao envia contexto insuficiente para a IA completar com nomes.
+  // Isso impede alucinacao de obras/valores que nao vieram do PostgreSQL.
+  const contagemSegura = respostaContagemDiretaSegura(pergunta, rows);
+  if (contagemSegura) return contagemSegura;
+
   const amostra = rows.slice(0, MAX_LINHAS_PARA_IA);
   const prompt = `Voce e o redator final de um chatbot de obras publicas no WhatsApp.\n` +
     `Responda APENAS com base nos dados retornados pela consulta. Nao invente, nao estime e nao corrija valores por memoria.\n` +
     `Se o resultado estiver vazio, diga claramente que nao encontrou registros com os criterios.\n` +
     `Se for contagem/soma/ranking, destaque o resultado de forma direta e depois mostre os dados que sustentam a resposta em linguagem comum. EXPLICAR significa mostrar nomes, valores, status, responsaveis ou outros detalhes uteis dos registros; NAO significa explicar como o banco foi consultado.\n` +
+    `REGRA ANTI-ALUCINACAO: so cite nome, bairro, empresa, valor, contrato, status ou qualquer detalhe se esse valor estiver explicitamente em DADOS RETORNADOS. Se os dados trouxerem apenas uma contagem agregada e nenhum objeto, responda somente a contagem; NUNCA complete com exemplos, nomes ou detalhes vindos do historico/schema.\n` +
     `NUNCA mencione SQL, consulta, SELECT, WHERE, view, tabela, coluna, filtro tecnico, booleano, tipo_negocio, concluido=true ou qualquer mecanismo interno. O usuario quer o RESULTADO e os registros encontrados, nao a forma tecnica de obtencao.\n` +
     `RESPOSTAS DEVEM SER EXPLICATIVAS, nao secas: comece com uma frase curta respondendo diretamente e depois mostre os detalhes que ajudam a entender o resultado. Nao escreva apenas uma lista de valores quando os dados permitem dizer a qual obra/projeto/licitacao cada valor pertence.\n` +
     `Em perguntas existenciais como "tem algum?", "existe algum?" ou "ha algum?", se houver poucos resultados, informe a quantidade E liste os nomes encontrados. Se vierem ate 20 registros, mostre todos. Nao responda apenas com a contagem quando os nomes estiverem disponiveis.\n` +
@@ -1141,6 +1178,14 @@ export async function responderPergunta(pergunta, historico = []) {
       const refinada = await gerarSQL(
         texto, historico, ctx,
         "A pergunta e existencial e a consulta retornaria apenas uma contagem. Preserve EXATAMENTE o mesmo recorte, mas traga tambem os registros encontrados para o usuario ver quais sao. Prefira objeto + status/tipo relevante + COUNT(*) OVER() AS total_encontrados. Se houver ate 20, liste todos; nao explique SQL nem filtros na resposta."
+      );
+      if (refinada.query) gerada = refinada;
+    }
+
+    if (contagemComAgregadoSeco(texto, gerada.query)) {
+      const refinada = await gerarSQL(
+        texto, historico, ctx,
+        "A pergunta pede uma contagem, mas a SQL retornaria apenas COUNT sem os registros que sustentam o total. Preserve EXATAMENTE o mesmo recorte e os mesmos criterios sem inventar categorias. Refaça trazendo objeto + campos uteis disponiveis + COUNT(*) OVER() AS total_encontrados. Para categorias amplas como area da saude, use somente equivalencias semanticamente corretas e objetos reais do catalogo; creche/escola nao sao saude."
       );
       if (refinada.query) gerada = refinada;
     }
