@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V13.1
+// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V13.5
 // ============================================================
 // Arquitetura baseada em duas referencias usadas no projeto:
 // 1) Conversational SQL Agent: schema/view + SQL dinamico + memoria de conversa.
@@ -12,10 +12,14 @@
 // - Mantem a mesma exportacao: responderPergunta(pergunta, historico).
 // - Usa db.js (queryReadOnly) e groq.js (chamarIAbruta) existentes.
 // - A IA pode gerar SQL, mas o Node valida e o PostgreSQL executa READ ONLY.
+// - Arquero valida/inspeciona o conjunto retornado e Decimal.js recalcula valores monetarios com precisao.
+// - Dependencias novas: npm install arquero decimal.js
 // ============================================================
 
 import { queryReadOnly } from "./db.js";
 import { chamarIAbruta } from "./groq.js";
+import * as aq from "arquero";
+import Decimal from "decimal.js";
 
 const MAX_REPAROS = Math.max(0, Math.min(Number(process.env.AGENTE_MAX_REPAROS || 2), 4));
 const MAX_RESULTADOS = Math.max(20, Math.min(Number(process.env.AGENTE_MAX_RESULTADOS || 200), 500));
@@ -43,6 +47,203 @@ function textoSeguro(s = "", max = 1200) {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, max);
+}
+
+
+// ------------------------------------------------------------
+// Camada local de analise/validacao (Arquero + Decimal.js)
+// ------------------------------------------------------------
+// O PostgreSQL continua sendo a fonte de verdade e fazendo os filtros pesados.
+// Esta camada confere o resultado retornado ANTES de a IA redigir a resposta.
+// Assim contagens nao sao confundidas com dinheiro e somas podem ser validadas
+// com aritmetica decimal exata, sem depender de ponto flutuante do JavaScript.
+function decimalSeguro(valor) {
+  if (valor === null || valor === undefined || valor === "") return null;
+  if (Decimal.isDecimal?.(valor)) return valor;
+
+  let s = String(valor).trim();
+  if (!s) return null;
+  s = s.replace(/\s+/g, "").replace(/^R\$/i, "");
+
+  const temVirgula = s.includes(",");
+  const temPonto = s.includes(".");
+  if (temVirgula && temPonto) {
+    if (s.lastIndexOf(",") > s.lastIndexOf(".")) {
+      // 1.234.567,89
+      s = s.replace(/\./g, "").replace(",", ".");
+    } else {
+      // 1,234,567.89
+      s = s.replace(/,/g, "");
+    }
+  } else if (temVirgula) {
+    // 1234,56
+    s = s.replace(",", ".");
+  }
+
+  s = s.replace(/[^0-9eE+\-.]/g, "");
+  if (!s || !/^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/.test(s)) return null;
+
+  try {
+    const d = new Decimal(s);
+    return d.isFinite() ? d : null;
+  } catch {
+    return null;
+  }
+}
+
+function formatarDecimalBR(valor, casas = 2, moeda = false) {
+  const d = decimalSeguro(valor);
+  if (!d) return null;
+  const fixo = d.toFixed(casas);
+  const negativo = fixo.startsWith("-");
+  const base = negativo ? fixo.slice(1) : fixo;
+  const [inteiro, frac = ""] = base.split(".");
+  const agrupado = inteiro.replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+  const numero = `${negativo ? "-" : ""}${agrupado}${casas > 0 ? `,${frac}` : ""}`;
+  return moeda ? `R$ ${numero}` : numero;
+}
+
+function campoPareceMonetario(campo = "") {
+  const k = normalizar(campo).replace(/\s+/g, "_");
+  return /(?:^|_)(valor|investimento|investido|gasto|gastos|custo|custos|saldo|preco|montante|reajuste|aditivo|contrapartida|pago|pagamento)(?:_|$)/.test(k) ||
+    /valor|invest|gasto|custo|saldo|preco|montante|reajuste|aditivo|contrapartida|pago/.test(k);
+}
+
+function campoPareceContagem(campo = "") {
+  const k = normalizar(campo).replace(/\s+/g, "_");
+  if (campoPareceMonetario(k) || /percent|media|taxa|indice/.test(k)) return false;
+
+  if (/^(?:count|contagem|quantidade|qtd|numero)(?:_|$)/.test(k)) return true;
+  if (/(?:^|_)(?:count|contagem|quantidade|qtd)(?:_|$)/.test(k)) return true;
+  return /^total_(?:obras?|projetos?|licitacoes?|registros?|encontrados?|itens?|contratos?|engenheiros?|responsaveis?|empresas?|bairros?)$/.test(k);
+}
+
+function limiteDaSQL(sql = "") {
+  const m = String(sql || "").match(/\blimit\s+(\d+)\b/i);
+  return m ? Number(m[1]) : null;
+}
+
+function aliasesAgregadosDaSQL(sql = "") {
+  const encontrados = [];
+  const rx = /\b(sum|avg)\s*\(\s*(?:[a-zA-Z_][\w$]*\.)?"?([a-zA-Z_][\w$]*)"?\s*\)\s*(over\s*\([^)]*\))?\s+as\s+"?([a-zA-Z_][\w$]*)"?/gi;
+  let m;
+  while ((m = rx.exec(String(sql || "")))) {
+    encontrados.push({ funcao: m[1].toLowerCase(), origem: m[2], janela: !!m[3], alias: m[4] });
+  }
+  return encontrados;
+}
+
+function analisarResultadoDados(pergunta = "", sql = "", rows = []) {
+  const lista = Array.isArray(rows) ? rows : [];
+  const tabela = aq.from(lista);
+  const linhas = tabela.numRows();
+  const colunas = tabela.columnNames();
+  const objetos = tabela.objects();
+
+  const analise = {
+    motor: "Arquero + Decimal.js",
+    linhas,
+    colunas,
+    conjunto_completo: null,
+    contagens: {},
+    agregados_validados: [],
+    avisos: [],
+  };
+
+  if (!linhas) return analise;
+
+  // Contagens retornadas pelo SQL (COUNT, total_encontrados etc.).
+  for (const coluna of colunas.filter(campoPareceContagem)) {
+    const vals = objetos.map((r) => decimalSeguro(r?.[coluna])).filter(Boolean);
+    const unicos = [...new Set(vals.map((d) => d.toString()))];
+    if (!unicos.length) continue;
+
+    analise.contagens[coluna] = unicos.length === 1 ? unicos[0] : unicos;
+    if (unicos.length > 1) {
+      analise.avisos.push(`A contagem ${coluna} veio com valores diferentes entre as linhas.`);
+      continue;
+    }
+
+    const total = new Decimal(unicos[0]);
+    if (total.lt(linhas)) {
+      analise.avisos.push(`A contagem ${coluna} (${total.toString()}) e menor que as ${linhas} linhas retornadas.`);
+    }
+    if (/total_encontrados|total_registros|total_obras|total_projetos|total_licitacoes/i.test(coluna)) {
+      analise.conjunto_completo = total.eq(linhas);
+    }
+  }
+
+  // Se nao houver total_encontrados, usamos o LIMIT para saber se o conjunto
+  // certamente terminou antes do limite. Se bateu exatamente no LIMIT, tratamos
+  // como potencialmente parcial e nao validamos soma pelo subconjunto.
+  if (analise.conjunto_completo === null) {
+    const limite = limiteDaSQL(sql);
+    analise.conjunto_completo = limite === null ? true : linhas < limite;
+  }
+
+  // Recalcula SUM/AVG quando a propria consulta retornou a coluna componente.
+  // Decimal.js evita erros do tipo 0.1 + 0.2 e preserva valores financeiros.
+  for (const agg of aliasesAgregadosDaSQL(sql)) {
+    if (!colunas.includes(agg.origem) || !colunas.includes(agg.alias)) continue;
+    if (!analise.conjunto_completo) continue;
+
+    const componentes = objetos.map((r) => decimalSeguro(r?.[agg.origem])).filter(Boolean);
+    const reportados = objetos.map((r) => decimalSeguro(r?.[agg.alias])).filter(Boolean);
+    if (!componentes.length || !reportados.length) continue;
+
+    const unicosReportados = [...new Set(reportados.map((d) => d.toString()))];
+    // Para window aggregate, todas as linhas devem carregar o mesmo total/media.
+    if (agg.janela && unicosReportados.length !== 1) {
+      analise.avisos.push(`O agregado ${agg.alias} nao veio consistente entre as linhas.`);
+      continue;
+    }
+
+    let recalculado = componentes.reduce((acc, d) => acc.plus(d), new Decimal(0));
+    if (agg.funcao === "avg") recalculado = recalculado.div(componentes.length);
+    const reportado = reportados[0];
+    const ok = recalculado.eq(reportado);
+
+    analise.agregados_validados.push({
+      alias: agg.alias,
+      funcao: agg.funcao,
+      origem: agg.origem,
+      reportado: reportado.toString(),
+      recalculado: recalculado.toString(),
+      ok,
+    });
+    if (!ok) {
+      analise.avisos.push(`Divergencia em ${agg.alias}: SQL=${reportado.toString()} e recalculo=${recalculado.toString()}.`);
+    }
+  }
+
+  return analise;
+}
+
+function respostaNumericaDiretaSegura(pergunta = "", rows = [], analise = null) {
+  if (!Array.isArray(rows) || rows.length !== 1) return null;
+  const r = rows[0] || {};
+  if (r.objeto) return null;
+
+  const p = normalizar(pergunta);
+  const pedeDinheiro = /\b(valor|valores|investid|investimento|gasto|gastos|custo|custos|saldo|quanto foi|quanto e|quanto é)\b/.test(p);
+  if (!pedeDinheiro) return null;
+
+  const candidatos = Object.entries(r)
+    .filter(([k, v]) => campoPareceMonetario(k) && v !== null && v !== undefined && v !== "")
+    .map(([k, v]) => ({ campo: k, valor: decimalSeguro(v) }))
+    .filter((x) => x.valor);
+
+  if (!candidatos.length) return null;
+  const preferidos = candidatos.filter((x) => /total|invest|soma|saldo|gasto|custo/.test(normalizar(x.campo)));
+  const escolhido = preferidos.length === 1 ? preferidos[0] : candidatos.length === 1 ? candidatos[0] : null;
+  if (!escolhido) return null;
+
+  const fmt = formatarDecimalBR(escolhido.valor, 2, true);
+  if (!fmt) return null;
+
+  const temAviso = Array.isArray(analise?.avisos) && analise.avisos.length > 0;
+  if (temAviso) return null; // deixa a IA/fallback explicar em vez de mascarar divergencia.
+  return `O valor total correspondente a esses critérios é ${fmt}.`;
 }
 
 function respostaSocial(pergunta = "", historico = []) {
@@ -291,6 +492,53 @@ function garantirUniversoNegocio(pergunta = "", historico = [], sqlAtual = "") {
 }
 
 
+function pedidoAreaTematicaAmpla(pergunta = "") {
+  const p = normalizar(pergunta);
+  if (!p) return false;
+
+  const universoExplicito = /\b(obras?|projetos?|licita(?:cao|coes))\b/.test(p);
+  if (universoExplicito) return false;
+
+  const falaDeArea = /\barea\s+(?:da|do|de)?\s*[a-z0-9]/.test(p);
+  const pedidoAmplo = /\b(registros?|dados|informacoes?|itens?|cadastros?|geral|em geral|tudo|todos|todas)\b/.test(p) ||
+    /\b(fala|fale|mostra|mostre|liste|quais|o que tem|o que existe)\b/.test(p);
+
+  return falaDeArea && pedidoAmplo;
+}
+
+function consultaRestringeTipoNegocio(sql = "") {
+  const s = String(sql || "");
+  return /\btipo_negocio\s*=\s*'[^']+'/i.test(s) ||
+    /\btipo_negocio\s+in\s*\([^)]*\)/i.test(s);
+}
+
+// Detecta um erro semantico comum em perguntas por AREA/TEMA: a IA ve um valor
+// real em "recurso" com o mesmo nome do tema e reduz todo o assunto a esse
+// campo. Ex.: "obras da educacao" -> recurso='EDUCACAO', deixando de fora
+// escolas/creches financiadas por outra fonte.
+//
+// A deteccao e GENERICA: nao possui lista de areas. Ela so dispara quando a
+// pergunta pede um conjunto e a SQL usa recurso/tipo_recurso como igualdade,
+// sem que o usuario tenha pedido explicitamente uma fonte de recurso. A IA e
+// chamada novamente para decidir, com base no catalogo real, se a expressao e
+// tema/area ou de fato uma fonte/programa de financiamento.
+function consultaPossivelmenteConfundeTemaComRecurso(pergunta = "", sql = "") {
+  const p = normalizar(pergunta);
+  const s = String(sql || "");
+  if (!p || !s) return false;
+
+  const pedeConjunto = /\b(obras?|projetos?|licita(?:cao|coes)|registros?|dados|itens?|cadastros?)\b/.test(p);
+  if (!pedeConjunto) return false;
+
+  // Se o usuario falou explicitamente de recurso/fonte/financiamento, a
+  // igualdade em recurso pode ser exatamente o que ele quer.
+  const pediuFonte = /\b(recurso|recursos|fonte|fontes|financiamento|financiada|financiadas|financiado|financiados|convenio|convenios|emenda|emendas|repasse|repasses)\b/.test(p);
+  if (pediuFonte) return false;
+
+  return /\b(?:recurso|tipo_recurso)\s*=\s*'[^']+'/i.test(s);
+}
+
+
 function referenciaPessoaRecente(historico = [], pergunta = "") {
   const p = normalizar(pergunta);
   const dependeDePessoa = /\b(ele|ela|dele|dela|esse engenheiro|essa engenheira|esse arquiteto|essa arquiteta|esse responsavel|essa responsavel)\b/.test(p);
@@ -495,6 +743,10 @@ async function carregarSchemaContexto() {
       const extras = [
         nomes.has("tipo_negocio") ? "tipo_negocio" : null,
         nomes.has("bairro") ? "bairro" : null,
+        nomes.has("categoria") ? "categoria" : null,
+        nomes.has("recurso") ? "recurso" : null,
+        nomes.has("tipo_recurso") ? "tipo_recurso" : null,
+        nomes.has("aba_origem") ? "aba_origem" : null,
       ].filter(Boolean);
       const campos = ["objeto", ...extras].join(", ");
       const rr = await queryReadOnly(
@@ -567,6 +819,10 @@ function schemaParaPrompt(ctx) {
     const partes = [];
     if (r.tipo_negocio) partes.push(r.tipo_negocio);
     partes.push(r.objeto);
+    if (r.categoria) partes.push(`categoria=${r.categoria}`);
+    if (r.recurso) partes.push(`recurso=${r.recurso}`);
+    if (r.tipo_recurso) partes.push(`tipo_recurso=${r.tipo_recurso}`);
+    if (r.aba_origem) partes.push(`aba=${r.aba_origem}`);
     if (r.bairro) partes.push(`bairro=${r.bairro}`);
     return `- ${partes.join(" | ")}`;
   }).join("\n");
@@ -645,7 +901,10 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `- LICITACOES E ETAPA REAL: ao listar/detalhar licitacoes ou responder sobre seu status, se a coluna status_original existir selecione status_original junto de status. status_original representa a etapa especifica cadastrada (ex.: Habilitacao em andamento, Edital publicado) e deve ser preferida na resposta ao rotulo generico 'Em licitacao'.\n` +
     `- Nao invente valores de status, nomes, bairros, engenheiros ou empresas; use os valores reais do schema/contexto.\n` +
     `- LIGACAO SEMANTICA: quando o usuario pedir uma CLASSE ou CONCEITO amplo (sigla, tipo de equipamento, servico ou categoria), nao filtre apenas a palavra literal. Considere abreviacoes, forma por extenso e sinonimos realmente equivalentes em portugues e compare com o CATALOGO DE OBJETOS REAIS. Use OR com ILIKE apenas para equivalencias semanticamente justificadas.\n` +
-    `- AREA DA SAUDE: considere apenas equipamentos/servicos claramente de saude, como UBS/unidade basica de saude, posto de saude, PSF, hospital, policlinica, unidade de saude e academia da saude quando existirem no catalogo real. CRECHE e ESCOLA pertencem a educacao e NAO devem entrar como saude apenas por inferencia. Nunca invente nomes de equipamentos para completar uma categoria.\n` +
+    `- AREAS TEMATICAS (qualquer area/assunto): NAO use uma lista fixa de palavras. Descubra dinamicamente pelos registros REAIS do catalogo e pelos campos objeto, categoria, recurso, tipo_recurso, aba_origem e dados_extras quando houver evidencia semantica clara de que o registro pertence ao tema pedido. Uma nova planilha pode trazer tipos de equipamentos/servicos que nunca apareceram antes; eles devem ser considerados se os dados reais mostrarem claramente a relacao. Nao inclua registros apenas por associacao vaga e nunca invente nomes.\n` +
+    `- TEMA NAO E RECURSO: quando o usuario disser algo como "obras da/de/do X" e X representar uma area/tema, NAO transforme isso automaticamente em recurso='X' ou tipo_recurso='X' so porque esse valor existe na base. O campo recurso descreve a fonte/origem do dinheiro e pode ser diferente do tema da obra. Para area/tema, examine primeiro o OBJETO e o CATALOGO DE OBJETOS REAIS, usando categoria/dados_extras e recurso apenas como evidencias complementares. So filtre por recurso/tipo_recurso como criterio principal quando o usuario pedir explicitamente recurso, fonte, financiamento, convenio, emenda ou quando X for claramente uma fonte/programa de financiamento.\n` +
+    `- COBERTURA TEMATICA: em uma pergunta por tema, inclua TODOS os registros do universo pedido que o catalogo real mostre pertencer claramente ao tema, mesmo que tenham fontes de recurso diferentes. Monte OR apenas com equivalencias/objetos realmente presentes no catalogo; nao use uma lista fixa escrita no codigo e nao invente sinonimos sem apoio dos dados.\n` +
+    `- REGISTROS DE UMA AREA: se o usuario pedir "registros", "dados", "informacoes" ou perguntar de forma ampla o que existe em uma area, e NAO disser explicitamente obras/projetos/licitacoes, pesquise TODOS os tipos de negocio e registros auxiliares relacionados ao tema. Nao aplique tipo_negocio='obra' por padrao. Se disser "obras da area X", ai sim restrinja a obras; o mesmo vale para projetos e licitacoes.\n` +
     `- Para alvo proprio/especifico (nome de bairro, rua, equipamento com nome proprio), seja conservador: nao expanda para conceitos diferentes.\n` +
     `- Em busca ampla por assunto, voce pode procurar em objeto, categoria e dados_extras::text quando essas colunas existirem; mantenha o tipo_negocio correto.\n` +
     `- Se um termo livre puder ser nome parcial, use ILIKE/LOWER de forma tolerante.\n` +
@@ -973,15 +1232,17 @@ function rotuloHumano(campo = "") {
 
 function valorFallback(campo, valor) {
   if (valor === null || valor === undefined || valor === "") return null;
-  if (["valor_total", "valor_executado", "quanto_falta", "saldo_devedor", "aditivo"].includes(campo)) {
-    const n = Number(valor);
-    if (Number.isFinite(n)) {
-      return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(n);
-    }
+
+  // Decimal.js tambem e usado na formatacao final de qualquer campo monetario,
+  // inclusive aliases como total_investido, soma_valores, saldo_total etc.
+  if (campoPareceMonetario(campo)) {
+    const fmt = formatarDecimalBR(valor, 2, true);
+    if (fmt) return fmt;
   }
+
   if (campo === "percentual_executado") {
-    const n = Number(valor);
-    if (Number.isFinite(n)) return `${new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 2 }).format(n)}%`;
+    const d = decimalSeguro(valor);
+    if (d) return `${formatarDecimalBR(d, Math.min(2, d.decimalPlaces()), false)}%`;
   }
   return String(valor);
 }
@@ -1028,27 +1289,42 @@ function respostaContagemDiretaSegura(pergunta = "", rows = []) {
   if (!Array.isArray(rows) || rows.length !== 1) return null;
   const r = rows[0] || {};
   if (r.objeto) return null;
+  const p = normalizar(pergunta);
+  const perguntaPedeContagem = /\b(quantos?|quantas?|quantidade|numero de|n[uú]mero de)\b/.test(p);
 
-  const candidatos = Object.entries(r).filter(([k, v]) =>
-    /(?:^count$|count_|_count$|^total|total_|quantidade|qtd)/i.test(k) &&
-    v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v))
-  );
+  // IMPORTANTE: "total_investido", "valor_total" etc. NAO sao contagens.
+  // Antes a regex aceitava qualquer campo iniciado por "total" e podia responder
+  // "503000 registros" para uma soma em reais. O alias simples "total" so e
+  // aceito quando a propria pergunta pede explicitamente uma contagem.
+  const candidatos = Object.entries(r)
+    .filter(([k, v]) =>
+      (campoPareceContagem(k) || (perguntaPedeContagem && normalizar(k) === "total")) &&
+      v !== null && v !== undefined && v !== ""
+    )
+    .map(([k, v]) => ({ campo: k, valor: decimalSeguro(v) }))
+    .filter((x) => x.valor && x.valor.isInteger() && x.valor.gte(0));
   if (candidatos.length !== 1) return null;
 
-  const n = Number(candidatos[0][1]);
-  const p = normalizar(pergunta);
+  const nDecimal = candidatos[0].valor;
+  if (nDecimal.gt(Number.MAX_SAFE_INTEGER)) return null;
+  const n = nDecimal.toNumber();
   if (/\bobras?\b/.test(p)) return n === 1 ? "Há 1 obra que corresponde a esses critérios." : `Há ${n} obras que correspondem a esses critérios.`;
   if (/\bprojetos?\b/.test(p)) return n === 1 ? "Há 1 projeto que corresponde a esses critérios." : `Há ${n} projetos que correspondem a esses critérios.`;
   if (/\blicita(?:cao|coes)\b/.test(p)) return n === 1 ? "Há 1 licitação que corresponde a esses critérios." : `Há ${n} licitações que correspondem a esses critérios.`;
   return n === 1 ? "Encontrei 1 registro com esses critérios." : `Encontrei ${n} registros com esses critérios.`;
 }
 
-async function redigirResposta(pergunta, historico, sql, rows, ctx) {
+async function redigirResposta(pergunta, historico, sql, rows, ctx, analiseDados = null) {
   // Se por qualquer motivo uma consulta de contagem ainda chegar apenas com o
   // agregado, nao envia contexto insuficiente para a IA completar com nomes.
   // Isso impede alucinacao de obras/valores que nao vieram do PostgreSQL.
   const contagemSegura = respostaContagemDiretaSegura(pergunta, rows);
   if (contagemSegura) return contagemSegura;
+
+  // Agregados monetarios de uma unica linha sao respondidos pelo proprio Node.
+  // Evita que a IA transforme um valor (ex.: 503000) em quantidade de registros.
+  const numericaSegura = respostaNumericaDiretaSegura(pergunta, rows, analiseDados);
+  if (numericaSegura) return numericaSegura;
 
   const amostra = rows.slice(0, MAX_LINHAS_PARA_IA);
   const prompt = `Voce e o redator final de um chatbot de obras publicas no WhatsApp.\n` +
@@ -1072,6 +1348,7 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
     `NUNCA mostre ID/identificador interno. NUNCA escreva o nome tecnico da coluna "objeto". Use diretamente o nome da obra/projeto/licitacao.\n` +
     `Exemplo correto: "1. Reforma e ampliacao da UBS do Cristo Rei — Recurso: FEDERAL". Exemplo proibido: "1. id: 3 — objeto: Reforma...".\n` +
     `Diferencie obra, projeto e licitacao conforme os campos da view/tabela. Se tipo_negocio='licitacao', chame os registros de licitacoes, nunca de obras.\n` +
+    `Quando a pergunta pedir REGISTROS/DADOS de uma area tematica de forma ampla, nao resuma tudo como "obras e projetos". Descreva corretamente a mistura encontrada (obras, projetos, licitacoes e/ou registros auxiliares) conforme tipo_negocio e aba_origem retornados.\n` +
     `PERCENTUAL: percentual_executado e percentual de EXECUCAO. Escreva sempre 'X% executado' ou 'X% de execucao'. NUNCA escreva 'X% concluido' para uma obra que ainda esta em andamento.\n` +
     `LICITACAO: se status_original vier no resultado, use-o como etapa/status especifico da licitacao (ex.: 'Habilitacao em andamento', 'Edital publicado'). Nao esconda essa etapa atras do rotulo generico 'Em licitacao'.\n` +
     `Recurso e tipo_recurso sao campos diferentes; nao troque um pelo outro.\n` +
@@ -1080,6 +1357,8 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
     `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
     `SQL EXECUTADA: ${sql}\n` +
     `TOTAL DE LINHAS RETORNADAS: ${rows.length}\n` +
+    `VALIDACAO LOCAL (Arquero + Decimal.js):\n${jsonSeguro(analiseDados || {}, 4_500)}\n` +
+    `REGRA: se a validacao local trouxer aviso de divergencia, nao esconda o problema nem invente um valor alternativo. Responda somente com o que estiver consistente nos dados retornados.\n` +
     `DADOS RETORNADOS (ate ${MAX_LINHAS_PARA_IA} linhas):\n${jsonSeguro(amostra, 16_000)}\n\n` +
     `Responda em portugues brasileiro, de forma natural e objetiva.`;
 
@@ -1164,6 +1443,27 @@ export async function responderPergunta(pergunta, historico = []) {
       if (refinada.query) gerada = refinada;
     }
 
+    // Pedido tematico amplo: "registros/dados da area X" nao significa apenas obras.
+    // A classificacao do tema e dinamica e deve vir dos dados reais da planilha.
+    if (pedidoAreaTematicaAmpla(texto) && consultaRestringeTipoNegocio(gerada.query)) {
+      const refinada = await gerarSQL(
+        texto, historico, ctx,
+        "O usuario pediu REGISTROS/DADOS de uma AREA TEMATICA sem limitar a obras, projetos ou licitacoes. A SQL restringiu tipo_negocio indevidamente. Refaça pesquisando todos os tipos de negocio e registros auxiliares que tenham evidencia semantica clara de pertencer ao tema, usando o CATALOGO DE OBJETOS e os campos reais (objeto, categoria, recurso, tipo_recurso, aba_origem e dados_extras). Nao use uma lista fixa de palavras e nao invente categorias. Retorne tipo_negocio/aba_origem junto dos registros para a resposta diferenciar obra, projeto, licitacao e auxiliar."
+      );
+      if (refinada.query) gerada = refinada;
+    }
+
+    // Protecao generica contra confundir AREA/TEMA com FONTE DE RECURSO.
+    // Ex.: "obras da educacao" nao deve virar apenas recurso='EDUCACAO', pois
+    // outras obras do mesmo tema podem ter recurso FEDERAL, ESTADUAL etc.
+    if (consultaPossivelmenteConfundeTemaComRecurso(texto, gerada.query)) {
+      const refinada = await gerarSQL(
+        texto, historico, ctx,
+        "Revise a semantica da expressao pedida pelo usuario. A SQL atual reduziu o conjunto a uma igualdade em recurso/tipo_recurso, embora o usuario nao tenha pedido explicitamente uma fonte de recurso. Primeiro determine, pelo contexto e pelo CATALOGO DE OBJETOS REAIS, se a expressao representa uma AREA/TEMA ou uma fonte/programa de financiamento. Se for AREA/TEMA, NAO use recurso='tema' como criterio unico: encontre dinamicamente TODOS os objetos do universo pedido que pertencem claramente ao tema, mesmo que tenham recursos diferentes, usando objeto como evidencia principal e categoria/dados_extras/recurso como apoio. Se for claramente uma fonte/programa de financiamento, preserve o filtro de recurso. Nao use lista fixa de areas, nao invente sinonimos e mantenha o tipo_negocio pedido pelo usuario."
+      );
+      if (refinada.query) gerada = refinada;
+    }
+
     // Refinamentos gerais de qualidade. Nao sao regras de uma frase especifica:
     // evitam respostas existenciais arbitrarias e agregados numericos sem composicao.
     if (existencialComLimitUm(texto, gerada.query)) {
@@ -1185,7 +1485,7 @@ export async function responderPergunta(pergunta, historico = []) {
     if (contagemComAgregadoSeco(texto, gerada.query)) {
       const refinada = await gerarSQL(
         texto, historico, ctx,
-        "A pergunta pede uma contagem, mas a SQL retornaria apenas COUNT sem os registros que sustentam o total. Preserve EXATAMENTE o mesmo recorte e os mesmos criterios sem inventar categorias. Refaça trazendo objeto + campos uteis disponiveis + COUNT(*) OVER() AS total_encontrados. Para categorias amplas como area da saude, use somente equivalencias semanticamente corretas e objetos reais do catalogo; creche/escola nao sao saude."
+        "A pergunta pede uma contagem, mas a SQL retornaria apenas COUNT sem os registros que sustentam o total. Preserve EXATAMENTE o mesmo recorte e os mesmos criterios sem inventar categorias. Refaça trazendo objeto + campos uteis disponiveis + COUNT(*) OVER() AS total_encontrados. Para qualquer area tematica, descubra os registros dinamicamente pelo catalogo e pelos campos reais; nao use uma lista fechada de tipos/equipamentos e nao restrinja tipo_negocio se o usuario pediu registros gerais da area."
       );
       if (refinada.query) gerada = refinada;
     }
@@ -1228,11 +1528,20 @@ export async function responderPergunta(pergunta, historico = []) {
     console.log("SQL AGENT - SQL FINAL:", execucao.sql);
     console.log("SQL AGENT - LINHAS:", execucao.rows.length, "| REPAROS:", execucao.tentativa || 0, "| EARLY_ACCEPT:", !!execucao.earlyAccept);
 
-    const resposta = await redigirResposta(texto, historico, execucao.sql, execucao.rows, ctx);
+    // Estagio 3: confere localmente o resultado antes da redacao por IA.
+    const analiseDados = analisarResultadoDados(texto, execucao.sqlExecucao || execucao.sql, execucao.rows);
+    if (analiseDados.avisos.length) {
+      console.warn("SQL AGENT - VALIDACAO DE DADOS:", analiseDados.avisos.join(" | "));
+    } else {
+      console.log("SQL AGENT - VALIDACAO DE DADOS: OK (Arquero + Decimal.js)");
+    }
+
+    const resposta = await redigirResposta(texto, historico, execucao.sql, execucao.rows, ctx, analiseDados);
     return {
       resposta,
       sql: execucao.sql,
       linhas: execucao.rows.length,
+      analiseDados,
       estado: estadoPublico(ctx, execucao),
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
