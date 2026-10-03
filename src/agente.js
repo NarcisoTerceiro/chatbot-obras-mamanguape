@@ -399,6 +399,27 @@ function contagemComAgregadoSeco(pergunta = "", sql = "") {
   return pedeContagem && conta && !trazNomes;
 }
 
+// Quando a pergunta pede qual ENTIDADE (engenheiro, empresa, bairro etc.) tem
+// maior/menor VALOR TOTAL INVESTIDO no conjunto, o correto e somar as obras de
+// cada entidade. MAX(valor_total) responderia apenas qual foi a maior obra
+// individual daquela entidade, mudando a semantica da pergunta.
+function corrigirRankingValorTotalPorEntidade(pergunta = "", sql = "") {
+  const p = normalizar(pergunta);
+  let s = limparSQL(sql);
+  if (!s) return s;
+
+  const pedeEntidade = /\b(engenheir|arquit|responsavel|empresa|bairro)\w*\b/.test(p);
+  const pedeExtremo = /\b(maior|mais|menor|menos)\b/.test(p);
+  const pedeTotalFinanceiro = /\b(valor\s+(?:total\s+)?investid|investimento|valor\s+total|total\s+investid)\w*\b/.test(p);
+  const agrupada = /\bgroup\s+by\b/i.test(s);
+  const usaMaxValorTotal = /\bmax\s*\(\s*valor_total\s*\)/i.test(s);
+
+  if (!(pedeEntidade && pedeExtremo && pedeTotalFinanceiro && agrupada && usaMaxValorTotal)) return s;
+
+  // Troca apenas o agregado do valor_total. Mantem alias, GROUP BY, filtros e ORDER BY.
+  return s.replace(/\bmax\s*\(\s*valor_total\s*\)/ig, "SUM(valor_total)");
+}
+
 function stripThink(texto = "") {
   return String(texto || "").replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 }
@@ -668,6 +689,8 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `- Nao consulte information_schema, pg_catalog, auth, storage ou outras tabelas.\n` +
     `- Prefira agregacoes SQL reais (COUNT, SUM, AVG, GROUP BY, ORDER BY) quando a pergunta pedir calculo/ranking.\n` +
     `- SOMA/MEDIA EXPLICAVEL: quando somar ou calcular media de um conjunto e houver nomes/valores por registro, prefira retornar a composicao junto do agregado, por exemplo objeto + valor_total + SUM(valor_total) OVER () AS total_investido. Assim a resposta consegue explicar de onde saiu o total.\n` +
+    `- RANKING POR ENTIDADE + VALOR TOTAL: se a pergunta for qual engenheiro/responsavel/empresa/bairro tem MAIOR ou MENOR valor total/investido no conjunto, agrupe pela entidade e use SUM(valor_total). NUNCA use MAX(valor_total) para esse pedido, porque MAX representa somente a maior obra individual. Use MAX apenas quando o usuario pedir explicitamente a maior obra/maior valor individual.\n` +
+    `- RANKING POR QUANTIDADE: se a pergunta for qual engenheiro/responsavel/empresa/bairro tem mais ou menos obras, use COUNT(*) por entidade, GROUP BY, ORDER BY COUNT ASC/DESC e retorne sempre a entidade junto da contagem.\n` +
     `- EXISTENCIA/ALGUM: perguntas do tipo "existe/tem algum" NAO devem ser respondidas escolhendo um registro arbitrario com LIMIT 1. Use COUNT, agrupamento por tipo_negocio ou liste o conjunto real. Se nao houver universo claro nem recorte anterior, resuma por tipo_negocio em vez de escolher um item ao acaso.\n` +
     `- Para 'quais engenheiros dessas obras?', se o usuario quer apenas a lista de nomes, SELECT DISTINCT engenheiro e valido; se ele pedir quem e responsavel por cada obra, retorne objeto + engenheiro.\n` +
     `- FOLLOW-UP DE CAMPO SOBRE UM CONJUNTO: quando o usuario perguntar 'quais os recursos?', 'quais os status?', 'quais os engenheiros?', 'quais os contratos?' etc. sobre varios registros ja em contexto, prefira UMA LINHA POR REGISTRO com objeto + campo pedido. So use DISTINCT campo sozinho quando ele pedir explicitamente valores unicos/diferentes ou apenas os nomes sem associar a cada registro.\n` +
@@ -1202,6 +1225,50 @@ function fallbackResposta(pergunta, rows = []) {
   return `${linhas.join("\n")}${rows.length > exibidas.length ? `\n… e mais ${rows.length - exibidas.length}.` : ""}`;
 }
 
+function respostaAgregadoComDimensaoSegura(pergunta = "", rows = []) {
+  if (!Array.isArray(rows) || rows.length !== 1) return null;
+  const r = rows[0] || {};
+  if (r.objeto) return null;
+
+  const ignorar = new Set(["id"]);
+  const entradas = Object.entries(r).filter(([k, v]) =>
+    !ignorar.has(k) && v !== null && v !== undefined && String(v).trim() !== ""
+  );
+  if (entradas.length < 2) return null;
+
+  const medidas = entradas.filter(([k, v]) =>
+    Number.isFinite(Number(v)) &&
+    (/(?:^count$|count_|_count$|^total|total_|quantidade|qtd|valor|invest|executad|saldo|soma|media|avg|sum)/i.test(k))
+  );
+  const dimensoes = entradas.filter(([k]) => !medidas.some(([mk]) => mk === k));
+  if (dimensoes.length !== 1 || medidas.length !== 1) return null;
+
+  const [campoDim, valorDim] = dimensoes[0];
+  const [campoMed, valorMed] = medidas[0];
+  const p = normalizar(pergunta);
+  const rotuloDim = rotuloHumano(campoDim);
+
+  const ehContagem = /(?:count|quantidade|qtd|total_obras|numero_obras)/i.test(campoMed);
+  if (ehContagem) {
+    const n = Number(valorMed);
+    if (!Number.isFinite(n)) return null;
+    const plural = n === 1 ? "obra" : "obras";
+    if (/\b(menos|menor)\b/.test(p)) return `${rotuloDim === "Engenheiro" ? "O engenheiro" : `O ${rotuloDim.toLowerCase()}`} com menos obras neste recorte é ${valorDim}, com ${n} ${plural}.`;
+    if (/\b(mais|maior)\b/.test(p)) return `${rotuloDim === "Engenheiro" ? "O engenheiro" : `O ${rotuloDim.toLowerCase()}`} com mais obras neste recorte é ${valorDim}, com ${n} ${plural}.`;
+    return `${rotuloDim}: ${valorDim} — ${n} ${plural}.`;
+  }
+
+  if (campoPareceFinanceiro(campoMed)) {
+    const moeda = formatarMoedaSegura(valorMed);
+    if (!moeda) return null;
+    if (/\b(menos|menor)\b/.test(p)) return `${rotuloDim}: ${valorDim} — menor valor total neste recorte: ${moeda}.`;
+    if (/\b(mais|maior)\b/.test(p)) return `${rotuloDim}: ${valorDim} — maior valor total neste recorte: ${moeda}.`;
+    return `${rotuloDim}: ${valorDim} — ${rotuloHumano(campoMed)}: ${moeda}.`;
+  }
+
+  return null;
+}
+
 function respostaContagemDiretaSegura(pergunta = "", rows = []) {
   if (!Array.isArray(rows) || rows.length !== 1) return null;
   const r = rows[0] || {};
@@ -1213,6 +1280,15 @@ function respostaContagemDiretaSegura(pergunta = "", rows = []) {
   );
   if (candidatos.length !== 1) return null;
 
+  // Se a linha tambem possui uma dimensao (engenheiro, empresa, bairro etc.),
+  // NAO reduza a resposta a "Ha N obras". O nome da dimensao e parte da resposta.
+  const campoMedida = candidatos[0][0];
+  const temDimensao = Object.entries(r).some(([k, v]) =>
+    k !== "id" && k !== campoMedida &&
+    v !== null && v !== undefined && String(v).trim() !== ""
+  );
+  if (temDimensao) return null;
+
   const n = Number(candidatos[0][1]);
   const p = normalizar(pergunta);
   if (/\bobras?\b/.test(p)) return n === 1 ? "Há 1 obra que corresponde a esses critérios." : `Há ${n} obras que correspondem a esses critérios.`;
@@ -1222,6 +1298,12 @@ function respostaContagemDiretaSegura(pergunta = "", rows = []) {
 }
 
 async function redigirResposta(pergunta, historico, sql, rows, ctx, analiseDados = null) {
+  // Ranking/agrupamento com uma dimensao + uma medida deve citar AMBOS.
+  // Ex.: { engenheiro: "Eng. X", total_obras: 1 } nao pode virar apenas
+  // "Ha 1 obra"; o nome do engenheiro e parte essencial da resposta.
+  const agregadoComDimensao = respostaAgregadoComDimensaoSegura(pergunta, rows);
+  if (agregadoComDimensao) return agregadoComDimensao;
+
   // Se por qualquer motivo uma consulta de contagem ainda chegar apenas com o
   // agregado, nao envia contexto insuficiente para a IA completar com nomes.
   // Isso impede alucinacao de obras/valores que nao vieram do PostgreSQL.
@@ -1238,6 +1320,8 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx, analiseDados
     `Responda APENAS com base nos dados retornados pela consulta. Nao invente, nao estime e nao corrija valores por memoria.\n` +
     `Se o resultado estiver vazio, diga claramente que nao encontrou registros com os criterios.\n` +
     `Se for contagem/soma/ranking, destaque o resultado de forma direta e depois mostre os dados que sustentam a resposta em linguagem comum. EXPLICAR significa mostrar nomes, valores, status, responsaveis ou outros detalhes uteis dos registros; NAO significa explicar como o banco foi consultado.\n` +
+    `AGREGADO COM DIMENSAO: se DADOS RETORNADOS trouxerem uma entidade junto de uma medida (ex.: engenheiro + total_obras, empresa + valor_total_obras, bairro + quantidade), cite SEMPRE os dois. Nunca responda somente o numero/valor e esconda a entidade.\n` +
+    `DUAS MEDIDAS PEDIDAS: se o usuario pedir, por exemplo, valor investido E total executado, responda as duas separadamente. Se uma delas nao puder ser calculada porque todos os valores correspondentes vieram nulos/vazios, diga claramente que esse total nao pode ser calculado com os dados preenchidos; nao invente zero e nao assuma que obra concluida implica valor_executado = valor_total.\n` +
     `REGRA ANTI-ALUCINACAO: so cite nome, bairro, empresa, valor, contrato, status ou qualquer detalhe se esse valor estiver explicitamente em DADOS RETORNADOS. Se os dados trouxerem apenas uma contagem agregada e nenhum objeto, responda somente a contagem; NUNCA complete com exemplos, nomes ou detalhes vindos do historico/schema.\n` +
     `NUNCA mencione SQL, consulta, SELECT, WHERE, view, tabela, coluna, filtro tecnico, booleano, tipo_negocio, concluido=true ou qualquer mecanismo interno. O usuario quer o RESULTADO e os registros encontrados, nao a forma tecnica de obtencao.\n` +
     `RESPOSTAS DEVEM SER EXPLICATIVAS, nao secas: comece com uma frase curta respondendo diretamente e depois mostre os detalhes que ajudam a entender o resultado. Nao escreva apenas uma lista de valores quando os dados permitem dizer a qual obra/projeto/licitacao cada valor pertence.\n` +
@@ -1388,6 +1472,15 @@ export async function responderPergunta(pergunta, historico = []) {
       if (refinada.query) gerada = refinada;
     }
 
+    // Guardrail semantico financeiro: em ranking de valor TOTAL por entidade,
+    // MAX(valor_total) mede a maior obra individual. Para o total da entidade,
+    // corrige deterministicamente para SUM(valor_total), preservando todo o recorte.
+    const sqlRankingTotalCorrigido = corrigirRankingValorTotalPorEntidade(texto, gerada.query);
+    if (sqlRankingTotalCorrigido && sqlRankingTotalCorrigido !== limparSQL(gerada.query)) {
+      console.log("SQL AGENT - RANKING DE VALOR TOTAL CORRIGIDO: MAX -> SUM");
+      gerada = { ...gerada, query: sqlRankingTotalCorrigido };
+    }
+
     // Protecao de continuidade: em perguntas puramente referenciais (ex.:
     // "quais sao?"), restaura o WHERE do ultimo recorte confirmado. Isso evita
     // misturar obra/projeto/licitacao quando a IA simplifica demais a SQL.
@@ -1439,7 +1532,7 @@ export async function responderPergunta(pergunta, historico = []) {
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "sql_agent_self_healing_v13_6_arquero_decimal_erro",
+      modoAgente: "sql_agent_self_healing_v13_7_arquero_decimal_erro",
     };
   }
 }
