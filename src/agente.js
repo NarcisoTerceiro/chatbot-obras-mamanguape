@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V13.1
+// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V13.6
 // ============================================================
 // Arquitetura baseada em duas referencias usadas no projeto:
 // 1) Conversational SQL Agent: schema/view + SQL dinamico + memoria de conversa.
@@ -16,6 +16,44 @@
 
 import { queryReadOnly } from "./db.js";
 import { chamarIAbruta } from "./groq.js";
+
+// ------------------------------------------------------------
+// Analise local opcional: Arquero + Decimal.js
+// ------------------------------------------------------------
+// IMPORTANTE: usamos import() dinamico dentro de try/catch.
+// Assim, se o Render ainda nao tiver as dependencias instaladas, o agente
+// CONTINUA SUBINDO normalmente e usa fallback nativo. Quando as bibliotecas
+// estiverem no package.json/node_modules, elas sao ativadas automaticamente.
+let moduloArquero = null;
+let ClasseDecimal = null;
+let promessaBibliotecasAnalise = null;
+
+async function carregarBibliotecasAnalise() {
+  if (promessaBibliotecasAnalise) return promessaBibliotecasAnalise;
+
+  promessaBibliotecasAnalise = (async () => {
+    const status = { arquero: false, decimal: false };
+
+    try {
+      moduloArquero = await import("arquero");
+      status.arquero = true;
+    } catch (e) {
+      console.warn("AGENTE SQL: Arquero nao instalado; usando analise nativa.", e?.code || e?.message || e);
+    }
+
+    try {
+      const decimalModulo = await import("decimal.js");
+      ClasseDecimal = decimalModulo?.default || decimalModulo?.Decimal || null;
+      status.decimal = !!ClasseDecimal;
+    } catch (e) {
+      console.warn("AGENTE SQL: Decimal.js nao instalado; usando Number como fallback.", e?.code || e?.message || e);
+    }
+
+    return status;
+  })();
+
+  return promessaBibliotecasAnalise;
+}
 
 const MAX_REPAROS = Math.max(0, Math.min(Number(process.env.AGENTE_MAX_REPAROS || 2), 4));
 const MAX_RESULTADOS = Math.max(20, Math.min(Number(process.env.AGENTE_MAX_RESULTADOS || 200), 500));
@@ -986,6 +1024,146 @@ function valorFallback(campo, valor) {
   return String(valor);
 }
 
+function numeroParaAnalise(valor) {
+  if (valor === null || valor === undefined || valor === "") return null;
+  if (typeof valor === "number") return Number.isFinite(valor) ? valor : null;
+
+  const bruto = String(valor).trim();
+  if (!bruto) return null;
+
+  // PostgreSQL normalmente entrega numeric como "503000.00". Tambem aceitamos
+  // formatos brasileiros simples caso algum valor chegue como texto.
+  let normalizado = bruto.replace(/\s/g, "").replace(/^R\$/i, "");
+  if (/^-?\d{1,3}(?:\.\d{3})+(?:,\d+)?$/.test(normalizado)) {
+    normalizado = normalizado.replace(/\./g, "").replace(",", ".");
+  } else if (/^-?\d+(?:,\d+)?$/.test(normalizado)) {
+    normalizado = normalizado.replace(",", ".");
+  }
+
+  const n = Number(normalizado);
+  return Number.isFinite(n) ? n : null;
+}
+
+function formatarMoedaSegura(valor) {
+  const n = numeroParaAnalise(valor);
+  if (n === null) return null;
+  return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(n);
+}
+
+function campoPareceContagem(campo = "") {
+  return /(?:^count$|count_|_count$|quantidade|qtd|total_(?:registros|encontrados|obras|projetos|licitacoes)|numero|n[uú]mero)/i.test(campo);
+}
+
+function campoParecePercentual(campo = "") {
+  return /percent|porcent|taxa/i.test(campo);
+}
+
+function campoPareceFinanceiro(campo = "") {
+  if (campoPareceContagem(campo) || campoParecePercentual(campo)) return false;
+  return /(valor|invest|custo|gasto|pago|saldo|aditivo|contrapartida|restante|falta|orcamento|or[cç]amento)/i.test(campo);
+}
+
+function decimalSomar(valores = []) {
+  if (ClasseDecimal) {
+    let total = new ClasseDecimal(0);
+    for (const valor of valores) {
+      const n = numeroParaAnalise(valor);
+      if (n !== null) total = total.plus(String(n));
+    }
+    return total.toString();
+  }
+
+  let total = 0;
+  for (const valor of valores) {
+    const n = numeroParaAnalise(valor);
+    if (n !== null) total += n;
+  }
+  return String(total);
+}
+
+async function analisarResultadoLocal(rows = []) {
+  const status = await carregarBibliotecasAnalise();
+  const lista = Array.isArray(rows) ? rows : [];
+
+  let totalLinhas = lista.length;
+  if (status.arquero && moduloArquero?.from) {
+    try {
+      totalLinhas = moduloArquero.from(lista).numRows();
+    } catch (e) {
+      console.warn("AGENTE SQL: Arquero falhou ao contar linhas; usando Array.length:", e?.message || e);
+    }
+  }
+
+  const campos = [...new Set(lista.flatMap((r) => Object.keys(r || {})))];
+  const somas = {};
+
+  // Calcula apenas campos financeiros de linha (ex.: valor_total), evitando
+  // aliases de agregado como total_investido, que podem se repetir em cada row.
+  for (const campo of campos) {
+    if (!campoPareceFinanceiro(campo)) continue;
+    if (/^(?:total_|soma_|media_|avg_|sum_)/i.test(campo) && campo !== "valor_total") continue;
+
+    const valores = lista.map((r) => r?.[campo]).filter((v) => numeroParaAnalise(v) !== null);
+    if (!valores.length) continue;
+    somas[campo] = decimalSomar(valores);
+  }
+
+  const agregados = {};
+  for (const campo of campos) {
+    if (!/^(?:total_|soma_|media_|avg_|sum_)/i.test(campo)) continue;
+    const distintos = [...new Set(lista.map((r) => r?.[campo]).filter((v) => numeroParaAnalise(v) !== null).map(String))];
+    if (distintos.length === 1) agregados[campo] = distintos[0];
+  }
+
+  const validacoes = [];
+  if (somas.valor_total !== undefined) {
+    for (const [campo, valor] of Object.entries(agregados)) {
+      if (!/(invest|valor_total|total_invest|soma_valor)/i.test(campo)) continue;
+      const calculado = numeroParaAnalise(somas.valor_total);
+      const retornado = numeroParaAnalise(valor);
+      if (calculado !== null && retornado !== null) {
+        validacoes.push({
+          agregado: campo,
+          campo_base: "valor_total",
+          confere: Math.abs(calculado - retornado) < 0.005,
+          calculado: somas.valor_total,
+          retornado: String(valor),
+        });
+      }
+    }
+  }
+
+  return {
+    total_linhas: totalLinhas,
+    bibliotecas: status,
+    somas_financeiras: somas,
+    agregados_detectados: agregados,
+    validacoes,
+  };
+}
+
+function respostaFinanceiraDiretaSegura(pergunta = "", rows = []) {
+  if (!Array.isArray(rows) || rows.length !== 1) return null;
+  const r = rows[0] || {};
+  if (r.objeto) return null;
+
+  const candidatos = Object.entries(r).filter(([campo, valor]) =>
+    campoPareceFinanceiro(campo) &&
+    numeroParaAnalise(valor) !== null
+  );
+  if (candidatos.length !== 1) return null;
+
+  const [campo, valor] = candidatos[0];
+  const moeda = formatarMoedaSegura(valor);
+  if (!moeda) return null;
+
+  const p = normalizar(pergunta);
+  if (/invest|valor total|quanto (?:foi|e|é)|custo|gasto/.test(p)) {
+    return `O valor total nesse recorte é ${moeda}.`;
+  }
+  return `${rotuloHumano(campo)}: ${moeda}.`;
+}
+
 function fallbackResposta(pergunta, rows = []) {
   if (!rows.length) return "Não encontrei registros que correspondam a essa pergunta nos dados atuais.";
 
@@ -1043,12 +1221,17 @@ function respostaContagemDiretaSegura(pergunta = "", rows = []) {
   return n === 1 ? "Encontrei 1 registro com esses critérios." : `Encontrei ${n} registros com esses critérios.`;
 }
 
-async function redigirResposta(pergunta, historico, sql, rows, ctx) {
+async function redigirResposta(pergunta, historico, sql, rows, ctx, analiseDados = null) {
   // Se por qualquer motivo uma consulta de contagem ainda chegar apenas com o
   // agregado, nao envia contexto insuficiente para a IA completar com nomes.
   // Isso impede alucinacao de obras/valores que nao vieram do PostgreSQL.
   const contagemSegura = respostaContagemDiretaSegura(pergunta, rows);
   if (contagemSegura) return contagemSegura;
+
+  // Agregado financeiro isolado (ex.: SUM(valor_total)=503000) nunca deve ser
+  // interpretado pela IA como quantidade de registros.
+  const financeiroSeguro = respostaFinanceiraDiretaSegura(pergunta, rows);
+  if (financeiroSeguro) return financeiroSeguro;
 
   const amostra = rows.slice(0, MAX_LINHAS_PARA_IA);
   const prompt = `Voce e o redator final de um chatbot de obras publicas no WhatsApp.\n` +
@@ -1080,6 +1263,7 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
     `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
     `SQL EXECUTADA: ${sql}\n` +
     `TOTAL DE LINHAS RETORNADAS: ${rows.length}\n` +
+    `ANALISE LOCAL NODE/ARQUERO/DECIMAL (auxiliar; nao invente dados):\n${jsonSeguro(analiseDados || {}, 4000)}\n` +
     `DADOS RETORNADOS (ate ${MAX_LINHAS_PARA_IA} linhas):\n${jsonSeguro(amostra, 16_000)}\n\n` +
     `Responda em portugues brasileiro, de forma natural e objetiva.`;
 
@@ -1097,7 +1281,7 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
   }
 }
 
-function estadoPublico(ctx, execucao) {
+function estadoPublico(ctx, execucao, analiseDados = null) {
   const primeira = execucao.rows?.[0] || {};
   return {
     fonte: `public.${ctx.relacao}`,
@@ -1106,6 +1290,12 @@ function estadoPublico(ctx, execucao) {
     colunas_resultado: Object.keys(primeira).slice(0, 30),
     early_accept: execucao.earlyAccept === true,
     reparos_usados: Math.max(0, Number(execucao.tentativa || 0)),
+    analise_dados: analiseDados ? {
+      arquero_ativo: !!analiseDados?.bibliotecas?.arquero,
+      decimal_ativo: !!analiseDados?.bibliotecas?.decimal,
+      total_linhas_conferido: analiseDados?.total_linhas ?? (execucao.rows?.length || 0),
+      validacoes: analiseDados?.validacoes || [],
+    } : null,
   };
 }
 
@@ -1147,7 +1337,7 @@ export async function responderPergunta(pergunta, historico = []) {
       return {
         resposta: "Não consegui transformar essa pergunta em uma consulta segura aos dados. Pode reformular?",
         erro: "sql_nao_gerada",
-        modoAgente: "sql_agent_self_healing_v13_ram30",
+        modoAgente: "sql_agent_self_healing_v13_6_arquero_decimal",
       };
     }
 
@@ -1228,12 +1418,17 @@ export async function responderPergunta(pergunta, historico = []) {
     console.log("SQL AGENT - SQL FINAL:", execucao.sql);
     console.log("SQL AGENT - LINHAS:", execucao.rows.length, "| REPAROS:", execucao.tentativa || 0, "| EARLY_ACCEPT:", !!execucao.earlyAccept);
 
-    const resposta = await redigirResposta(texto, historico, execucao.sql, execucao.rows, ctx);
+    // Camada local de conferencia. Se Arquero/Decimal.js nao estiverem instalados,
+    // os imports dinamicos falham de forma controlada e o agente segue com fallback.
+    const analiseDados = await analisarResultadoLocal(execucao.rows);
+    console.log("SQL AGENT - ANALISE LOCAL:", jsonSeguro(analiseDados, 2000));
+
+    const resposta = await redigirResposta(texto, historico, execucao.sql, execucao.rows, ctx, analiseDados);
     return {
       resposta,
       sql: execucao.sql,
       linhas: execucao.rows.length,
-      estado: estadoPublico(ctx, execucao),
+      estado: estadoPublico(ctx, execucao, analiseDados),
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
       tentativas: execucao.tentativas,
@@ -1244,7 +1439,7 @@ export async function responderPergunta(pergunta, historico = []) {
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "sql_agent_self_healing_v13_ram30_erro",
+      modoAgente: "sql_agent_self_healing_v13_6_arquero_decimal_erro",
     };
   }
 }
