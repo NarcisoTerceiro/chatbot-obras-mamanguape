@@ -1072,6 +1072,34 @@ function respostaFinanceiraDiretaSegura(pergunta = "", rows = []) {
   return `${rotuloHumano(campo)}: ${moeda}.`;
 }
 
+// Decide se a resposta pode ser montada LOCALMENTE, sem gastar uma chamada de
+// IA. Campos "diretos" (nome, bairro, status, valores, pessoas) o Node formata
+// perfeitamente. So vale a pena chamar a IA quando ha campos LIVRES de
+// dados_extras (recurso, contrato, convenio, observacoes...) que costumam
+// precisar de explicacao textual associando campo a cada registro.
+const CAMPOS_DIRETOS_REDACAO = new Set([
+  "id", "objeto", "bairro", "status", "status_original", "categoria",
+  "valor_total", "valor_executado", "percentual_executado",
+  "engenheiro", "empresa", "aba_origem", "tipo_negocio",
+  "total_obras", "total", "quantidade", "count", "soma", "media",
+]);
+function redacaoLocalEhSuficiente(rows = []) {
+  if (!Array.isArray(rows) || rows.length === 0) return false;
+  // Se qualquer linha trouxer uma coluna fora da lista "direta", provavelmente
+  // e um campo livre (recurso/contrato/etc.) que a IA redige melhor.
+  for (const r of rows) {
+    if (!r || typeof r !== "object") return false;
+    for (const chave of Object.keys(r)) {
+      const k = chave.toLowerCase();
+      if (CAMPOS_DIRETOS_REDACAO.has(k)) continue;
+      // nomes agregados tipo "total_x", "qtd_x", "valor_x" tambem sao diretos
+      if (/^(total|qtd|quantidade|count|soma|media|valor|num|numero)[_a-z]*$/.test(k)) continue;
+      return false; // achou campo livre -> melhor usar IA
+    }
+  }
+  return true; // tudo direto -> Node monta sozinho
+}
+
 function fallbackResposta(pergunta, rows = []) {
   if (!rows.length) return "Não encontrei registros que correspondam a essa pergunta nos dados atuais.";
 
@@ -1199,6 +1227,19 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx) {
   // interpretado pela IA como quantidade de registros.
   const financeiroSeguro = respostaFinanceiraDiretaSegura(pergunta, rows);
   if (financeiroSeguro) return financeiroSeguro;
+
+  // --- ECONOMIA DE TOKENS (conforme literatura de otimizacao de LLM) ---
+  // Listas e registros simples NAO precisam de IA para serem redigidos: o
+  // fallbackResposta ja formata nome + campos em portugues. Chamar a IA so
+  // para montar uma lista desperdica tokens e e a maior causa do erro 429.
+  // So mandamos para a IA quando a resposta exige redacao mais rica (poucas
+  // colunas "livres" de dados_extras que pedem explicacao textual).
+  // Regra: se as linhas tem apenas campos diretos (objeto/bairro/status/valor/
+  // engenheiro/empresa/percentual) e nenhuma chave "livre" de dados_extras,
+  // respondemos LOCALMENTE (zero IA).
+  if (redacaoLocalEhSuficiente(rows)) {
+    return fallbackResposta(pergunta, rows);
+  }
 
   const amostra = rows.slice(0, MAX_LINHAS_PARA_IA);
   const prompt = `Voce e o redator final de um chatbot de obras publicas no WhatsApp.\n` +
