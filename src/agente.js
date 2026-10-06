@@ -16,7 +16,7 @@
 // ============================================================
 
 import { queryReadOnly } from "./db.js";
-import { chamarIAbruta, interpretarPergunta } from "./groq.js";
+import { chamarIAbruta, interpretarPergunta, redigirResposta as redigirRespostaIA } from "./groq.js";
 
 // Bibliotecas Arquero/Decimal removidas: o agente usa apenas validacoes nativas do Node.
 
@@ -672,6 +672,72 @@ const ALIASES_CAMPOS = new Map([
   ["observacoes", "observacoes"], ["observacao", "observacoes"],
 ]);
 
+
+// ------------------------------------------------------------
+// V14.1 - LISTAS DE DIMENSOES / VALORES UNICOS
+// Perguntas como "me informa todos os bairros?" nao significam "liste todas
+// as obras". O Node corrige esse tipo de intencao deterministicamente, sem
+// depender da IA acertar exatamente o nome da acao.
+// ------------------------------------------------------------
+const DIMENSOES_UNICAS = [
+  { campo: "tipo_recurso", rx: /\b(?:tipos?|fontes?)\s+(?:de\s+)?recursos?\b/ },
+  { campo: "bairro", rx: /\bbairros?\b/ },
+  { campo: "engenheiro", rx: /\b(?:engenheiros?|engenheiras?|arquitetos?|arquitetas?|responsaveis?|responsáveis?)\b/ },
+  { campo: "empresa", rx: /\bempresas?\b/ },
+  { campo: "recurso", rx: /\brecursos?\b/ },
+  { campo: "status", rx: /\b(?:status|situacoes?|situações?)\b/ },
+  { campo: "categoria", rx: /\bcategorias?\b/ },
+];
+
+function corrigirIntencaoValoresUnicos(intencao, pergunta = "", historico = []) {
+  const p = normalizar(pergunta);
+  if (!p) return intencao;
+
+  // Ranking/contagem/analise por dimensao nao deve virar DISTINCT.
+  if (/\b(?:mais|menos|maior|menor|quantos?|quantas?|quantidade|media|média|soma|total|valor|investid|executad)\b/.test(p)) {
+    return intencao;
+  }
+
+  // "bairro de cada obra", "engenheiro de cada uma" etc. pedem associacao
+  // registro -> campo, nao apenas a lista de nomes unicos.
+  if (/\b(?:cada\s+(?:obra|projeto|licitacao|licitação|uma)|por\s+(?:obra|projeto|licitacao|licitação))\b/.test(p)) {
+    return intencao;
+  }
+
+  const dim = DIMENSOES_UNICAS.find((d) => d.rx.test(p));
+  if (!dim) return intencao;
+
+  const pedidoDeLista = /\b(?:todos?|todas?|quais|lista|listar|liste|informa|informe|informar|nomes?|diferentes|distintos?|existem)\b/.test(p);
+  const curta = p.split(/\s+/).filter(Boolean).length <= 4;
+  if (!pedidoDeLista && !curta) return intencao;
+
+  const anterior = ultimaConsultaConfirmada(historico);
+  const universoExplicito = universoNegocioDaPergunta(pergunta);
+
+  // Se o usuario acabou de falar de um recorte (ex.: obras) e pergunta apenas
+  // "todos os bairros?", reutilizamos o WHERE anterior. Sem contexto, bairros
+  // e demais dimensoes simples assumem o universo de obras, que e o principal
+  // universo do chatbot.
+  const usarContexto = !universoExplicito && Boolean(anterior);
+  const universo = universoExplicito || (usarContexto ? "auto" : (intencao?.universo && intencao.universo !== "auto" ? intencao.universo : "obra"));
+
+  return {
+    ...(intencao || {}),
+    acao: "valores_unicos",
+    campo: dim.campo,
+    agrupar_por: "",
+    medida: "",
+    direcao: "",
+    filtros: Array.isArray(intencao?.filtros) ? intencao.filtros : [],
+    termos: [],
+    usar_contexto: usarContexto || intencao?.usar_contexto === true,
+    universo,
+    limite: Math.min(MAX_RESULTADOS, 200),
+    detalhe: "resumido",
+    falhou: false,
+  };
+}
+
 const EXTRAS_PREFERIDOS = {
   contrato: ["Nº DO CONTRATO", "N° DO CONTRATO", "NUMERO DO CONTRATO", "CONTRATO"],
   convenio: ["CONVÊNIO", "CONVENIO", "Nº DO CONVÊNIO", "N° DO CONVÊNIO"],
@@ -940,9 +1006,12 @@ function gerarSQLDeterministico(intencao, pergunta, historico, ctx) {
 
   if (acao === "valores_unicos") {
     if (!campo) return null;
+    // Lista de dimensoes (bairros, engenheiros, empresas etc.) deve trazer
+    // TODOS os valores distintos do recorte, nao apenas os 20 primeiros.
+    const limiteUnicos = Math.min(MAX_RESULTADOS, 200);
     return `SELECT DISTINCT ${campo.expressao} AS ${campo.alias} FROM ${rel} ` +
       `WHERE ${where} AND ${campo.expressao} IS NOT NULL AND BTRIM(${campo.expressao}::text) <> '' ` +
-      `ORDER BY ${campo.alias} LIMIT ${limite}`;
+      `ORDER BY ${campo.alias} LIMIT ${limiteUnicos}`;
   }
 
   if (acao === "campo") {
@@ -988,6 +1057,18 @@ async function executarSQLDiretoSeguro({ ctx, sql }) {
 }
 
 function respostaLocalPorIntencao(intencao, pergunta, rows = []) {
+  if (intencao?.acao === "valores_unicos") {
+    if (!rows.length) return "Não encontrei valores para esse campo nesse recorte.";
+    const campo = intencao.campo || Object.keys(rows[0] || {})[0];
+    const resolvida = Object.keys(rows[0] || {}).find((k) => normalizarChaveSemantica(k) === normalizarChaveSemantica(campo)) || Object.keys(rows[0] || {})[0];
+    const valores = [...new Set(rows.map((r) => r?.[resolvida]).filter((v) => v !== null && v !== undefined && String(v).trim() !== "").map(String))];
+    if (!valores.length) return "Não encontrei valores para esse campo nesse recorte.";
+    const rotulo = rotuloHumano(resolvida);
+    const titulo = rotulo.endsWith("s") ? rotulo : `${rotulo}s`;
+    return `${titulo} encontrados (${valores.length}):
+` + valores.map((v, i) => `${i + 1}. ${v}`).join("\n");
+  }
+
   const agregado = respostaAgregadoComDimensaoSegura(pergunta, rows);
   if (agregado) return agregado;
   const contagem = respostaContagemDiretaSegura(pergunta, rows);
@@ -1765,16 +1846,19 @@ export async function responderPergunta(pergunta, historico = []) {
       // UNICA chamada normal de IA: entender a pergunta. Nao recebe schema nem
       // catalogo inteiro e NAO gera SQL.
       intencao = await interpretarPergunta(texto, historico);
+      // Guardrail local: "todos os bairros", "quais empresas", "engenheiros?"
+      // etc. significam valores unicos da dimensao, e nao lista de obras.
+      intencao = corrigirIntencaoValoresUnicos(intencao, texto, historico);
       const sqlDet = gerarSQLDeterministico(intencao, texto, historico, ctx);
 
       if (sqlDet) {
-        gerada = { query: sqlDet, descricao: "motor deterministico v14" };
+        gerada = { query: sqlDet, descricao: "motor deterministico v14.1" };
         modoDeterministico = true;
-        console.log("MOTOR V14 - INTENCAO:", JSON.stringify(intencao));
+        console.log("MOTOR V14.1 - INTENCAO:", JSON.stringify(intencao));
       } else {
         // Plano B: mantemos o SQL Agent antigo para perguntas realmente fora do
         // DSL/motor. Assim a troca nao deixa o bot "burro".
-        console.log("MOTOR V14 - FALLBACK PARA SQL AGENT COMPLETO");
+        console.log("MOTOR V14.1 - FALLBACK PARA SQL AGENT COMPLETO");
         gerada = await gerarSQL(texto, historico, ctx);
       }
     }
@@ -1783,7 +1867,7 @@ export async function responderPergunta(pergunta, historico = []) {
       return {
         resposta: "Não consegui transformar essa pergunta em uma consulta segura aos dados. Pode reformular?",
         erro: "sql_nao_gerada",
-        modoAgente: "motor_consulta_v14",
+        modoAgente: "motor_consulta_v14_1",
       };
     }
 
@@ -1832,7 +1916,7 @@ export async function responderPergunta(pergunta, historico = []) {
 
       // Se uma mudanca de schema ou campo raro quebrar o motor, usa o agente
       // antigo UMA vez como rede de seguranca.
-      console.warn("MOTOR V14 - consulta deterministica falhou; usando fallback SQL Agent:", erroDet.message);
+      console.warn("MOTOR V14.1 - consulta deterministica falhou; usando fallback SQL Agent:", erroDet.message);
       const fallback = await gerarSQL(texto, historico, ctx,
         `O motor deterministico falhou com: ${textoSeguro(erroDet.message, 300)}. Gere uma SELECT segura.`);
       if (!fallback.query) throw erroDet;
@@ -1846,11 +1930,34 @@ export async function responderPergunta(pergunta, historico = []) {
     console.log("SQL AGENT - SQL FINAL:", execucao.sql);
     console.log("SQL AGENT - LINHAS:", execucao.rows.length, "| REPAROS:", execucao.tentativa || 0, "| EARLY_ACCEPT:", !!execucao.earlyAccept);
 
-    // Fluxo normal: resposta 100% local, sem segunda chamada de IA.
-    // No fallback legado, mantemos o redator existente somente quando necessario.
-    const resposta = modoDeterministico
-      ? respostaLocalPorIntencao(intencao, texto, execucao.rows)
-      : await redigirResposta(texto, historico, execucao.sql, execucao.rows, ctx);
+    // V14.2: no fluxo normal a IA tem apenas dois papeis:
+    // 1) entender a pergunta (classificador pequeno);
+    // 2) redigir em portugues a resposta que o SISTEMA ja calculou.
+    // A IA NAO recebe schema/SQL/regras para resolver a consulta e NAO refaz contas.
+    // Primeiro o Node produz uma resposta factual autoritativa. Depois a IA apenas
+    // melhora a apresentacao. Se a redacao falhar/429, devolvemos o texto local.
+    let resposta;
+    if (modoDeterministico) {
+      const respostaFactual = respostaLocalPorIntencao(intencao, texto, execucao.rows);
+      try {
+        const redigida = await redigirRespostaIA(
+          texto,
+          [], // fatos ja contem o resultado; nao reenviamos linhas para economizar tokens
+          intencao?.detalhe || "resumido",
+          historico,
+          respostaFactual,
+          "O sistema ja resolveu a consulta. Apenas apresente a resposta factual com clareza. " +
+          "Nao recalcule, nao altere numeros, nomes, quantidades ou itens e nao acrescente fatos."
+        );
+        resposta = limparRespostaParaWhatsApp(String(redigida || "").trim()) || respostaFactual;
+        console.log("MOTOR V14.2 - REDACAO FINAL POR IA");
+      } catch (erroRedacao) {
+        console.warn("MOTOR V14.2 - redacao IA falhou; usando resposta local:", erroRedacao.message);
+        resposta = respostaFactual;
+      }
+    } else {
+      resposta = await redigirResposta(texto, historico, execucao.sql, execucao.rows, ctx);
+    }
 
     return {
       resposta,
@@ -1864,14 +1971,14 @@ export async function responderPergunta(pergunta, historico = []) {
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
       tentativas: execucao.tentativas,
-      modoAgente: modoDeterministico ? "motor_consulta_v14" : "sql_agent_fallback_v14",
+      modoAgente: modoDeterministico ? "motor_consulta_v14_2_ia_entende_redige" : "sql_agent_fallback_v14",
     };
   } catch (e) {
     console.error("MOTOR V14: falha final:", e);
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "motor_consulta_v14_erro",
+      modoAgente: "motor_consulta_v14_2_erro",
     };
   }
 }
