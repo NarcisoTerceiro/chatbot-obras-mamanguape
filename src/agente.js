@@ -992,13 +992,23 @@ function rotuloHumano(campo = "") {
     saldo_devedor: "Saldo devedor",
     observacoes: "Observações",
     quantidade: "Quantidade",
+    total_investido: "Total investido",
+    total_valor: "Total",
+    soma_valor: "Total",
   };
   return mapa[campo] || campo.replace(/_/g, " ");
 }
 
 function valorFallback(campo, valor) {
   if (valor === null || valor === undefined || valor === "") return null;
-  if (["valor_total", "valor_executado", "quanto_falta", "saldo_devedor", "aditivo"].includes(campo)) {
+  // Campos de dinheiro fixos + QUALQUER campo agregado de valor/total/soma/
+  // investido (ex.: total_investido, soma_valor, valor_total_obras). Antes o
+  // "total_investido" saia como numero cru ("3059000") sem formatar.
+  const k = String(campo).toLowerCase();
+  const ehDinheiro =
+    ["valor_total", "valor_executado", "quanto_falta", "saldo_devedor", "aditivo"].includes(campo) ||
+    /(valor|investid|total_inv|soma|montante|custo|orcament)/.test(k);
+  if (ehDinheiro) {
     const n = Number(valor);
     if (Number.isFinite(n)) {
       return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(n);
@@ -1100,8 +1110,44 @@ function redacaoLocalEhSuficiente(rows = []) {
   return true; // tudo direto -> Node monta sozinho
 }
 
+// Detecta uma coluna de TOTAL agregado que vem repetida igual em todas as
+// linhas (ex.: SUM(...) OVER () AS total_investido). Em vez de repetir o total
+// em cada item, mostramos UMA vez no topo e removemos a coluna das linhas.
+function extrairTotalAgregadoRepetido(rows = []) {
+  if (!Array.isArray(rows) || rows.length < 2) return null;
+  const candidatos = ["total_investido", "total_valor", "soma_valor", "total", "valor_total_obras", "soma", "total_geral"];
+  for (const chave of Object.keys(rows[0] || {})) {
+    const k = chave.toLowerCase();
+    const ehTotal = candidatos.includes(k) || /^(total|soma)_/.test(k) || /_total$/.test(k);
+    if (!ehTotal) continue;
+    // o valor precisa ser o MESMO em todas as linhas (é um total do conjunto)
+    const v0 = String(rows[0][chave]);
+    const igualEmTodas = rows.every((r) => String(r[chave]) === v0);
+    if (igualEmTodas && v0 && v0 !== "null" && v0 !== "undefined") {
+      return { chave, valor: rows[0][chave] };
+    }
+  }
+  return null;
+}
+
 function fallbackResposta(pergunta, rows = []) {
   if (!rows.length) return "Não encontrei registros que correspondam a essa pergunta nos dados atuais.";
+
+  // Se houver um total do conjunto repetido em todas as linhas, destaca no topo
+  // e remove das linhas (senão ele apareceria cru e repetido em cada obra).
+  let cabecalhoTotal = "";
+  const totalRep = extrairTotalAgregadoRepetido(rows);
+  if (totalRep) {
+    const totalFmt = valorFallback(totalRep.chave, totalRep.valor) ?? String(totalRep.valor);
+    cabecalhoTotal = `${rotuloHumano(totalRep.chave)}: *${totalFmt}*\n\n`;
+    // remove a coluna do total de cada linha (cópia, não altera original)
+    rows = rows.map((r) => {
+      const c = { ...r };
+      delete c[totalRep.chave];
+      return c;
+    });
+  }
+  const _prefixo = cabecalhoTotal;
 
   const camposTecnicosOcultos = new Set(["id", "objeto"]);
   if (rows.length === 1) {
@@ -1135,7 +1181,7 @@ function fallbackResposta(pergunta, rows = []) {
     if (nome) return `${i + 1}. ${nome}${detalhes ? ` — ${detalhes}` : ""}`;
     return `${i + 1}. ${detalhes || "Registro encontrado"}`;
   });
-  return `${linhas.join("\n")}${rows.length > exibidas.length ? `\n… e mais ${rows.length - exibidas.length}.` : ""}`;
+  return `${_prefixo}${linhas.join("\n")}${rows.length > exibidas.length ? `\n… e mais ${rows.length - exibidas.length}.` : ""}`;
 }
 
 function respostaAgregadoComDimensaoSegura(pergunta = "", rows = []) {
