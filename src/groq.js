@@ -1,13 +1,13 @@
 // ============================================================
 //  groq.js
-//  IA do chatbot: SOMENTE Groq + Gemini.
+//  IA do chatbot: Groq principal + Gemini de reserva.
 //
 //  Estrategia:
-//    1) Groq primeiro, usando modelo leve/atual.
-//    2) Se o modelo configurado nao existir, tenta outro modelo Groq atual.
-//    3) Em 429/erro, cai imediatamente para Gemini.
-//    4) Gemini usa a API nativa + x-goog-api-key (mais robusto que a camada
-//       OpenAI-compatible para chaves do Google AI Studio).
+//    1) Groq primeiro, com UM modelo configurado (padrao GPT-OSS-20B).
+//    2) Se Groq falhar/atingir 429, cai imediatamente para Gemini.
+//    3) Sem OpenRouter/Nemotron.
+//    4) O classificador de intencao usa prompt curto; regras de negocio,
+//       schema, SQL, calculos e validacoes ficam no Node/PostgreSQL.
 //
 //  Variaveis de ambiente:
 //    GROQ_API_KEY
@@ -18,15 +18,8 @@
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_KEY = (process.env.GROQ_API_KEY || "").trim();
-const GROQ_MODEL_ENV = (process.env.GROQ_MODEL || "").trim();
-// 20B primeiro: menor custo/latencia. 120B fica somente como reserva dentro
-// do proprio Groq. Se o Render ainda tiver um modelo antigo, ele e tentado
-// primeiro; se vier model_not_found/404, o codigo troca sozinho.
-const GROQ_MODELOS = [...new Set([
-  GROQ_MODEL_ENV,
-  "openai/gpt-oss-20b",
-  "openai/gpt-oss-120b",
-].filter(Boolean))];
+const GROQ_MODEL = (process.env.GROQ_MODEL || "openai/gpt-oss-20b").trim();
+const GROQ_MODELOS = [GROQ_MODEL];
 
 const GEMINI_KEY = (
   process.env.GEMINI_API_KEY ||
@@ -37,6 +30,7 @@ const GEMINI_KEY = (
 const GEMINI_MODEL = (process.env.GEMINI_MODEL || "gemini-3.5-flash-lite").trim();
 
 const PROVEDORES = [];
+// Ordem de prioridade: Groq -> Gemini.
 if (GROQ_KEY) PROVEDORES.push({ nome: "groq" });
 if (GEMINI_KEY) PROVEDORES.push({ nome: "gemini" });
 if (PROVEDORES.length === 0) {
@@ -47,8 +41,8 @@ if (PROVEDORES.length === 0) {
 const CONTATO_SECRETARIA = process.env.CONTATO_SECRETARIA || "";
 
 // Mantem contexto pequeno para economizar TPM.
-const MAX_HISTORICO_ENVIO = 4;
-const MAX_CHARS_HISTORICO = 220;
+const MAX_HISTORICO_ENVIO = 2;
+const MAX_CHARS_HISTORICO = 180;
 
 const OPERACOES_VALIDAS = new Set([
   "maior_valor",
@@ -65,7 +59,7 @@ const TIMEOUT_IA_MS = 18 * 1000;
 const MAX_SAIDA_GLOBAL = 1000;
 // Em 429, tenta outro modelo/provedor primeiro. Se todos estiverem limitados,
 // pode aguardar uma unica janela curta indicada pelo Retry-After e tentar de novo.
-const MAX_ESPERA_429_MS = Math.max(0, Math.min(Number(process.env.IA_MAX_ESPERA_429_MS || 14000), 30000));
+const MAX_ESPERA_429_MS = Math.max(0, Math.min(Number(process.env.IA_MAX_ESPERA_429_MS || 3000), 30000));
 const RETENTAR_429 = process.env.IA_RETENTAR_429 !== "false";
 
 function limiteSaida(body) {
@@ -158,7 +152,11 @@ async function chamarGroq(body) {
     const data = await resp.json();
     const texto = data.choices?.[0]?.message?.content?.trim() || "";
     if (!texto) throw new Error(`groq (${model}) devolveu resposta vazia`);
+    const u = data?.usage || {};
     console.log(`DEBUG IA usada: Groq (principal) | modelo: ${model}`);
+    if (u.prompt_tokens != null || u.completion_tokens != null) {
+      console.log(`DEBUG TOKENS Groq | entrada=${u.prompt_tokens ?? "?"} | saida=${u.completion_tokens ?? "?"} | total=${u.total_tokens ?? "?"}`);
+    }
     return texto;
   }
 
@@ -226,7 +224,11 @@ async function chamarGemini(body) {
   const parts = data?.candidates?.[0]?.content?.parts || [];
   const texto = parts.map((p) => typeof p?.text === "string" ? p.text : "").join("").trim();
   if (!texto) throw new Error("gemini devolveu resposta vazia");
-  console.log(`DEBUG IA usada: Gemini (fallback) | modelo: ${GEMINI_MODEL}`);
+  const u = data?.usageMetadata || {};
+  console.log(`DEBUG IA usada: Gemini (fallback 2) | modelo: ${GEMINI_MODEL}`);
+  if (u.promptTokenCount != null || u.candidatesTokenCount != null) {
+    console.log(`DEBUG TOKENS Gemini | entrada=${u.promptTokenCount ?? "?"} | saida=${u.candidatesTokenCount ?? "?"} | total=${u.totalTokenCount ?? "?"}`);
+  }
   return texto;
 }
 
@@ -266,13 +268,17 @@ async function chamarIA(body, tentativa429 = 0) {
         const pausa = Math.max(1000, Math.min(e.retryAfterMs || DESCANSO_PADRAO_MS, 60_000));
         provedorDescansando.set(prov.nome, Date.now() + pausa);
         console.log(`DEBUG ${prov.nome} em limite - cooldown de ${Math.ceil(pausa / 1000)}s; tentando outro provedor se existir.`);
-        // NAO interrompe: o proximo provedor (por exemplo Gemini) e tentado imediatamente.
+        // NAO interrompe: o proximo provedor da fila e tentado imediatamente.
         continue;
       }
 
-      if (prov.nome === "gemini" && (e.status === 401 || e.status === 403)) {
+      if ((e.status === 401 || e.status === 403)) {
         provedorDescansando.set(prov.nome, Date.now() + 10 * 60 * 1000);
-        console.error("DEBUG Gemini: confira GEMINI_API_KEY no Render (chave do Google AI Studio).");
+        if (prov.nome === "groq") {
+          console.error("DEBUG Groq: confira GROQ_API_KEY no Render.");
+        } else if (prov.nome === "gemini") {
+          console.error("DEBUG Gemini: confira GEMINI_API_KEY no Render (chave do Google AI Studio).");
+        }
       }
       // Erro de um provedor nao impede tentar o seguinte.
     }
@@ -309,229 +315,200 @@ function prepararHistorico(historico) {
 }
 
 // ============================================================
-//  PARTE 1 - INTERPRETACAO (com memoria da conversa)
+//  PARTE 1 - INTERPRETACAO LEVE
+//  A IA SOMENTE entende a pergunta e devolve uma intencao estruturada.
+//  Regras de negocio, schema, SQL, calculos e validacoes ficam no Node.
 // ============================================================
 
-const SYSTEM_PROMPT_INTERPRETAR = `Voce interpreta perguntas de cidadaos sobre obras publicas de uma prefeitura
-(WhatsApp, linguagem informal, com girias, abreviacoes e erros de digitacao).
-Sua unica tarefa: entender a INTENCAO e devolver um JSON. Voce NAO escreve
-resposta ao cidadao - quem faz isso e outra etapa. Voce so classifica.
+const SYSTEM_PROMPT_INTERPRETAR = `Voce e um CLASSIFICADOR SEMANTICO de perguntas sobre obras publicas.
+NAO gere SQL. NAO calcule. NAO responda ao cidadao.
+Entenda girias, erros de digitacao e referencias como "essas", "delas", "ele/ela".
 
-Entenda o SENTIDO, nao as palavras exatas. "ta pronta a creche?", "a creche ja
-acabou?" e "situacao da creche" pedem a mesma coisa.
+Retorne SOMENTE JSON com:
+{
+ "acao":"listar|buscar|contar|somar|media|ranking|campo|existencia|valores_unicos|complexa",
+ "universo":"obra|projeto|licitacao|auto",
+ "campo":"",
+ "agrupar_por":"",
+ "medida":"",
+ "direcao":"maior|menor|",
+ "filtros":[{"campo":"","valor":""}],
+ "termos":[],
+ "usar_contexto":false,
+ "limite":20,
+ "detalhe":"resumido|completo"
+}
 
-Use o HISTORICO da conversa para resolver referencias. Se a pergunta claramente
-continua o assunto anterior (ex.: "e o valor de cada uma?", "quantas dessas estao
-paradas?", "os engenheiros dessas", "cada uma"), marque "usar_contexto":true e
-monte so a operacao - o sistema ja aplica sobre as obras que voce mostrou antes.
-Se for assunto novo sobre a base inteira, "usar_contexto":false.
+VOCABULARIO SEMANTICO (use estes nomes; o sistema faz o mapeamento real):
+- valor investido/custo/valor total -> campo "valor_total"
+- valor executado/pago -> "valor_executado"
+- percentual/execucao -> "percentual_executado"
+- responsavel/engenheiro/arquiteto -> "engenheiro"
+- etapa da licitacao -> "status_original"
+- situacao/status -> "status"
+- recurso -> "recurso"; tipo/fonte do recurso -> "tipo_recurso"
+- bairro, empresa, categoria, contrato, convenio, data_inicio, data_prev_termino
+- concluida/pronta/finalizada -> filtro {"campo":"situacao","valor":"concluido"}
+- em andamento/sendo feita -> filtro {"campo":"situacao","valor":"em_andamento"}
 
-TIPOS possiveis:
-- "saudacao": so cumprimento/agradecimento, SEM pedido de informacao ("oi", "bom dia", "valeu").
-- "listagem": pedido generico da lista de obras, SEM citar bairro/nome/tipo
-  especifico ("quais obras existem", "me mostra as obras", "o que ta sendo feito
-  na cidade", "quais obras tem", "o que ta rolando de obra", "que obras a
-  prefeitura ta tocando"). Se NAO menciona um lugar/obra especifica, e listagem.
-- "agregacao": exige CONTA ou COMPARACAO ("mais cara", "quantas concluidas", "total gasto", "quantas por bairro").
-- "engenheiro": listar obras de um responsavel especifico ("obras do engenheiro Carlos") - poe SO o nome em "termos". (Se pedir CONTAGEM de obras de alguem, e "agregacao", nao "engenheiro".)
-- "busca": qualquer pergunta sobre uma obra/grupo especifico (bairro, rua, tipo, nome, empresa).
-
-Para "agregacao", use "operacao":
-  maior_valor | menor_valor | soma_valor | media_valor | contar_total
-  contar_por_status (preencha "filtro_status" com o status citado, ou vazio para contagem geral)
-
-REGRA sobre VALOR TOTAL: qualquer pergunta pedindo o valor/custo/investimento de
-um CONJUNTO de obras e SEMPRE soma_valor - nao importa como foi escrita. Trate
-como iguais: "qual o valor investido", "quais os valores", "quanto foi investido",
-"quanto custou tudo", "quanto gastou", "deu quanto no total", "soma dos valores".
-Singular ou plural NAO muda: as duas sao soma_valor. Se refere as obras ja
-mostradas, marque usar_contexto:true.
-
-Para "listar nomes sem repetir" (ex.: "so os nomes dos engenheiros", "quais
-empresas", "quais bairros tem obra"), use "receita" com contar_por:
-  "receita": { "filtros": [], "agregacao": { "tipo":"contar_por", "campo":"ENGENHEIRO" } }
-  Campos possiveis: ENGENHEIRO, EMPRESA, BAIRRO, STATUS.
-  Isso agrupa sem repetir a ficha da obra.
-
-Para "liste cada obra com seu X" (ex.: "quais engenheiros dessas obras", "liste
-cada obra com o valor", "cada uma com o engenheiro", "o valor de cada obra"), use
-"receita" com listar + campo - mostra cada obra e o valor daquele campo:
-  "receita": { "filtros": [], "agregacao": { "tipo":"listar", "campo":"ENGENHEIRO" } }
-  Campo pode ser: ENGENHEIRO, EMPRESA, VALOR TOTAL DA OBRA, BAIRRO, STATUS.
-  Se a pergunta se refere as obras ja mostradas, marque usar_contexto:true.
-
-Em "termos" (para busca e agregacao com recorte), coloque so o que IDENTIFICA a
-obra (bairro, rua, tipo, nome, empresa), normalizando girias: asfalto->pavimentacao,
-colegio->escola, postinho/posto->UBS, pracinha->praca, quadra->quadra poliesportiva.
-NAO inclua palavras vazias (obra, valor, prazo, situacao) nem "Mamanguape" sozinho
-(quase toda obra fica la). Se a pergunta indicar qual valor (executado, inicial,
-pago, aditivo), poe em "pista_valor". Se for vaga demais, "termos":[] vazio.
-
-"detalhe": "completo" se pede detalhes especificos ou uma obra so; senao "resumido".
-
-Responda SOMENTE com um JSON valido, sem texto antes ou depois:
-{"tipo":"busca","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":null}
-
-Exemplos:
-"bom dia" -> {"tipo":"saudacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":null}
-"quais obras tem?" -> {"tipo":"listagem","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":null}
-"o que ta sendo feito ai?" -> {"tipo":"listagem","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":null}
-"quanto custou o asfalto do centro?" -> {"tipo":"busca","termos":["pavimentacao","centro"],"detalhe":"completo","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":null}
-"qual a obra mais cara?" -> {"tipo":"agregacao","termos":[],"detalhe":"completo","operacao":"maior_valor","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":null}
-"quantas estao concluidas?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"contar_por_status","filtro_status":"concluida","pista_valor":"","usar_contexto":false,"receita":null}
-"quanto foi o total executado dessas?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"soma_valor","filtro_status":"","pista_valor":"executado","usar_contexto":true,"receita":null}
-"quais os valores investidos nessas obras?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"soma_valor","filtro_status":"","pista_valor":"","usar_contexto":true,"receita":null}
-"quanto custou tudo isso?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"soma_valor","filtro_status":"","pista_valor":"","usar_contexto":true,"receita":null}
-"so os nomes dos engenheiros" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":false,"receita":{"filtros":[],"agregacao":{"tipo":"contar_por","campo":"ENGENHEIRO"}}}
-"quais engenheiros dessas obras?" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":true,"receita":{"filtros":[],"agregacao":{"tipo":"listar","campo":"ENGENHEIRO"}}}
-"liste cada obra com seu valor investido" -> {"tipo":"agregacao","termos":[],"detalhe":"resumido","operacao":"","filtro_status":"","pista_valor":"","usar_contexto":true,"receita":{"filtros":[],"agregacao":{"tipo":"listar","campo":"VALOR TOTAL DA OBRA"}}}
+REGRAS DE INTENCAO:
+- "qual o valor investido nessas obras?" => somar valor_total + usar_contexto=true.
+- "valor de cada uma" => campo valor_total + usar_contexto=true (NAO somar).
+- "qual engenheiro tem mais obras?" => ranking, agrupar_por=engenheiro, medida=quantidade, direcao=maior, limite=1.
+- "qual engenheiro tem maior valor investido?" => ranking, agrupar_por=engenheiro, campo=valor_total, medida=soma, direcao=maior, limite=1.
+- "quais obras concluidas?" => listar universo=obra + filtro situacao=concluido.
+- "quais os recursos dessas?" => campo=recurso + usar_contexto=true.
+- AREA/TEMA: expressoes como "area da educacao", "area da saude" ou "do setor de educacao" NAO significam necessariamente coluna categoria. Coloque o tema em "termos" e deixe o sistema aplicar a semantica aos dados reais.
+- Ex.: "tem alguma licitacao da area da educacao?" => acao="existencia", universo="licitacao", filtros=[], termos=["educacao"].
+- Ex.: "qual o valor investido nas obras da area da educacao?" => acao="somar", universo="obra", campo="valor_total", termos=["educacao"], usar_contexto=false.
+- Ex.: "qual o valor investido nas obras da area da educacao e da saude?" => acao="somar", universo="obra", campo="valor_total", termos=["educacao","saude"], usar_contexto=false. Dois ou mais temas no mesmo pedido representam o conjunto combinado; o Node faz a uniao dos temas.
+- Se o usuario disser explicitamente "categoria X" ou pedir o campo categoria, ai sim use campo/filtro categoria.
+- PEDIDO DE VALORES UNICOS: se a pessoa pedir apenas todos/quais/nomes de bairros, engenheiros, empresas, status, categorias ou recursos, use acao="valores_unicos" e coloque a dimensao em "campo". NAO use acao="listar" nesses casos.
+- Ex.: "me informa todos os bairros?" => acao="valores_unicos", campo="bairro".
+- Ex.: "quais empresas?" => acao="valores_unicos", campo="empresa".
+- Se pedir "bairro/engenheiro de cada obra", ai use acao="campo" para manter a associacao com cada registro.
+- Se a frase pedir algo que nao cabe com seguranca nesses campos/acoes, use acao="complexa".
+- "usar_contexto" so e true quando a pergunta depende do conjunto/entidade anterior.
 `;
+
+function limparJsonIA(texto = "") {
+  const bruto = String(texto || "").replace(/```json|```/gi, "").trim();
+  const ini = bruto.indexOf("{");
+  const fim = bruto.lastIndexOf("}");
+  if (ini < 0 || fim <= ini) return null;
+  try { return JSON.parse(bruto.slice(ini, fim + 1)); } catch { return null; }
+}
+
+function intencaoFallback() {
+  return {
+    acao: "complexa", universo: "auto", campo: "", agrupar_por: "", medida: "",
+    direcao: "", filtros: [], termos: [], usar_contexto: false, limite: 20,
+    detalhe: "resumido", falhou: true,
+    // compatibilidade com o fluxo antigo
+    tipo: "busca", operacao: "", filtro_status: "", pista_valor: "", receita: null,
+  };
+}
 
 export async function interpretarPergunta(pergunta, historico = []) {
   const mensagens = [
     { role: "system", content: SYSTEM_PROMPT_INTERPRETAR },
     ...prepararHistorico(historico),
-    { role: "user", content: pergunta },
+    { role: "user", content: String(pergunta || "").slice(0, 1200) },
   ];
 
+  let texto = "";
   const base = {
     temperature: 0,
-    // IMPORTANTE: o gemini-2.5-flash e um modelo "pensante" - ele gasta tokens
-    // RACIOCINANDO antes de escrever, e esse raciocinio conta no max_tokens.
-    // Com 1024 + thinking ligado, perguntas complexas gastavam tudo pensando e
-    // sobrava zero para o JSON -> resposta vazia -> fallback de busca crua ->
-    // respostas repetidas ou sem sentido. (Bug confirmado: modelos de reasoning
-    // devolvem content vazio quando max_tokens e baixo demais.)
-    //
-    // CORRECAO: interpretar e so CLASSIFICAR (nao precisa raciocinio profundo).
-    // Desligamos o thinking com "none" (suportado nos modelos Gemini 2.5): o
-    // modelo vai direto ao JSON, mais rapido, mais barato e sem estourar. O
-    // max_tokens generoso fica como rede de seguranca para o JSON completo.
-    max_tokens: 450,
+    max_tokens: 300,
     reasoning_effort: "low",
     messages: mensagens,
   };
 
-  let texto = "";
+  // Uma unica chamada: o prompt ja exige JSON e o parser limpa cercas Markdown.
+  // Isso evita gastar uma segunda chamada apenas por incompatibilidade de
+  // response_format em algum modelo/provedor.
   try {
-    // Tentativa 1: modo JSON nativo (mais confiavel quando funciona).
-    texto = await chamarIA({ ...base, response_format: { type: "json_object" } });
+    texto = await chamarIA(base);
   } catch (e) {
-    // Se o modelo estourar o orcamento no modo JSON, ele devolve 400 com
-    // geracao vazia. Tentamos de novo SEM o modo JSON: o prompt ja pede JSON
-    // puro, e o parser abaixo limpa eventuais cercas de markdown.
-    console.error("Interpretacao em modo JSON falhou, tentando sem:", e.message);
-    try {
-      texto = await chamarIA(base);
-    } catch (e2) {
-      // Ultima tentativa: orcamento ainda maior e sem modo JSON. Cobre o caso
-      // raro de o modelo precisar de muito raciocinio numa pergunta ambigua.
-      console.error("Interpretacao (2a tentativa) falhou, tentando com folga:", e2.message);
-      texto = await chamarIA({ ...base, max_tokens: 650 });
-    }
+    console.error("CLASSIFICADOR: falhou:", e.message);
+    return intencaoFallback();
   }
 
-  // Se mesmo assim veio vazio, nao adianta parsear: sinaliza falha para o
-  // server.js pedir a pista que falta, em vez de chutar uma busca crua.
-  if (!texto || !texto.trim()) {
-    console.error("Interpretacao devolveu vazio apos todas as tentativas.");
-    return {
-      tipo: "busca", termos: [], detalhe: "completo", operacao: "",
-      filtro_status: "", pista_valor: "", receita: null,
-      usar_contexto: false, falhou: true,
-    };
-  }
+  const it = limparJsonIA(texto);
+  if (!it) return intencaoFallback();
 
-  // LOG TEMPORARIO DE DEBUG - remover depois de confirmar que esta ok
-  console.log("DEBUG resposta crua da IA (interpretar):", JSON.stringify(texto));
+  const acoes = new Set(["listar","buscar","contar","somar","media","ranking","campo","existencia","valores_unicos","complexa"]);
+  const universos = new Set(["obra","projeto","licitacao","auto"]);
+  const direcoes = new Set(["maior","menor",""]);
+  const acao = acoes.has(it.acao) ? it.acao : "complexa";
+  const universo = universos.has(it.universo) ? it.universo : "auto";
+  const direcao = direcoes.has(it.direcao) ? it.direcao : "";
+  const limiteBruto = Number(it.limite);
+  const limite = Number.isFinite(limiteBruto) ? Math.max(1, Math.min(Math.trunc(limiteBruto), 20)) : (acao === "ranking" ? 1 : 20);
 
-  try {
-    // Pega o primeiro objeto JSON que aparecer, mesmo com texto em volta.
-    const bruto = (texto || "").replace(/```json|```/g, "").trim();
-    const inicio = bruto.indexOf("{");
-    const fim = bruto.lastIndexOf("}");
-    const limpo = inicio >= 0 && fim > inicio ? bruto.slice(inicio, fim + 1) : "{}";
-    const it = JSON.parse(limpo);
+  const filtros = Array.isArray(it.filtros)
+    ? it.filtros.slice(0, 8).map((f) => ({
+        campo: typeof f?.campo === "string" ? f.campo.trim() : "",
+        valor: typeof f?.valor === "string" || typeof f?.valor === "number" || typeof f?.valor === "boolean"
+          ? String(f.valor).trim() : "",
+      })).filter((f) => f.campo && f.valor !== "")
+    : [];
 
-    const tiposValidos = ["busca", "saudacao", "listagem", "agregacao", "engenheiro"];
-    const tipo = tiposValidos.includes(it.tipo) ? it.tipo : "busca";
+  const termos = Array.isArray(it.termos)
+    ? it.termos.filter((t) => typeof t === "string" && t.trim()).map((t) => t.trim()).slice(0, 6)
+    : [];
 
-    // Valida a operacao: se a IA inventar uma que o sistema nao executa,
-    // tratamos como busca comum (nunca deixamos a IA fazer conta).
-    let operacao = typeof it.operacao === "string" ? it.operacao.trim() : "";
-    if (!OPERACOES_VALIDAS.has(operacao)) operacao = "";
+  // Campos antigos continuam presentes para nao quebrar nenhum import legado.
+  let tipo = ["contar","somar","media","ranking"].includes(acao) ? "agregacao"
+    : acao === "listar" ? "listagem" : "busca";
+  let operacao = "";
+  if (acao === "somar") operacao = "soma_valor";
+  if (acao === "media") operacao = "media_valor";
+  if (acao === "contar") operacao = "contar_total";
 
-    return {
-      tipo: tipo === "agregacao" && !operacao ? "busca" : tipo,
-      termos: Array.isArray(it.termos)
-        ? it.termos.filter((t) => typeof t === "string" && t.trim()).map((t) => t.trim())
-        : [],
-      detalhe: it.detalhe === "resumido" ? "resumido" : "completo",
-      operacao,
-      filtro_status: typeof it.filtro_status === "string" ? it.filtro_status.trim() : "",
-      pista_valor: typeof it.pista_valor === "string" ? it.pista_valor.trim() : "",
-      receita: it.receita && typeof it.receita === "object" ? it.receita : null,
-      // A propria IA ja decidiu, lendo o historico, se a pergunta se refere
-      // ao resultado anterior. Isso e mais confiavel que uma lista fixa de
-      // pronomes/expressoes no server.js (que sempre fica incompleta).
-      usar_contexto: it.usar_contexto === true,
-      falhou: false,
-    };
-  } catch {
-    // Sem JSON valido -> busca com a frase crua (o sistema ainda tenta buscar).
-    return {
-      tipo: "busca",
-      termos: [],
-      detalhe: "completo",
-      operacao: "",
-      filtro_status: "",
-      pista_valor: "",
-      receita: null,
-      usar_contexto: false,
-      falhou: true,
-    };
-  }
+  const resultado = {
+    acao, universo,
+    campo: typeof it.campo === "string" ? it.campo.trim() : "",
+    agrupar_por: typeof it.agrupar_por === "string" ? it.agrupar_por.trim() : "",
+    medida: typeof it.medida === "string" ? it.medida.trim() : "",
+    direcao,
+    filtros,
+    termos,
+    usar_contexto: it.usar_contexto === true,
+    limite,
+    detalhe: it.detalhe === "completo" ? "completo" : "resumido",
+    falhou: false,
+    tipo, operacao, filtro_status: "", pista_valor: "", receita: null,
+  };
+
+  console.log("DEBUG INTENCAO:", JSON.stringify(resultado));
+  return resultado;
 }
 
 // ============================================================
 //  PARTE 2 - REDACAO DA RESPOSTA FINAL (com memoria da conversa)
 // ============================================================
 
-const SYSTEM_PROMPT_RESPOSTA = `Voce e o Assistente de Obras da Prefeitura de Mamanguape, atendendo cidadaos
-pelo WhatsApp. Sua tarefa: entender o que a pessoa quer e entregar exatamente
-isso, de forma clara e curta.
+const SYSTEM_PROMPT_RESPOSTA = `Voce e o Assistente de Obras da Prefeitura de Mamanguape no WhatsApp.
+Sua funcao nesta etapa e SOMENTE REDIGIR. O sistema ja entendeu a pergunta, consultou
+o banco, aplicou as regras e fez os calculos. Voce nao decide filtros, nao gera SQL e
+nao recalcula nada.
 
-Voce recebe um JSON com:
-- "pergunta": o que o cidadao escreveu (pode ser informal).
-- "obras": as obras que o sistema ja filtrou da base. Pode vir vazia.
-- "fatos": (opcional) um calculo ja pronto (soma, total, contagem, media).
-- "instrucao": (opcional) orientacao de como responder este turno. Siga-a, mas
-  nunca a mencione.
+Voce recebe:
+- "pergunta": mensagem original do cidadao;
+- "fatos": resposta factual pronta e autoritativa produzida pelo sistema;
+- "obras": dados adicionais somente quando forem necessarios;
+- "instrucao": orientacao de apresentacao, nunca um novo fato.
 
-REGRA QUE NAO PODE SER QUEBRADA:
-Responda SOMENTE com o que estiver em "obras" e "fatos" - essa e a unica fonte de
-verdade. NUNCA invente, estime ou complete valores, datas, status, nomes de
-empresa ou engenheiro. Se um dado nao esta ali, diga com naturalidade que nao
-consta na base e ofereca ajudar de outro jeito. Se vier "fatos", use os numeros
-dele exatamente, sem refazer conta. Informar dado errado de obra publica e grave.
+REGRA ABSOLUTA DE VERDADE:
+- Use SOMENTE fatos/obras recebidos.
+- NUNCA altere numero, valor, nome, bairro, status, engenheiro, quantidade ou item.
+- NUNCA complete por conhecimento proprio, memoria ou suposicao.
+- NUNCA refaca soma, media, contagem ou ranking. Se "fatos" disser 7, responda 7.
+- Se um dado nao estiver presente, diga apenas que essa informacao nao consta no
+  resultado recebido.
 
-COMO RESPONDER:
-- Responda so o que foi pedido, sem despejar todos os campos. Se pediu o valor,
-  de o valor; se pediu o status, de o status.
-- Seja curto (formato WhatsApp, poucas linhas). Detalhe so se a pessoa pedir.
-- Entenda a pessoa mesmo com girias e erros. Status tem sinonimos: concluida =
-  concluido = pronta = finalizada; em andamento = sendo feita = tocando; parada =
-  atrasada = paralisada.
-- Se "obras" e "fatos" vierem vazios, peca a pista que falta (bairro, rua ou nome
-  da obra) em uma frase curta e cordial.
-- Nao repita o que ja disse antes no historico. Cada resposta traz algo novo.
-- Fale como a prefeitura falaria: cordial e humano. Nunca diga que e uma IA nem
-  cite "os dados", "a planilha" ou "o sistema".
-- Portugues do Brasil. Negrito com *asteriscos*, valores em R$ 1.408.500,00.
-  No maximo um emoji sutil.
+COMO REDIGIR:
+- Dê a resposta principal JA NA PRIMEIRA FRASE.
+- Depois, se ajudar, acrescente uma explicacao curta e natural baseada nos fatos.
+- Se o usuario pediu "todos", "quais" ou uma lista e fatos trouxerem uma lista,
+  mantenha TODOS os itens recebidos (ate 20). Nao troque a lista por um resumo.
+- Se for ranking, cite sempre a entidade E a medida: ex. "Centro, com 7 obras".
+- Se for valor, destaque o valor e diga em uma frase o que ele representa.
+- Se for contagem, informe a quantidade e o universo correto (obras/projetos/licitacoes).
+- Se for follow-up ("essas", "delas", "e o valor?"), responda diretamente sem
+  recontar toda a conversa.
+- Preserve conceitos diferentes: recurso != tipo de recurso; valor total != valor
+  executado; obra != projeto != licitacao.
+- Nao transforme pedido de bairros/engenheiros/empresas em lista de obras.
+- Nao fale "segundo a IA", "segundo o sistema", "consulta", "SQL", "banco" ou
+  "planilha".
+- Portugues do Brasil, claro e humano. Poucas linhas quando a pergunta for simples.
+- Formato WhatsApp: lista numerada ou marcadores quando houver varios itens; sem tabela.
+- Negrito pode usar *asteriscos*. Valores no formato R$ 1.408.500,00.
+- Nao termine com explicacoes tecnicas nem frases mecanicas.
 
-Responda apenas com o texto final da mensagem, sem JSON e sem aspas ao redor.
-`;
+Responda apenas com a mensagem final ao cidadao, sem JSON e sem aspas.`;
 
 // Limpa as obras antes de mandar pra IA: tira o campo interno "_aba", remove
 // campos vazios e corta textos muito longos.
@@ -563,8 +540,8 @@ export async function redigirResposta(pergunta, obras, detalhe, historico = [], 
 
   const texto = await chamarIA({
     temperature: 0.2,
-    // Cobre o raciocinio do modelo + o texto final da mensagem.
-    max_tokens: 700,
+    // Redacao apenas: o sistema ja resolveu a consulta.
+    max_tokens: 500,
     reasoning_effort: "low",
     messages: [
       { role: "system", content: SYSTEM_PROMPT_RESPOSTA },
