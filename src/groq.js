@@ -1,20 +1,30 @@
 // ============================================================
 //  groq.js
-//  IA do chatbot: SOMENTE Groq + Gemini.
+//  IA do chatbot: OpenRouter principal + Groq + Gemini de reserva.
 //
 //  Estrategia:
-//    1) Groq primeiro, usando modelo leve/atual.
-//    2) Se o modelo configurado nao existir, tenta outro modelo Groq atual.
-//    3) Em 429/erro, cai imediatamente para Gemini.
-//    4) Gemini usa a API nativa + x-goog-api-key (mais robusto que a camada
-//       OpenAI-compatible para chaves do Google AI Studio).
+//    1) OpenRouter primeiro (principal).
+//    2) Se OpenRouter estiver limitado/indisponivel, cai para Groq.
+//    3) Se Groq falhar ou atingir 429, cai para Gemini.
+//    4) Provedor com 429 entra temporariamente em cooldown; o seguinte
+//       e tentado na mesma mensagem para aumentar a disponibilidade.
 //
 //  Variaveis de ambiente:
+//    OPENROUTER_API_KEY
+//    OPENROUTER_MODEL  opcional; padrao openrouter/free
+//    OPENROUTER_SITE_URL opcional; URL do seu site/backend
+//    OPENROUTER_APP_NAME opcional; nome exibido no OpenRouter
 //    GROQ_API_KEY
 //    GROQ_MODEL       opcional; padrao openai/gpt-oss-20b
 //    GEMINI_API_KEY   (tambem aceita GOOGLE_API_KEY / GOOGLE_GENAI_API_KEY)
 //    GEMINI_MODEL     opcional; padrao gemini-3.5-flash-lite
 // ============================================================
+
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_KEY = (process.env.OPENROUTER_API_KEY || "").trim();
+const OPENROUTER_MODEL = (process.env.OPENROUTER_MODEL || "openrouter/free").trim();
+const OPENROUTER_SITE_URL = (process.env.OPENROUTER_SITE_URL || "").trim();
+const OPENROUTER_APP_NAME = (process.env.OPENROUTER_APP_NAME || "Chatbot Obras Mamanguape").trim();
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_KEY = (process.env.GROQ_API_KEY || "").trim();
@@ -37,10 +47,12 @@ const GEMINI_KEY = (
 const GEMINI_MODEL = (process.env.GEMINI_MODEL || "gemini-3.5-flash-lite").trim();
 
 const PROVEDORES = [];
+// Ordem de prioridade: OpenRouter -> Groq -> Gemini.
+if (OPENROUTER_KEY) PROVEDORES.push({ nome: "openrouter" });
 if (GROQ_KEY) PROVEDORES.push({ nome: "groq" });
 if (GEMINI_KEY) PROVEDORES.push({ nome: "gemini" });
 if (PROVEDORES.length === 0) {
-  console.warn("AVISO: configure GROQ_API_KEY e/ou GEMINI_API_KEY.");
+  console.warn("AVISO: configure OPENROUTER_API_KEY, GROQ_API_KEY e/ou GEMINI_API_KEY.");
 }
 
 // Contato para escalar quando o bot nao resolve (opcional, via .env).
@@ -158,7 +170,7 @@ async function chamarGroq(body) {
     const data = await resp.json();
     const texto = data.choices?.[0]?.message?.content?.trim() || "";
     if (!texto) throw new Error(`groq (${model}) devolveu resposta vazia`);
-    console.log(`DEBUG IA usada: Groq (principal) | modelo: ${model}`);
+    console.log(`DEBUG IA usada: Groq (fallback 2) | modelo: ${model}`);
     return texto;
   }
 
@@ -172,6 +184,52 @@ async function chamarGroq(body) {
     ultimoErro.retryAfterMs = Math.max(500, proximoModeloEm - Date.now());
   }
   throw ultimoErro || new Error("Nenhum modelo Groq disponivel para esta conta.");
+}
+
+async function chamarOpenRouter(body) {
+  const limite = limiteSaida(body);
+
+  // OpenRouter e OpenAI-compatible. O roteador openrouter/free escolhe
+  // automaticamente um modelo gratuito disponivel compativel com a requisicao.
+  const corpo = {
+    ...body,
+    model: OPENROUTER_MODEL,
+    max_tokens: limite,
+  };
+  delete corpo.max_completion_tokens;
+
+  // Nem todos os modelos gratuitos aceitam reasoning_effort no formato OpenAI.
+  // Remover aqui aumenta a compatibilidade sem alterar o prompt/regras do agente.
+  delete corpo.reasoning_effort;
+
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${OPENROUTER_KEY}`,
+  };
+  if (OPENROUTER_SITE_URL) headers["HTTP-Referer"] = OPENROUTER_SITE_URL;
+  if (OPENROUTER_APP_NAME) headers["X-Title"] = OPENROUTER_APP_NAME;
+
+  const resp = await fetchComTimeout(OPENROUTER_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(corpo),
+  });
+
+  if (!resp.ok) {
+    const erroTxt = await resp.text();
+    const err = new Error(`openrouter respondeu ${resp.status}: ${erroTxt.slice(0, 320)}`);
+    err.status = resp.status;
+    if (resp.status === 429) err.retryAfterMs = retryDepoisMs(resp, erroTxt);
+    throw err;
+  }
+
+  const data = await resp.json();
+  const texto = data.choices?.[0]?.message?.content?.trim() || "";
+  if (!texto) throw new Error(`openrouter (${OPENROUTER_MODEL}) devolveu resposta vazia`);
+
+  const modeloUsado = data.model || OPENROUTER_MODEL;
+  console.log(`DEBUG IA usada: OpenRouter (principal) | modelo: ${modeloUsado}`);
+  return texto;
 }
 
 function corpoGeminiNativo(body) {
@@ -226,13 +284,13 @@ async function chamarGemini(body) {
   const parts = data?.candidates?.[0]?.content?.parts || [];
   const texto = parts.map((p) => typeof p?.text === "string" ? p.text : "").join("").trim();
   if (!texto) throw new Error("gemini devolveu resposta vazia");
-  console.log(`DEBUG IA usada: Gemini (fallback) | modelo: ${GEMINI_MODEL}`);
+  console.log(`DEBUG IA usada: Gemini (fallback 3) | modelo: ${GEMINI_MODEL}`);
   return texto;
 }
 
 async function chamarIA(body, tentativa429 = 0) {
   if (PROVEDORES.length === 0) {
-    throw new Error("Nenhuma chave de IA configurada (GROQ_API_KEY ou GEMINI_API_KEY).");
+    throw new Error("Nenhuma chave de IA configurada (OPENROUTER_API_KEY, GROQ_API_KEY ou GEMINI_API_KEY).");
   }
 
   const agora = Date.now();
@@ -255,7 +313,12 @@ async function chamarIA(body, tentativa429 = 0) {
   let ultimoErro = null;
   for (const prov of ordem) {
     try {
-      const texto = prov.nome === "groq" ? await chamarGroq(body) : await chamarGemini(body);
+      const texto =
+        prov.nome === "openrouter"
+          ? await chamarOpenRouter(body)
+          : prov.nome === "groq"
+            ? await chamarGroq(body)
+            : await chamarGemini(body);
       provedorDescansando.delete(prov.nome);
       return texto;
     } catch (e) {
@@ -266,13 +329,19 @@ async function chamarIA(body, tentativa429 = 0) {
         const pausa = Math.max(1000, Math.min(e.retryAfterMs || DESCANSO_PADRAO_MS, 60_000));
         provedorDescansando.set(prov.nome, Date.now() + pausa);
         console.log(`DEBUG ${prov.nome} em limite - cooldown de ${Math.ceil(pausa / 1000)}s; tentando outro provedor se existir.`);
-        // NAO interrompe: o proximo provedor (por exemplo Gemini) e tentado imediatamente.
+        // NAO interrompe: o proximo provedor da fila e tentado imediatamente.
         continue;
       }
 
-      if (prov.nome === "gemini" && (e.status === 401 || e.status === 403)) {
+      if ((e.status === 401 || e.status === 403)) {
         provedorDescansando.set(prov.nome, Date.now() + 10 * 60 * 1000);
-        console.error("DEBUG Gemini: confira GEMINI_API_KEY no Render (chave do Google AI Studio).");
+        if (prov.nome === "openrouter") {
+          console.error("DEBUG OpenRouter: confira OPENROUTER_API_KEY no Render.");
+        } else if (prov.nome === "groq") {
+          console.error("DEBUG Groq: confira GROQ_API_KEY no Render.");
+        } else if (prov.nome === "gemini") {
+          console.error("DEBUG Gemini: confira GEMINI_API_KEY no Render (chave do Google AI Studio).");
+        }
       }
       // Erro de um provedor nao impede tentar o seguinte.
     }
@@ -293,7 +362,7 @@ async function chamarIA(body, tentativa429 = 0) {
     }
   }
 
-  throw ultimoErro || new Error("Groq e Gemini falharam.");
+  throw ultimoErro || new Error("OpenRouter, Groq e Gemini falharam.");
 }
 
 // Normaliza o historico em mensagens que a API entende.
@@ -718,7 +787,7 @@ export async function gerarCodigoPython(pergunta, colunas) {
 //  chamarIAbruta — funcao simples para o agente SQL.
 //  Recebe uma lista de mensagens [{role, content}] e devolve o
 //  texto da resposta. Reaproveita o chamarIA interno (com
-//  fallback Groq -> Gemini e limpeza de parametros por provedor).
+//  fallback OpenRouter -> Groq -> Gemini e limpeza de parametros por provedor).
 // ============================================================
 export async function chamarIAbruta(mensagens, opcoes = {}) {
   const body = {
