@@ -12,8 +12,6 @@
     "node": ">=18.17.0"
   },
   "dependencies": {
-    "arquero": "^8.0.3",
-    "decimal.js": "^10.6.0",
     "dotenv": "^16.6.1",
     "express": "^4.19.2",
     "googleapis": "^140.0.1",
