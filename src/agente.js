@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V13.8 SEM ARQUERO/DECIMAL
+// agente.js - MOTOR DE CONSULTA DETERMINISTICO + IA LEVE DE INTENCAO + FALLBACK SQL AGENT - V14
 // ============================================================
 // Arquitetura baseada em duas referencias usadas no projeto:
 // 1) Conversational SQL Agent: schema/view + SQL dinamico + memoria de conversa.
@@ -11,11 +11,12 @@
 // - Nao exige Python, FastAPI ou LangChain.
 // - Mantem a mesma exportacao: responderPergunta(pergunta, historico).
 // - Usa db.js (queryReadOnly) e groq.js (chamarIAbruta) existentes.
-// - A IA pode gerar SQL, mas o Node valida e o PostgreSQL executa READ ONLY.
+// - Fluxo normal: a IA so classifica a intencao; Node monta SQL, aplica regras e PostgreSQL calcula.
+// - O SQL Agent completo fica apenas como fallback para perguntas realmente complexas.
 // ============================================================
 
 import { queryReadOnly } from "./db.js";
-import { chamarIAbruta } from "./groq.js";
+import { chamarIAbruta, interpretarPergunta } from "./groq.js";
 
 // Bibliotecas Arquero/Decimal removidas: o agente usa apenas validacoes nativas do Node.
 
@@ -632,6 +633,377 @@ function regrasNegocio(ctx) {
     `no WHERE, para que obras com o valor vazio NUNCA ganhem o topo do ranking.\n`;
 }
 
+
+// ------------------------------------------------------------
+// V14 - MOTOR DETERMINISTICO
+// A IA devolve somente a intencao. O Node conhece as regras de negocio,
+// resolve schema/campos, monta SQL seguro, preserva contexto e calcula no banco.
+// ------------------------------------------------------------
+
+function nomesColunas(ctx) {
+  return new Set((ctx?.colunas || []).map((c) => String(c.column_name)));
+}
+
+function escaparLiteralSQL(valor = "") {
+  return String(valor ?? "").replace(/'/g, "''");
+}
+
+function normalizarChaveSemantica(s = "") {
+  return normalizar(String(s || "")).replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+const ALIASES_CAMPOS = new Map([
+  ["nome", "objeto"], ["objeto", "objeto"],
+  ["bairro", "bairro"], ["local", "bairro"], ["localizacao", "bairro"],
+  ["status", "status"], ["situacao", "status"],
+  ["etapa", "status_original"], ["status_original", "status_original"],
+  ["engenheiro", "engenheiro"], ["responsavel", "engenheiro"], ["arquiteto", "engenheiro"],
+  ["empresa", "empresa"],
+  ["recurso", "recurso"],
+  ["tipo_recurso", "tipo_recurso"], ["fonte_recurso", "tipo_recurso"], ["fonte", "tipo_recurso"],
+  ["valor_total", "valor_total"], ["valor_investido", "valor_total"], ["investimento", "valor_total"], ["custo", "valor_total"],
+  ["valor_executado", "valor_executado"], ["executado", "valor_executado"], ["pago", "valor_executado"],
+  ["percentual_executado", "percentual_executado"], ["percentual_execucao", "percentual_executado"], ["execucao", "percentual_executado"],
+  ["categoria", "categoria"],
+  ["tipo_negocio", "tipo_negocio"], ["tipo", "tipo_negocio"],
+  ["subtipo_negocio", "subtipo_negocio"], ["subtipo", "subtipo_negocio"],
+  ["data_inicio", "data_inicio"],
+  ["data_prev_termino", "data_prev_termino"], ["previsao_termino", "data_prev_termino"],
+  ["observacoes", "observacoes"], ["observacao", "observacoes"],
+]);
+
+const EXTRAS_PREFERIDOS = {
+  contrato: ["Nº DO CONTRATO", "N° DO CONTRATO", "NUMERO DO CONTRATO", "CONTRATO"],
+  convenio: ["CONVÊNIO", "CONVENIO", "Nº DO CONVÊNIO", "N° DO CONVÊNIO"],
+  aditivo: ["ADITIVO", "VALOR ADITIVO"],
+  data_envio: ["DATA DE ENVIO", "DATA ENVIO"],
+  proposta_analisada: ["PROPOSTA ANALISADA"],
+  habilitacao_analisada: ["HABILITAÇÃO ANALISADA", "HABILITACAO ANALISADA"],
+};
+
+function chaveExtraCorrespondente(ctx, semantico = "") {
+  const alvo = normalizar(String(semantico || "")).replace(/\s+/g, " ");
+  if (!alvo) return null;
+  const chaves = ctx?.chavesDadosExtras || [];
+
+  const preferidas = EXTRAS_PREFERIDOS[normalizarChaveSemantica(semantico)] || [];
+  for (const p of preferidas) {
+    const achou = chaves.find((k) => normalizar(k) === normalizar(p));
+    if (achou) return achou;
+  }
+
+  // Correspondencia exata normalizada primeiro; depois uma correspondencia
+  // conservadora por inclusao apenas quando for inequivoca.
+  const exata = chaves.find((k) => normalizar(k) === alvo);
+  if (exata) return exata;
+
+  const candidatos = chaves.filter((k) => {
+    const nk = normalizar(k);
+    return nk.includes(alvo) || alvo.includes(nk);
+  });
+  return candidatos.length === 1 ? candidatos[0] : null;
+}
+
+function resolverCampo(ctx, semantico = "") {
+  const nomes = nomesColunas(ctx);
+  const bruto = String(semantico || "").trim();
+  if (!bruto) return null;
+  const key = normalizarChaveSemantica(bruto);
+
+  let coluna = ALIASES_CAMPOS.get(key) || null;
+  if (!coluna) {
+    // Se a IA devolveu o proprio nome real da coluna, aceite somente se existir.
+    coluna = [...nomes].find((c) => normalizarChaveSemantica(c) === key) || null;
+  }
+  if (coluna && nomes.has(coluna)) {
+    return { expressao: coluna, alias: coluna, coluna, extra: false };
+  }
+
+  if (nomes.has("dados_extras")) {
+    const extra = chaveExtraCorrespondente(ctx, bruto);
+    if (extra) {
+      const alias = key || "campo_extra";
+      return {
+        expressao: `dados_extras->>'${escaparLiteralSQL(extra)}'`,
+        alias,
+        coluna: null,
+        extra: true,
+        chaveExtra: extra,
+      };
+    }
+  }
+  return null;
+}
+
+function condicaoUniversoDeterministica(universo, ctx) {
+  if (!universo || universo === "auto") return "";
+  const nomes = nomesColunas(ctx);
+  if (nomes.has("tipo_negocio")) {
+    return `tipo_negocio = '${escaparLiteralSQL(universo)}'`;
+  }
+  if (!nomes.has("aba_origem")) return "";
+  if (universo === "obra") return `aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO')`;
+  if (universo === "projeto") return `aba_origem = 'EM_PROJETO'`;
+  if (universo === "licitacao") return `aba_origem = 'EM_LICITAÇÃO'`;
+  return "";
+}
+
+function condicaoConceitoAmplo(termo = "", ctx) {
+  const t = normalizar(termo);
+  const nomes = nomesColunas(ctx);
+  if (!nomes.has("objeto")) return "";
+
+  if (/\b(saude|saúde)\b/.test(t)) {
+    const termos = [
+      "ubs", "unidade basica de saude", "posto de saude", "psf",
+      "hospital", "policlinica", "unidade de saude", "academia da saude"
+    ];
+    return "(" + termos.map((x) => `LOWER(COALESCE(objeto,'')) LIKE '%${escaparLiteralSQL(normalizar(x))}%'`).join(" OR ") + ")";
+  }
+  if (/\b(educacao|educação)\b/.test(t)) {
+    const termos = ["escola", "creche", "educacao"];
+    return "(" + termos.map((x) => `LOWER(COALESCE(objeto,'')) LIKE '%${escaparLiteralSQL(normalizar(x))}%'`).join(" OR ") + ")";
+  }
+  return "";
+}
+
+function condicaoSituacao(valor, universo, ctx) {
+  const v = normalizar(valor);
+  const nomes = nomesColunas(ctx);
+
+  if (/concluid|pront|finaliz|executad/.test(v)) {
+    if (nomes.has("concluido")) return `concluido = true`;
+    if (nomes.has("status")) return `LOWER(COALESCE(status,'')) LIKE '%conclu%'`;
+  }
+  if (/andamento|sendo feita|tocando|execucao/.test(v)) {
+    if (universo === "obra" && nomes.has("em_andamento_obra")) return `em_andamento_obra = true`;
+    if (nomes.has("status")) return `LOWER(COALESCE(status,'')) LIKE '%andamento%'`;
+  }
+  if (/parad|paralis|atrasad/.test(v) && nomes.has("status")) {
+    return `(LOWER(COALESCE(status,'')) LIKE '%paralis%' OR LOWER(COALESCE(status,'')) LIKE '%parad%' OR LOWER(COALESCE(status,'')) LIKE '%atras%')`;
+  }
+  return "";
+}
+
+function condicaoFiltroDeterministica(filtro, universo, ctx) {
+  const campoSem = String(filtro?.campo || "").trim();
+  const valor = String(filtro?.valor ?? "").trim();
+  if (!campoSem || !valor) return "";
+
+  if (normalizarChaveSemantica(campoSem) === "situacao") {
+    return condicaoSituacao(valor, universo, ctx);
+  }
+
+  const campo = resolverCampo(ctx, campoSem);
+  if (!campo) return "";
+
+  const nomes = nomesColunas(ctx);
+  const nv = normalizar(valor);
+
+  // booleanos conhecidos
+  if (campo.coluna && ["concluido", "em_andamento_obra"].includes(campo.coluna)) {
+    if (["true","sim","1","verdadeiro"].includes(nv)) return `${campo.coluna} = true`;
+    if (["false","nao","não","0","falso"].includes(nv)) return `${campo.coluna} = false`;
+  }
+
+  // Numericos: igualdade simples quando o valor e inequivocamente numero.
+  if (/^-?\d+(?:[.,]\d+)?$/.test(valor) && campo.coluna &&
+      ["valor_total","valor_executado","percentual_executado"].includes(campo.coluna)) {
+    const num = valor.replace(",", ".");
+    return `${campo.expressao} = ${Number(num)}`;
+  }
+
+  // Texto: correspondencia tolerante sem expor a consulta a injecao.
+  const lit = escaparLiteralSQL(nv);
+  return `LOWER(COALESCE(${campo.expressao}::text,'')) LIKE '%${lit}%'`;
+}
+
+function condicaoTermoLivre(termo, ctx) {
+  const conceito = condicaoConceitoAmplo(termo, ctx);
+  if (conceito) return conceito;
+
+  const nomes = nomesColunas(ctx);
+  const t = escaparLiteralSQL(normalizar(termo));
+  if (!t) return "";
+
+  const campos = ["objeto", "bairro", "engenheiro", "empresa", "recurso", "tipo_recurso", "categoria"]
+    .filter((c) => nomes.has(c));
+  const partes = campos.map((c) => `LOWER(COALESCE(${c}::text,'')) LIKE '%${t}%'`);
+  if (nomes.has("dados_extras")) partes.push(`LOWER(COALESCE(dados_extras::text,'')) LIKE '%${t}%'`);
+  return partes.length ? `(${partes.join(" OR ")})` : "";
+}
+
+function universoIntento(intencao, pergunta = "") {
+  if (["obra","projeto","licitacao"].includes(intencao?.universo)) return intencao.universo;
+  return universoNegocioDaPergunta(pergunta) || "auto";
+}
+
+function montarWhereDeterministico(intencao, pergunta, historico, ctx) {
+  const condicoes = [];
+  const universo = universoIntento(intencao, pergunta);
+
+  // Follow-up: reaproveita o recorte EXATO confirmado anteriormente.
+  if (intencao?.usar_contexto) {
+    const anterior = ultimaConsultaConfirmada(historico);
+    const whereAnterior = extrairWhereSimples(anterior);
+    if (whereAnterior) condicoes.push(`(${whereAnterior})`);
+  }
+
+  // Universo explicito ou inferido pelas regras oficiais.
+  const univ = condicaoUniversoDeterministica(universo, ctx);
+  if (univ && !condicoes.some((c) => /\btipo_negocio\b|\baba_origem\b/i.test(c))) condicoes.push(univ);
+
+  for (const f of intencao?.filtros || []) {
+    const c = condicaoFiltroDeterministica(f, universo, ctx);
+    if (c) condicoes.push(c);
+  }
+
+  for (const termo of intencao?.termos || []) {
+    const c = condicaoTermoLivre(termo, ctx);
+    if (c) condicoes.push(c);
+  }
+
+  // Pronome de pessoa: o sistema, nao a IA, restaura o responsavel.
+  const pessoa = referenciaPessoaRecente(historico, pergunta);
+  if (pessoa && nomesColunas(ctx).has("engenheiro")) {
+    const nome = escaparLiteralSQL(normalizar(pessoa.replace(/^(eng\.?|arq\.?)\s*/i, "")));
+    const condPessoa = `LOWER(COALESCE(engenheiro,'')) LIKE '%${nome}%'`;
+    if (!condicoes.some((c) => /\bengenheiro\b/i.test(c))) condicoes.push(condPessoa);
+  }
+
+  return condicoes.length ? condicoes.join(" AND ") : "TRUE";
+}
+
+function aliasTotalPorUniverso(universo) {
+  if (universo === "obra") return "total_obras";
+  if (universo === "projeto") return "total_projetos";
+  if (universo === "licitacao") return "total_licitacoes";
+  return "total_registros";
+}
+
+function camposDetalhePadrao(ctx, universo) {
+  const nomes = nomesColunas(ctx);
+  const preferidos = universo === "licitacao"
+    ? ["objeto","status_original","status","empresa","recurso"]
+    : ["objeto","status","bairro","engenheiro","valor_total","percentual_executado"];
+  return preferidos.filter((c) => nomes.has(c));
+}
+
+function gerarSQLDeterministico(intencao, pergunta, historico, ctx) {
+  if (!intencao || intencao.falhou || intencao.acao === "complexa") return null;
+
+  const acao = intencao.acao;
+  const universo = universoIntento(intencao, pergunta);
+  const where = montarWhereDeterministico(intencao, pergunta, historico, ctx);
+  const rel = `public.${ctx.relacao}`;
+  const limite = Math.max(1, Math.min(Number(intencao.limite) || 20, 20));
+
+  const campo = intencao.campo ? resolverCampo(ctx, intencao.campo) : null;
+  const grupo = intencao.agrupar_por ? resolverCampo(ctx, intencao.agrupar_por) : null;
+
+  if (acao === "contar") {
+    const alias = aliasTotalPorUniverso(universo);
+    return `SELECT COUNT(*)::int AS ${alias} FROM ${rel} WHERE ${where}`;
+  }
+
+  if (acao === "somar" || acao === "media") {
+    const alvo = campo || resolverCampo(ctx, "valor_total");
+    if (!alvo) return null;
+    const fn = acao === "somar" ? "SUM" : "AVG";
+    const alias =
+      acao === "media" ? `media_${alvo.alias}` :
+      alvo.alias === "valor_total" ? "total_investido" :
+      alvo.alias === "valor_executado" ? "total_executado" : `soma_${alvo.alias}`;
+    return `SELECT ${fn}(${alvo.expressao}) AS ${alias} FROM ${rel} WHERE ${where} AND ${alvo.expressao} IS NOT NULL`;
+  }
+
+  if (acao === "ranking") {
+    if (!grupo) return null;
+    const medida = normalizarChaveSemantica(intencao.medida || "");
+    const dir = intencao.direcao === "menor" ? "ASC" : "DESC";
+    const limitRank = Math.max(1, Math.min(limite || 1, 20));
+
+    if (!intencao.campo && (!medida || medida === "quantidade" || medida === "count")) {
+      return `SELECT ${grupo.expressao} AS ${grupo.alias}, COUNT(*)::int AS total_obras ` +
+        `FROM ${rel} WHERE ${where} AND ${grupo.expressao} IS NOT NULL ` +
+        `GROUP BY ${grupo.expressao} ORDER BY total_obras ${dir} NULLS LAST LIMIT ${limitRank}`;
+    }
+
+    const alvo = campo || resolverCampo(ctx, intencao.medida);
+    if (!alvo) return null;
+    const fn = medida === "media" || medida === "avg" ? "AVG" : "SUM";
+    const alias = fn === "AVG" ? `media_${alvo.alias}` : `total_${alvo.alias}`;
+    return `SELECT ${grupo.expressao} AS ${grupo.alias}, ${fn}(${alvo.expressao}) AS ${alias} ` +
+      `FROM ${rel} WHERE ${where} AND ${grupo.expressao} IS NOT NULL AND ${alvo.expressao} IS NOT NULL ` +
+      `GROUP BY ${grupo.expressao} ORDER BY ${alias} ${dir} NULLS LAST LIMIT ${limitRank}`;
+  }
+
+  if (acao === "valores_unicos") {
+    if (!campo) return null;
+    return `SELECT DISTINCT ${campo.expressao} AS ${campo.alias} FROM ${rel} ` +
+      `WHERE ${where} AND ${campo.expressao} IS NOT NULL AND BTRIM(${campo.expressao}::text) <> '' ` +
+      `ORDER BY ${campo.alias} LIMIT ${limite}`;
+  }
+
+  if (acao === "campo") {
+    if (!campo) return null;
+    const campos = [];
+    if (nomesColunas(ctx).has("objeto")) campos.push("objeto");
+    campos.push(`${campo.expressao} AS ${campo.alias}`);
+    // Recurso e tipo_recurso sao conceitos distintos: quando pede recurso,
+    // mostramos ambos se existirem, preservando a regra oficial.
+    if (campo.alias === "recurso" && nomesColunas(ctx).has("tipo_recurso")) campos.push("tipo_recurso");
+    if (universo === "licitacao" && nomesColunas(ctx).has("status_original") && !campos.includes("status_original")) campos.push("status_original");
+    return `SELECT ${[...new Set(campos)].join(", ")} FROM ${rel} WHERE ${where} LIMIT ${limite}`;
+  }
+
+  if (acao === "existencia") {
+    const cols = camposDetalhePadrao(ctx, universo).slice(0, 4);
+    if (!cols.length) return null;
+    return `SELECT ${cols.join(", ")}, COUNT(*) OVER()::int AS total_encontrados FROM ${rel} WHERE ${where} LIMIT ${limite}`;
+  }
+
+  if (acao === "listar" || acao === "buscar") {
+    const cols = camposDetalhePadrao(ctx, universo);
+    if (campo && !cols.includes(campo.alias)) cols.splice(1, 0, `${campo.expressao} AS ${campo.alias}`);
+    if (!cols.length) return null;
+    return `SELECT ${cols.join(", ")} FROM ${rel} WHERE ${where} ORDER BY ${nomesColunas(ctx).has("objeto") ? "objeto" : cols[0]} LIMIT ${limite}`;
+  }
+
+  return null;
+}
+
+async function executarSQLDiretoSeguro({ ctx, sql }) {
+  const validacao = validarSQL(sql, ctx);
+  if (!validacao.ok) throw new Error(`SQL deterministico bloqueado: ${validacao.motivo}`);
+  const sqlExec = aplicarLimite(validacao.sql);
+  const r = await queryReadOnly(sqlExec);
+  return {
+    sql: sqlExec,
+    rows: r.rows || [],
+    tentativa: 0,
+    earlyAccept: true,
+    tentativas: [{ tentativa: 0, sql: sqlExec, linhas: r.rows?.length || 0, origem: "motor_deterministico" }],
+  };
+}
+
+function respostaLocalPorIntencao(intencao, pergunta, rows = []) {
+  const agregado = respostaAgregadoComDimensaoSegura(pergunta, rows);
+  if (agregado) return agregado;
+  const contagem = respostaContagemDiretaSegura(pergunta, rows);
+  if (contagem) return contagem;
+  const financeiro = respostaFinanceiraDiretaSegura(pergunta, rows);
+  if (financeiro) return financeiro;
+
+  if (intencao?.acao === "existencia" && rows.length) {
+    const total = numeroParaAnalise(rows[0]?.total_encontrados);
+    const lista = fallbackResposta(pergunta, rows);
+    if (total !== null) return `Sim. Encontrei ${total} registro${total === 1 ? "" : "s"} nesse recorte.\n${lista}`;
+  }
+
+  return fallbackResposta(pergunta, rows);
+}
+
 // ------------------------------------------------------------
 // Geracao SQL (estagio 1)
 // ------------------------------------------------------------
@@ -993,6 +1365,13 @@ function rotuloHumano(campo = "") {
     observacoes: "Observações",
     quantidade: "Quantidade",
     total_investido: "Total investido",
+    total_executado: "Total executado",
+    total_obras: "Total de obras",
+    total_projetos: "Total de projetos",
+    total_licitacoes: "Total de licitações",
+    total_registros: "Total de registros",
+    proposta_analisada: "Proposta analisada",
+    habilitacao_analisada: "Habilitação analisada",
     total_valor: "Total",
     soma_valor: "Total",
   };
@@ -1091,7 +1470,9 @@ const CAMPOS_DIRETOS_REDACAO = new Set([
   "id", "objeto", "bairro", "status", "status_original", "categoria",
   "valor_total", "valor_executado", "percentual_executado",
   "engenheiro", "empresa", "aba_origem", "tipo_negocio",
-  "total_obras", "total", "quantidade", "count", "soma", "media",
+  "recurso", "tipo_recurso", "contrato", "convenio", "aditivo", "observacoes",
+  "data_inicio", "data_prev_termino", "proposta_analisada", "habilitacao_analisada",
+  "total_obras", "total_projetos", "total_licitacoes", "total_registros", "total", "quantidade", "count", "soma", "media",
 ]);
 function redacaoLocalEhSuficiente(rows = []) {
   if (!Array.isArray(rows) || rows.length === 0) return false;
@@ -1234,7 +1615,7 @@ function respostaContagemDiretaSegura(pergunta = "", rows = []) {
   if (r.objeto) return null;
 
   const candidatos = Object.entries(r).filter(([k, v]) =>
-    /(?:^count$|count_|_count$|^total|total_|quantidade|qtd)/i.test(k) &&
+    campoPareceContagem(k) &&
     v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v))
   );
   if (candidatos.length !== 1) return null;
@@ -1349,7 +1730,7 @@ function estadoPublico(ctx, execucao) {
 }
 
 // ------------------------------------------------------------
-// Fluxo principal
+// Fluxo principal V14
 // ------------------------------------------------------------
 export async function responderPergunta(pergunta, historico = []) {
   const texto = textoSeguro(pergunta, 1600);
@@ -1370,129 +1751,127 @@ export async function responderPergunta(pergunta, historico = []) {
   try {
     const ctx = await carregarSchemaContexto();
 
-    // Estagio 1: para campos de ANALISE DE LICITACAO, o Node garante o
-    // universo correto (tipo_negocio='licitacao'). Para todo o resto, o fluxo
-    // continua exatamente igual e a IA gera a SQL.
+    // Regra 100% deterministica: proposta/habilitacao de licitacao.
     const sqlAnaliseDireta = sqlAnaliseLicitacao(texto, ctx);
-    let gerada = sqlAnaliseDireta
-      ? { query: sqlAnaliseDireta, descricao: "consulta segura de análise de licitação" }
-      : await gerarSQL(texto, historico, ctx);
+    let intencao = null;
+    let gerada = null;
+    let modoDeterministico = false;
 
-    if (!gerada.query) {
-      // Uma segunda tentativa curta so para formato/interpretacao, sem criar regra de frase.
-      gerada = await gerarSQL(texto, historico, ctx, "A tentativa anterior nao produziu SQL. Gere uma consulta SELECT valida usando apenas o schema fornecido.");
+    if (sqlAnaliseDireta) {
+      gerada = { query: sqlAnaliseDireta, descricao: "regra deterministica de análise de licitação" };
+      modoDeterministico = true;
+      intencao = { acao: "listar", universo: "licitacao", detalhe: "resumido" };
+    } else {
+      // UNICA chamada normal de IA: entender a pergunta. Nao recebe schema nem
+      // catalogo inteiro e NAO gera SQL.
+      intencao = await interpretarPergunta(texto, historico);
+      const sqlDet = gerarSQLDeterministico(intencao, texto, historico, ctx);
+
+      if (sqlDet) {
+        gerada = { query: sqlDet, descricao: "motor deterministico v14" };
+        modoDeterministico = true;
+        console.log("MOTOR V14 - INTENCAO:", JSON.stringify(intencao));
+      } else {
+        // Plano B: mantemos o SQL Agent antigo para perguntas realmente fora do
+        // DSL/motor. Assim a troca nao deixa o bot "burro".
+        console.log("MOTOR V14 - FALLBACK PARA SQL AGENT COMPLETO");
+        gerada = await gerarSQL(texto, historico, ctx);
+      }
     }
-    if (!gerada.query) {
+
+    if (!gerada?.query) {
       return {
         resposta: "Não consegui transformar essa pergunta em uma consulta segura aos dados. Pode reformular?",
         erro: "sql_nao_gerada",
-        modoAgente: "sql_agent_self_healing_v13_8_sem_bibliotecas",
+        modoAgente: "motor_consulta_v14",
       };
     }
 
-    // Garante continuidade quando o usuario usa pronome para uma pessoa citada
-    // no turno anterior (ex.: "ela tem quantas obras em geral?").
-    const pessoaPerdida = referenciaPessoaPerdida(texto, historico, gerada.query);
-    if (pessoaPerdida) {
-      const refinada = await gerarSQL(
-        texto, historico, ctx,
-        `A pergunta atual usa um pronome que se refere a ${pessoaPerdida}, citado(a) no contexto recente. ` +
-        `A SQL perdeu essa entidade e consultou um universo mais amplo. Refaça preservando o filtro de engenheiro/responsavel dessa pessoa. ` +
-        `Se o usuario disse "em geral", remova apenas filtros de status/andamento anteriores; NAO remova o filtro da pessoa.`
-      );
-      if (refinada.query) gerada = refinada;
-    }
+    // No caminho legado, preservamos os guardrails/refinamentos que ja provaram
+    // utilidade. O caminho deterministico nao precisa gastar chamadas extras.
+    if (!modoDeterministico) {
+      const pessoaPerdida = referenciaPessoaPerdida(texto, historico, gerada.query);
+      if (pessoaPerdida) {
+        const refinada = await gerarSQL(
+          texto, historico, ctx,
+          `A pergunta atual usa um pronome que se refere a ${pessoaPerdida}, citado(a) no contexto recente. ` +
+          `A SQL perdeu essa entidade. Refaça preservando o filtro dessa pessoa.`
+        );
+        if (refinada.query) gerada = refinada;
+      }
 
-    // Refinamentos gerais de qualidade. Nao sao regras de uma frase especifica:
-    // evitam respostas existenciais arbitrarias e agregados numericos sem composicao.
-    if (existencialComLimitUm(texto, gerada.query)) {
-      const refinada = await gerarSQL(
-        texto, historico, ctx,
-        "A consulta usou LIMIT 1 para uma pergunta existencial. Nao escolha um registro arbitrario. Refaça listando o conjunto real encontrado, preservando o recorte da conversa. Prefira objeto + campos relevantes + COUNT(*) OVER() AS total_encontrados, com no maximo 20 itens para exibicao."
-      );
-      if (refinada.query) gerada = refinada;
-    }
+      if (existencialComLimitUm(texto, gerada.query)) {
+        const refinada = await gerarSQL(
+          texto, historico, ctx,
+          "Pergunta existencial nao pode escolher registro arbitrario com LIMIT 1. Liste o conjunto real encontrado."
+        );
+        if (refinada.query) gerada = refinada;
+      }
 
-    if (existencialComAgregadoSeco(texto, gerada.query)) {
-      const refinada = await gerarSQL(
-        texto, historico, ctx,
-        "A pergunta e existencial e a consulta retornaria apenas uma contagem. Preserve EXATAMENTE o mesmo recorte, mas traga tambem os registros encontrados para o usuario ver quais sao. Prefira objeto + status/tipo relevante + COUNT(*) OVER() AS total_encontrados. Se houver ate 20, liste todos; nao explique SQL nem filtros na resposta."
-      );
-      if (refinada.query) gerada = refinada;
-    }
+      const sqlRankingTotalCorrigido = corrigirRankingValorTotalPorEntidade(texto, gerada.query);
+      if (sqlRankingTotalCorrigido && sqlRankingTotalCorrigido !== limparSQL(gerada.query)) {
+        gerada = { ...gerada, query: sqlRankingTotalCorrigido };
+      }
 
-    if (contagemComAgregadoSeco(texto, gerada.query)) {
-      const refinada = await gerarSQL(
-        texto, historico, ctx,
-        "A pergunta pede uma contagem, mas a SQL retornaria apenas COUNT sem os registros que sustentam o total. Preserve EXATAMENTE o mesmo recorte e os mesmos criterios sem inventar categorias. Refaça trazendo objeto + campos uteis disponiveis + COUNT(*) OVER() AS total_encontrados. Para categorias amplas como area da saude, use somente equivalencias semanticamente corretas e objetos reais do catalogo; creche/escola nao sao saude."
-      );
-      if (refinada.query) gerada = refinada;
-    }
+      const sqlComRecorte = preservarRecorteFollowUp(texto, historico, gerada.query);
+      if (sqlComRecorte) gerada = { ...gerada, query: sqlComRecorte };
 
-    if (consultaAgregadaSeca(texto, gerada.query)) {
-      const refinada = await gerarSQL(
-        texto, historico, ctx,
-        "A consulta retornaria apenas um agregado seco. Preserve EXATAMENTE o mesmo recorte e refaça de forma explicavel: traga objeto + valor componente e o agregado por window function (SUM/AVG ... OVER()), para a resposta mostrar de onde saiu o total. Nao remova filtros anteriores."
-      );
-      if (refinada.query) gerada = refinada;
-    }
-
-    // Guardrail semantico financeiro: em ranking de valor TOTAL por entidade,
-    // MAX(valor_total) mede a maior obra individual. Para o total da entidade,
-    // corrige deterministicamente para SUM(valor_total), preservando todo o recorte.
-    const sqlRankingTotalCorrigido = corrigirRankingValorTotalPorEntidade(texto, gerada.query);
-    if (sqlRankingTotalCorrigido && sqlRankingTotalCorrigido !== limparSQL(gerada.query)) {
-      console.log("SQL AGENT - RANKING DE VALOR TOTAL CORRIGIDO: MAX -> SUM");
-      gerada = { ...gerada, query: sqlRankingTotalCorrigido };
-    }
-
-    // Protecao de continuidade: em perguntas puramente referenciais (ex.:
-    // "quais sao?"), restaura o WHERE do ultimo recorte confirmado. Isso evita
-    // misturar obra/projeto/licitacao quando a IA simplifica demais a SQL.
-    const sqlComRecorte = preservarRecorteFollowUp(texto, historico, gerada.query);
-    if (sqlComRecorte && sqlComRecorte !== limparSQL(gerada.query)) {
-      console.log("SQL AGENT - RECORTE DE FOLLOW-UP PRESERVADO");
-      gerada = { ...gerada, query: sqlComRecorte };
-    }
-
-    // Guardrail semantico do universo: garante obra/projeto/licitacao quando a
-    // regra de negocio e inequívoca. Em "quais sao?", usa a pergunta anterior.
-    const sqlComUniverso = garantirUniversoNegocio(texto, historico, gerada.query);
-    if (sqlComUniverso && sqlComUniverso !== limparSQL(gerada.query)) {
-      console.log("SQL AGENT - UNIVERSO DE NEGOCIO CORRIGIDO");
-      gerada = { ...gerada, query: sqlComUniverso };
+      const sqlComUniverso = garantirUniversoNegocio(texto, historico, gerada.query);
+      if (sqlComUniverso) gerada = { ...gerada, query: sqlComUniverso };
     }
 
     console.log("SQL AGENT - SQL INICIAL:", gerada.query);
 
-    // Estagio 2: executa + self-healing com diagnostico real do PostgreSQL.
-    const execucao = await executarComSelfHealing({
-      pergunta: texto,
-      historico,
-      ctx,
-      sqlInicial: gerada.query,
-    });
+    let execucao;
+    try {
+      execucao = modoDeterministico
+        ? await executarSQLDiretoSeguro({ ctx, sql: gerada.query })
+        : await executarComSelfHealing({ pergunta: texto, historico, ctx, sqlInicial: gerada.query });
+    } catch (erroDet) {
+      if (!modoDeterministico) throw erroDet;
+
+      // Se uma mudanca de schema ou campo raro quebrar o motor, usa o agente
+      // antigo UMA vez como rede de seguranca.
+      console.warn("MOTOR V14 - consulta deterministica falhou; usando fallback SQL Agent:", erroDet.message);
+      const fallback = await gerarSQL(texto, historico, ctx,
+        `O motor deterministico falhou com: ${textoSeguro(erroDet.message, 300)}. Gere uma SELECT segura.`);
+      if (!fallback.query) throw erroDet;
+      modoDeterministico = false;
+      gerada = fallback;
+      execucao = await executarComSelfHealing({
+        pergunta: texto, historico, ctx, sqlInicial: fallback.query,
+      });
+    }
 
     console.log("SQL AGENT - SQL FINAL:", execucao.sql);
     console.log("SQL AGENT - LINHAS:", execucao.rows.length, "| REPAROS:", execucao.tentativa || 0, "| EARLY_ACCEPT:", !!execucao.earlyAccept);
 
-    const resposta = await redigirResposta(texto, historico, execucao.sql, execucao.rows, ctx);
+    // Fluxo normal: resposta 100% local, sem segunda chamada de IA.
+    // No fallback legado, mantemos o redator existente somente quando necessario.
+    const resposta = modoDeterministico
+      ? respostaLocalPorIntencao(intencao, texto, execucao.rows)
+      : await redigirResposta(texto, historico, execucao.sql, execucao.rows, ctx);
+
     return {
       resposta,
       sql: execucao.sql,
       linhas: execucao.rows.length,
-      estado: estadoPublico(ctx, execucao),
+      estado: {
+        ...estadoPublico(ctx, execucao),
+        intencao: intencao || null,
+        motor_deterministico: modoDeterministico,
+      },
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
       tentativas: execucao.tentativas,
-      modoAgente: "sql_agent_self_healing_v13_8_sem_bibliotecas",
+      modoAgente: modoDeterministico ? "motor_consulta_v14" : "sql_agent_fallback_v14",
     };
   } catch (e) {
-    console.error("SQL AGENT: falha final:", e);
+    console.error("MOTOR V14: falha final:", e);
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "sql_agent_self_healing_v13_8_sem_bibliotecas_erro",
+      modoAgente: "motor_consulta_v14_erro",
     };
   }
 }
