@@ -358,6 +358,9 @@ REGRAS DE INTENCAO:
 - "qual engenheiro tem maior valor investido?" => ranking, agrupar_por=engenheiro, campo=valor_total, medida=soma, direcao=maior, limite=1.
 - "quais obras concluidas?" => listar universo=obra + filtro situacao=concluido.
 - "quais os recursos dessas?" => campo=recurso + usar_contexto=true.
+- AREA/TEMA: expressoes como "area da educacao", "area da saude" ou "do setor de educacao" NAO significam necessariamente coluna categoria. Coloque o tema em "termos" e deixe o sistema aplicar a semantica aos dados reais.
+- Ex.: "tem alguma licitacao da area da educacao?" => acao="existencia", universo="licitacao", filtros=[], termos=["educacao"].
+- Se o usuario disser explicitamente "categoria X" ou pedir o campo categoria, ai sim use campo/filtro categoria.
 - PEDIDO DE VALORES UNICOS: se a pessoa pedir apenas todos/quais/nomes de bairros, engenheiros, empresas, status, categorias ou recursos, use acao="valores_unicos" e coloque a dimensao em "campo". NAO use acao="listar" nesses casos.
 - Ex.: "me informa todos os bairros?" => acao="valores_unicos", campo="bairro".
 - Ex.: "quais empresas?" => acao="valores_unicos", campo="empresa".

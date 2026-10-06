@@ -819,18 +819,42 @@ function condicaoConceitoAmplo(termo = "", ctx) {
   const nomes = nomesColunas(ctx);
   if (!nomes.has("objeto")) return "";
 
-  if (/\b(saude|saúde)\b/.test(t)) {
-    const termos = [
-      "ubs", "unidade basica de saude", "posto de saude", "psf",
-      "hospital", "policlinica", "unidade de saude", "academia da saude"
+  // AREA/TEMA nao e o mesmo que a coluna literal "categoria". Em especial nas
+  // licitacoes, categoria pode estar vazia/nao existir semanticamente, enquanto o
+  // proprio OBJETO deixa claro o tema (ex.: escola/creche = educacao).
+  // Estes sao mapeamentos semanticos, nunca respostas/dados fixos: os registros
+  // continuam sendo lidos do PostgreSQL a cada pergunta.
+  let termos = [];
+  if (/\bsaude\b/.test(t)) {
+    termos = [
+      "ubs", "unidade básica de saúde", "unidade basica de saude",
+      "posto de saúde", "posto de saude", "psf", "hospital", "policlínica",
+      "policlinica", "unidade de saúde", "unidade de saude",
+      "academia da saúde", "academia da saude"
     ];
-    return "(" + termos.map((x) => `LOWER(COALESCE(objeto,'')) LIKE '%${escaparLiteralSQL(normalizar(x))}%'`).join(" OR ") + ")";
+  } else if (/\beducacao\b/.test(t)) {
+    termos = ["escola", "creche", "educação", "educacao"];
   }
-  if (/\b(educacao|educação)\b/.test(t)) {
-    const termos = ["escola", "creche", "educacao"];
-    return "(" + termos.map((x) => `LOWER(COALESCE(objeto,'')) LIKE '%${escaparLiteralSQL(normalizar(x))}%'`).join(" OR ") + ")";
+
+  if (!termos.length) return "";
+
+  const partes = [];
+  for (const x of [...new Set(termos)]) {
+    const lit = escaparLiteralSQL(String(x).toLowerCase());
+    partes.push(`LOWER(COALESCE(objeto,'')) LIKE '%${lit}%'`);
   }
-  return "";
+
+  // Se houver categoria real, ela pode servir como evidencia adicional, mas NUNCA
+  // como criterio unico para uma pergunta de area/tema.
+  if (nomes.has("categoria")) {
+    const temaOriginal = String(termo || "").trim().toLowerCase();
+    const temaNormal = normalizar(termo);
+    for (const x of [...new Set([temaOriginal, temaNormal].filter(Boolean))]) {
+      partes.push(`LOWER(COALESCE(categoria::text,'')) LIKE '%${escaparLiteralSQL(x)}%'`);
+    }
+  }
+
+  return partes.length ? `(${partes.join(" OR ")})` : "";
 }
 
 function condicaoSituacao(valor, universo, ctx) {
@@ -856,8 +880,19 @@ function condicaoFiltroDeterministica(filtro, universo, ctx) {
   const valor = String(filtro?.valor ?? "").trim();
   if (!campoSem || !valor) return "";
 
-  if (normalizarChaveSemantica(campoSem) === "situacao") {
+  const chaveFiltro = normalizarChaveSemantica(campoSem);
+
+  if (chaveFiltro === "situacao") {
     return condicaoSituacao(valor, universo, ctx);
+  }
+
+  // Guardrail tematico: a IA pode traduzir "area da educacao/saude" como
+  // filtro categoria=..., mas isso nao significa igualdade literal na coluna
+  // categoria. Se reconhecermos um conceito amplo, pesquisamos semanticamente no
+  // OBJETO (e categoria apenas como apoio), preservando o universo solicitado.
+  if (["categoria", "area", "tema", "setor"].includes(chaveFiltro)) {
+    const conceito = condicaoConceitoAmplo(valor, ctx);
+    if (conceito) return conceito;
   }
 
   const campo = resolverCampo(ctx, campoSem);
@@ -1930,7 +1965,7 @@ export async function responderPergunta(pergunta, historico = []) {
     console.log("SQL AGENT - SQL FINAL:", execucao.sql);
     console.log("SQL AGENT - LINHAS:", execucao.rows.length, "| REPAROS:", execucao.tentativa || 0, "| EARLY_ACCEPT:", !!execucao.earlyAccept);
 
-    // V14.2: no fluxo normal a IA tem apenas dois papeis:
+    // V14.3: no fluxo normal a IA tem apenas dois papeis:
     // 1) entender a pergunta (classificador pequeno);
     // 2) redigir em portugues a resposta que o SISTEMA ja calculou.
     // A IA NAO recebe schema/SQL/regras para resolver a consulta e NAO refaz contas.
@@ -1950,9 +1985,9 @@ export async function responderPergunta(pergunta, historico = []) {
           "Nao recalcule, nao altere numeros, nomes, quantidades ou itens e nao acrescente fatos."
         );
         resposta = limparRespostaParaWhatsApp(String(redigida || "").trim()) || respostaFactual;
-        console.log("MOTOR V14.2 - REDACAO FINAL POR IA");
+        console.log("MOTOR V14.3 - REDACAO FINAL POR IA");
       } catch (erroRedacao) {
-        console.warn("MOTOR V14.2 - redacao IA falhou; usando resposta local:", erroRedacao.message);
+        console.warn("MOTOR V14.3 - redacao IA falhou; usando resposta local:", erroRedacao.message);
         resposta = respostaFactual;
       }
     } else {
@@ -1971,14 +2006,14 @@ export async function responderPergunta(pergunta, historico = []) {
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
       tentativas: execucao.tentativas,
-      modoAgente: modoDeterministico ? "motor_consulta_v14_2_ia_entende_redige" : "sql_agent_fallback_v14",
+      modoAgente: modoDeterministico ? "motor_consulta_v14_3_temas_semanticos" : "sql_agent_fallback_v14",
     };
   } catch (e) {
     console.error("MOTOR V14: falha final:", e);
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "motor_consulta_v14_2_erro",
+      modoAgente: "motor_consulta_v14_3_erro",
     };
   }
 }
