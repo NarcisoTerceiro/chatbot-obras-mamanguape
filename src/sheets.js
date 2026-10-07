@@ -90,195 +90,70 @@ async function listarAbasDaPlanilha() {
 }
 
 // ------------------------------------------------------------
-//  Deteccao robusta do cabecalho
-//
-//  PROBLEMA ANTIGO:
-//  O codigo juntava a linha inteira e aceitava a PRIMEIRA linha que
-//  contivesse uma palavra como "obra", "proposta", "empresa" etc.
-//  Uma linha de titulo/subtitulo ou ate uma linha de dados podia ser
-//  confundida com o cabecalho. Isso fazia o bot ignorar registros que
-//  estavam acima do falso cabecalho (ex.: aba EM_LICITAÇÃO).
-//
-//  NOVA ESTRATEGIA:
-//  - analisa cada CELULA separadamente;
-//  - pontua nomes de coluna conhecidos;
-//  - exige mais de uma evidencia de cabecalho;
-//  - escolhe a linha com MAIOR pontuacao, nao a primeira encontrada;
-//  - procura nas primeiras 40 linhas para suportar planilhas com titulos.
+//  Deteccao do cabecalho
+//  Nesta planilha o cabecalho NEM SEMPRE esta na linha 1 (em varias
+//  abas ele esta na linha 7 ou 8, com titulo antes). E linhas de dados
+//  podem ter tantas celulas quanto o cabecalho, entao "a linha com mais
+//  celulas" nao basta. Estrategia em duas etapas:
+//   1) procura a PRIMEIRA linha que contem palavras tipicas de cabecalho
+//      de obras (objeto, rua, situacao, status, contrato, empresa...);
+//   2) se nao achar por palavra, cai para a linha com mais celulas.
 // ------------------------------------------------------------
 
-// Nomes/fragmentos que caracterizam COLUNAS de verdade.
-// Tudo ja e comparado sem acento e em minusculas.
-const CAMPOS_CABECALHO = [
-  "objeto da obra",
-  "objeto",
-  "rua",
-  "logradouro",
-  "situacao",
-  "status",
-  "n do contrato",
-  "numero do contrato",
-  "contrato",
-  "empresa",
-  "recurso",
-  "fonte do recurso",
-  "fonte",
-  "engenheiro responsavel",
-  "engenheiro arquiteto responsavel",
-  "engenheiro",
-  "arquiteto",
-  "valor total da obra",
-  "valor executado",
-  "valor",
-  "bairro",
-  "endereco",
-  "convenio recurso",
-  "convenio proposta",
-  "convenio",
-  "proposta analisada",
-  "habilitacao analisada",
-  "data de envio",
-  "data de entrega",
-  "data inicio",
-  "data prev termino",
-  "prazo",
-  "aditivo",
-  "observacoes",
-  "observacao",
-  "comprimento m",
-  "meio fio m",
-  "area pavimentada m2",
+// Palavras que so aparecem em CABECALHO de uma tabela de obras.
+const PALAVRAS_CABECALHO = [
+  "objeto", "obra", "rua", "situacao", "status", "contrato", "empresa",
+  "recurso", "engenheiro", "arquiteto", "valor", "bairro", "endereco",
+  "fonte", "convenio", "proposta", "data", "prazo", "aditivo", "logradouro",
 ];
 
-const CAMPOS_CABECALHO_EXATOS = new Set(CAMPOS_CABECALHO);
-
 function normaliza(s) {
-  return (s ?? "")
+  return (s || "")
     .toString()
     .toLowerCase()
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[º°ª]/g, "")
-    .replace(/[_/\\()-]+/g, " ")
-    .replace(/[^a-z0-9% ]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/[\u0300-\u036f]/g, "");
 }
 
 function contarPreenchidas(row) {
-  return (row || []).filter((c) => (c ?? "").toString().trim() !== "").length;
+  return (row || []).filter((c) => (c || "").toString().trim() !== "").length;
 }
 
-function pontuarCelulaCabecalho(valor) {
-  const c = normaliza(valor);
-  if (!c) return 0;
-
-  // Cabecalhos exatos/fortes valem mais.
-  if (CAMPOS_CABECALHO_EXATOS.has(c)) return 4;
-
-  // Alguns cabecalhos reais trazem sufixos/unidades, ex. "VALOR (R$)".
-  if (/^(valor|status|situacao|bairro|empresa|recurso|fonte|contrato|rua|logradouro|objeto|engenheiro|arquiteto|convenio|proposta|habilitacao|data|observa)/.test(c)) {
-    // Evita considerar frases longas de dados/titulo como cabecalho.
-    const palavras = c.split(" ").filter(Boolean).length;
-    if (palavras <= 6) return 2;
-  }
-
-  return 0;
+function pareceCabecalho(row) {
+  const texto = normaliza((row || []).join(" "));
+  return PALAVRAS_CABECALHO.some((p) => texto.includes(p));
 }
 
-function analisarLinhaCabecalho(row) {
-  const preenchidas = contarPreenchidas(row);
-  if (preenchidas < 2) return { score: 0, evidencias: 0, preenchidas };
-
-  let score = 0;
-  let evidencias = 0;
-
-  for (const celula of row || []) {
-    const p = pontuarCelulaCabecalho(celula);
-    if (p > 0) {
-      score += p;
-      evidencias += 1;
-    }
-  }
-
-  // Bonus quando a linha tem muitas celulas e varias delas sao colunas conhecidas.
-  // Isso separa bem um cabecalho real de um titulo como "OBRAS EM LICITACAO".
-  if (evidencias >= 3) score += 6;
-  if (evidencias >= 5) score += 10;
-
-  return { score, evidencias, preenchidas };
-}
-
-export function acharLinhaCabecalho(rows, maxLinhasAnalisadas = 40) {
+export function acharLinhaCabecalho(rows, maxLinhasAnalisadas = 15) {
   if (!rows || rows.length === 0) return -1;
   const limite = Math.min(rows.length, maxLinhasAnalisadas);
 
-  let melhorIndice = -1;
-  let melhorScore = -1;
-  let melhoresEvidencias = -1;
-  let maisPreenchidas = -1;
-
+  // Etapa 1: primeira linha com >= 2 celulas E palavra tipica de cabecalho.
   for (let i = 0; i < limite; i++) {
-    const analise = analisarLinhaCabecalho(rows[i]);
-
-    // Para ser aceito como cabecalho sem fallback, exigimos pelo menos
-    // duas celulas com cara de nome de coluna. Em abas relevantes
-    // (obras/projetos/licitacoes/pavimentacao) normalmente ha 6+.
-    if (analise.evidencias < 2) continue;
-
-    const melhor =
-      analise.score > melhorScore ||
-      (analise.score === melhorScore && analise.evidencias > melhoresEvidencias) ||
-      (analise.score === melhorScore && analise.evidencias === melhoresEvidencias && analise.preenchidas > maisPreenchidas);
-
-    if (melhor) {
-      melhorIndice = i;
-      melhorScore = analise.score;
-      melhoresEvidencias = analise.evidencias;
-      maisPreenchidas = analise.preenchidas;
+    if (contarPreenchidas(rows[i]) >= 2 && pareceCabecalho(rows[i])) {
+      return i;
     }
   }
 
-  if (melhorIndice >= 0) return melhorIndice;
-
-  // Fallback conservador: usa a linha com mais celulas preenchidas.
-  // Em caso de empate, mantem a primeira.
-  let fallback = -1;
-  let maior = 0;
+  // Etapa 2 (fallback): a linha com mais celulas preenchidas.
+  let melhorIndice = -1;
+  let melhorContagem = 0;
   for (let i = 0; i < limite; i++) {
     const preenchidas = contarPreenchidas(rows[i]);
-    if (preenchidas >= 2 && preenchidas > maior) {
-      maior = preenchidas;
-      fallback = i;
+    if (preenchidas >= 2 && preenchidas > melhorContagem) {
+      melhorContagem = preenchidas;
+      melhorIndice = i;
     }
   }
-  return fallback;
-}
-
-function ehRepeticaoDeCabecalho(row, header) {
-  if (!row || !header || !header.length) return false;
-  let iguais = 0;
-  let comparados = 0;
-  const limite = Math.min(row.length, header.length);
-  for (let i = 0; i < limite; i++) {
-    const h = normaliza(header[i]);
-    const v = normaliza(row[i]);
-    if (!h || !v) continue;
-    comparados += 1;
-    if (h === v) iguais += 1;
-  }
-  return comparados >= 2 && iguais / comparados >= 0.7;
+  return melhorIndice;
 }
 
 // Converte uma aba em lista de objetos, ignorando lixo.
 export function rowsToObjects(rows, tabName) {
   const idxCabecalho = acharLinhaCabecalho(rows);
-  if (idxCabecalho < 0) {
-    return { obras: [], cabecalho: [], ignoradas: 0, linha_cabecalho: null, score_cabecalho: 0 };
-  }
+  if (idxCabecalho < 0) return { obras: [], cabecalho: [], ignoradas: 0 };
 
-  const header = (rows[idxCabecalho] || []).map((h) => (h ?? "").toString().trim());
-  const analiseCabecalho = analisarLinhaCabecalho(rows[idxCabecalho] || []);
+  const header = (rows[idxCabecalho] || []).map((h) => (h || "").toString().trim());
   const obras = [];
   let ignoradas = 0;
 
@@ -286,15 +161,8 @@ export function rowsToObjects(rows, tabName) {
     const row = rows[i] || [];
 
     // Linha totalmente vazia -> descarta (nao conta como obra).
-    const temAlgo = row.some((c) => (c ?? "").toString().trim() !== "");
+    const temAlgo = row.some((c) => (c || "").toString().trim() !== "");
     if (!temAlgo) {
-      ignoradas += 1;
-      continue;
-    }
-
-    // Algumas planilhas repetem o cabecalho no meio da tabela.
-    // Nao transforme essa linha repetida em obra/licitacao/projeto.
-    if (ehRepeticaoDeCabecalho(row, header)) {
       ignoradas += 1;
       continue;
     }
@@ -303,7 +171,7 @@ export function rowsToObjects(rows, tabName) {
     let campos = 0;
     header.forEach((col, j) => {
       if (!col) return;
-      const valor = (row[j] ?? "").toString().trim();
+      const valor = (row[j] || "").toString().trim();
       if (valor) {
         obj[col] = valor;
         campos += 1;
@@ -319,13 +187,7 @@ export function rowsToObjects(rows, tabName) {
     obras.push(obj);
   }
 
-  return {
-    obras,
-    cabecalho: header.filter(Boolean),
-    ignoradas,
-    linha_cabecalho: idxCabecalho + 1, // 1-based para facilitar leitura do log
-    score_cabecalho: analiseCabecalho.score,
-  };
+  return { obras, cabecalho: header.filter(Boolean), ignoradas };
 }
 
 // Retorna TODAS as obras de TODAS as abas.
@@ -358,15 +220,13 @@ export async function getObras() {
 
   (resp.data.valueRanges || []).forEach((vr, idx) => {
     const nomeAba = tabs[idx];
-    const { obras, cabecalho, ignoradas, linha_cabecalho, score_cabecalho } = rowsToObjects(vr.values, nomeAba);
+    const { obras, cabecalho, ignoradas } = rowsToObjects(vr.values, nomeAba);
     todas.push(...obras);
     relatorio.push({
       aba: nomeAba,
       linhas_lidas: (vr.values || []).length,
       obras: obras.length,
       linhas_ignoradas: ignoradas,
-      linha_cabecalho,
-      score_cabecalho,
       cabecalho,
     });
   });
@@ -374,9 +234,8 @@ export async function getObras() {
   // Log de diagnostico: mostra o que foi lido de cada aba.
   relatorio.forEach((r) => {
     console.log(
-      `DIAGNOSTICO aba "${r.aba}": ${r.obras} registro(s), ` +
-        `${r.linhas_ignoradas} linha(s) ignorada(s), ` +
-        `cabecalho na linha ${r.linha_cabecalho ?? "?"} (score ${r.score_cabecalho ?? 0}). ` +
+      `DIAGNOSTICO aba "${r.aba}": ${r.obras} obra(s), ` +
+        `${r.linhas_ignoradas} linha(s) ignorada(s). ` +
         `Colunas: ${r.cabecalho.join(" | ") || "(nenhuma detectada)"}`
     );
   });
