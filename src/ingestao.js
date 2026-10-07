@@ -79,14 +79,95 @@ function padronizarStatus(txt) {
   return (txt || "").toString().trim();
 }
 
-function parseValor(v) {
+// Converte numeros vindos do Google Sheets sem depender do formato visual.
+// Aceita, por exemplo:
+//   3,020,000.00   (formato EN/US)
+//   3.020.000,00   (formato PT/BR)
+//   3020000.00     (valor cru/unformatted)
+//   R$ 3.020.000,00
+// Tambem preserva negativos e ignora simbolos de moeda/texto residual.
+function parseNumeroFlexivel(v, { separadorUnicoDecimal = false } = {}) {
   if (v === null || v === undefined || v === "") return null;
-  if (typeof v === "number") return v;
-  let s = v.toString().replace(/r\$/i, "").replace(/\s/g, "").trim();
-  if (!s || s === "-") return null;
-  s = s.replace(/\./g, "").replace(",", ".");
-  const n = parseFloat(s);
-  return isNaN(n) ? null : n;
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+
+  let bruto = String(v).trim();
+  if (!bruto || bruto === "-") return null;
+
+  const negativoPorParenteses = /^\s*\(.*\)\s*$/.test(bruto);
+  let s = bruto
+    .replace(/\u00a0/g, "")
+    .replace(/r\$/gi, "")
+    .replace(/\s+/g, "")
+    .replace(/[^0-9,\.\-+]/g, "");
+
+  if (!s || s === "-" || s === "+") return null;
+
+  let negativo = negativoPorParenteses || s.includes("-");
+  s = s.replace(/[+-]/g, "");
+  if (!s) return null;
+
+  const ultimaVirgula = s.lastIndexOf(",");
+  const ultimoPonto = s.lastIndexOf(".");
+  let normalizado = s;
+
+  if (ultimaVirgula >= 0 && ultimoPonto >= 0) {
+    // Se existem os dois separadores, o ULTIMO e o separador decimal.
+    // 3,020,000.00 -> 3020000.00
+    // 3.020.000,00 -> 3020000.00
+    if (ultimaVirgula > ultimoPonto) {
+      normalizado = s.replace(/\./g, "").replace(/,/g, ".");
+    } else {
+      normalizado = s.replace(/,/g, "");
+    }
+  } else if (ultimaVirgula >= 0 || ultimoPonto >= 0) {
+    const sep = ultimaVirgula >= 0 ? "," : ".";
+    const partes = s.split(sep);
+
+    if (partes.length > 2) {
+      const ultima = partes[partes.length - 1];
+      const anteriores = partes.slice(0, -1).join("");
+      // Varios separadores: se o ultimo grupo tem 1-2 casas, tratamos como
+      // decimal; senao, todos sao separadores de milhar.
+      normalizado = (ultima.length >= 1 && ultima.length <= 2)
+        ? `${anteriores}.${ultima}`
+        : `${anteriores}${ultima}`;
+    } else {
+      const [inteiro, fracao = ""] = partes;
+      // Para dinheiro, um unico grupo de 3 digitos costuma ser milhar
+      // (1.234 ou 1,234). Para percentuais, permitimos forcar decimal.
+      const ehMilhar = !separadorUnicoDecimal && fracao.length === 3 && inteiro.length >= 1;
+      normalizado = ehMilhar ? `${inteiro}${fracao}` : `${inteiro}.${fracao}`;
+    }
+  }
+
+  const n = Number(normalizado);
+  if (!Number.isFinite(n)) return null;
+  return negativo ? -Math.abs(n) : n;
+}
+
+function parseValor(v) {
+  return parseNumeroFlexivel(v);
+}
+
+// No banco, percentual_executado fica em PONTOS PERCENTUAIS para combinar
+// com a exibicao do agente: 75,51% -> 75.51; 107,21% -> 107.21.
+// Quando o Sheets entrega UNFORMATTED_VALUE, uma celula 75,51% vem como 0.7551;
+// nesse caso convertemos a fracao para pontos percentuais.
+function parsePercentual(v) {
+  if (v === null || v === undefined || v === "") return null;
+
+  const texto = String(v).trim();
+  const tinhaPercentual = texto.includes("%");
+  const n = parseNumeroFlexivel(v, { separadorUnicoDecimal: true });
+  if (n === null) return null;
+
+  if (tinhaPercentual) return n;
+
+  // Heuristica para valores crus do Google Sheets: percentuais formatados sao
+  // armazenados como fracao (0.7551 = 75.51%, 1.0721 = 107.21%).
+  // Acima de 5, assumimos que a planilha ja esta em pontos percentuais.
+  if (Math.abs(n) <= 5) return n * 100;
+  return n;
 }
 
 function categoriaDaAba(aba) {
@@ -209,7 +290,7 @@ function limpar(obra) {
     categoria,
     valor_total: parseValor(pegar(obra, "valor_total")),
     valor_executado: parseValor(pegar(obra, "valor_executado")),
-    percentual_executado: parseValor(pegar(obra, "percentual_executado")),
+    percentual_executado: parsePercentual(pegar(obra, "percentual_executado")),
     engenheiro: (pegar(obra, "engenheiro") || "").toString().trim() || null,
     empresa: (pegar(obra, "empresa") || "").toString().trim() || null,
     aba_origem: obra._aba || null,
