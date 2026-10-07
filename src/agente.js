@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - GOOGLE SHEETS + ARQUERO + DECIMAL.JS (SEM SQL) - V5
+// agente.js - GOOGLE SHEETS + ARQUERO + DECIMAL.JS (SEM SQL) - V7
 // ============================================================
 // Inspirado no padrao de agentes de planilha do n8n:
 // - a IA entende a pergunta e escolhe uma ferramenta;
@@ -163,7 +163,10 @@ function formatarValorCampo(campo, v) {
   const n = parseNumero(v);
   if (n !== null && pareceCampoDinheiro(campo)) return formatarMoeda(n);
   if (n !== null && pareceCampoPercentual(campo)) {
-    const valor = Math.abs(n) <= 1 ? n * 100 : n;
+    // Com valueRenderOption=UNFORMATTED_VALUE, percentuais do Google Sheets
+    // normalmente chegam como razao: 0.9865 = 98,65%; 1.02 = 102%.
+    // Valores claramente ja percentuais (ex.: 75.51) ficam como 75,51%.
+    const valor = Math.abs(n) <= 5 ? n * 100 : n;
     return `${formatarNumero(valor)}%`;
   }
   return texto(v);
@@ -241,6 +244,8 @@ const ALIASES_CAMPOS = {
   valor_pago_2024: ["valor pago 2024"],
   valor_pago_2025: ["valor pago 2025"],
   valor_pago_2026: ["valor pago 2026"],
+  proposta_analisada: ["proposta analisada", "analise da proposta", "análise da proposta"],
+  habilitacao_analisada: ["habilitacao analisada", "habilitação analisada", "analise da habilitacao", "análise da habilitação"],
   data_inicio: ["data inicio", "data_inicio", "inicio"],
   data_prev_termino: ["data prev termino", "data_prev_termino", "previsao de termino", "previsao termino"],
   observacoes: ["observacoes", "observações", "observacao", "observação"],
@@ -418,7 +423,10 @@ function statusSemanticoDaLinha(row) {
   if (!s) return "";
 
   if (escopo === "obra" || escopo === "pavimentacao") {
-    if (/\b(executada|executadas|concluida|concluidas|concluido|concluidos|finalizada|finalizadas|finalizado|finalizados)\b/.test(s)) return "concluida";
+    // REGRA DE NEGOCIO: EXECUTADA e CONCLUIDA sao conceitos diferentes.
+    // Nao misture pavimentacao "EXECUTADA" com obra marcada "Concluida".
+    if (/\b(executada|executadas|executado|executados)\b/.test(s)) return "executada";
+    if (/\b(concluida|concluidas|concluido|concluidos|finalizada|finalizadas|finalizado|finalizados)\b/.test(s)) return "concluida";
     if (/\b(a executar|nao iniciada|nao iniciadas|nao iniciado|nao iniciados|a iniciar|para iniciar)\b/.test(s)) return "a_iniciar";
     if (/\bparalisad/.test(s)) return "paralisada";
     if (/\bretomad/.test(s)) return "retomada";
@@ -447,14 +455,25 @@ function statusSemanticoDaLinha(row) {
 }
 
 function detectarStatusSemanticoNaPergunta(pergunta = "") {
-  const q = normalizar(pergunta);
+  let q = normalizar(pergunta);
   if (!q) return "";
+
+  // Remove expressoes em que "executado" e METRICA, nao status.
+  q = q
+    .replace(/\bvalor executad[oa]s?\b/g, " ")
+    .replace(/\bpercentual executad[oa]s?\b/g, " ")
+    .replace(/\bporcentagem executad[oa]s?\b/g, " ")
+    .replace(/\btotal executad[oa]\b/g, " ")
+    .replace(/\bexecucao financeira\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
   // Negacoes complexas ficam para o planner; nao forcamos um status positivo.
   if (/\bnao\s+(?:esta|estao|ficou|ficaram)?\s*(?:em )?(andamento|execucao|concluid|executad|iniciad)/.test(q)) return "";
 
   if (/\b(em andamento|em execucao)\b/.test(q)) return "em_andamento";
-  if (/\b(concluida|concluidas|concluido|concluidos|executada|executadas|finalizada|finalizadas|finalizado|finalizados)\b/.test(q)) return "concluida";
+  if (/\b(executada|executadas|executado|executados)\b/.test(q)) return "executada";
+  if (/\b(concluida|concluidas|concluido|concluidos|finalizada|finalizadas|finalizado|finalizados)\b/.test(q)) return "concluida";
   if (/\b(a executar|nao iniciada|nao iniciadas|nao iniciado|nao iniciados|a iniciar|para iniciar|pra comecar|para comecar)\b/.test(q)) return "a_iniciar";
   if (/\bparalisad/.test(q)) return "paralisada";
   if (/\bretomad/.test(q)) return "retomada";
@@ -475,16 +494,252 @@ function detectarEscopoExplicito(pergunta = "") {
   return "";
 }
 
-function aplicarGuardasSemanticas(pergunta, plano = {}) {
+
+function detectarDimensaoExplicita(pergunta = "") {
+  const q = normalizar(pergunta);
+  if (!q) return "";
+  if (/\b(bairro|bairros|localidade|localidades|onde)\b/.test(q)) return "bairro";
+  if (/\b(empresa|empresas|construtora|construtoras|contratada|contratadas)\b/.test(q)) return "empresa";
+  if (/\b(engenheiro|engenheiros|arquiteto|arquitetos|responsavel|responsaveis|profissional|profissionais)\b/.test(q)) return "engenheiro";
+  if (/\b(recurso|recursos|fonte|fontes)\b/.test(q)) return "recurso";
+  if (/\b(status|situacao|situacoes)\b/.test(q)) return "status";
+  // "quem tem mais obras?" normalmente pede pessoa/responsavel.
+  if (/\bquem\b/.test(q) && /\b(mais|menos|ranking|rank)\b/.test(q)) return "engenheiro";
+  return "";
+}
+
+function detectarAcaoSemantica(pergunta = "") {
+  const q = normalizar(pergunta);
+  if (!q) return "desconhecida";
+  if (/\b(ranking|rank|maior quantidade|menor quantidade|mais obras|menos obras|mais projetos|menos projetos|mais licitacoes|menos licitacoes)\b/.test(q)) return "ranking";
+  if (/\b(valor|valores|quanto|soma|somam|investid|contratad|pago|pagos|gasto|gastos|desembols|executado financeir|saldo)\b/.test(q)) return "soma";
+  if (/\b(quantos|quantas|quantidade|existe quant|existem quant|total de)\b/.test(q)) return "contar";
+  if (/\b(quais|qual|listar|liste|mostre|mostrar|me diga|fale quais)\b/.test(q)) return "listar";
+  return "desconhecida";
+}
+
+function detectarMetricaFinanceira(pergunta = "") {
+  const q = normalizar(pergunta);
+  if (!q) return "";
+  if (/\b(saldo devedor|quanto falta|falta pagar)\b/.test(q)) return "saldo_devedor";
+  if (/\b(valor executado|total executado|execucao financeira|financeiramente executado)\b/.test(q)) return "valor_executado";
+  if (/\b(pago|pagos|pagamento|pagamentos|gasto|gastos|desembols|despesa paga)\b/.test(q)) return "pago";
+  if (/\b(valor total|investid|investimento|contratad|valor das obras|valor dos projetos|valor das licitacoes)\b/.test(q)) return "valor_total";
+  return "";
+}
+
+function perguntaTemReferenciaAoContexto(pergunta = "") {
+  const q = normalizar(pergunta);
+  if (!q) return false;
+  if (/\b(desse|dessa|desses|dessas|dele|dela|deles|delas|nesse|nessa|nesses|nessas|nisso|isso|esses|essas|este|esta|estes|estas|anteriores|acima)\b/.test(q)) return true;
+  if (/^(e\s+)?(quais|qual|quantos|quantas)\s+(sao|estao|ficaram|tem|têm|foram)\b/.test(q)) return true;
+  if (/^(e\s+)?(tem|têm)\s+algum\b/.test(q)) return true;
+  if (/^(e\s+)?(qual|quanto|quais)\b/.test(q) && q.split(/\s+/).length <= 6 && !detectarEscopoExplicito(q)) return true;
+  if (/^(e\s+)?(os|as)\s+(outros|outras)\b/.test(q)) return true;
+  return false;
+}
+
+function perguntaPedeResetAmplo(pergunta = "") {
+  const q = normalizar(pergunta);
+  return /\b(em geral|no geral|ao todo|total geral|geralmente|todos os registros|todas as obras|todos os projetos|todas as licitacoes)\b/.test(q);
+}
+
+function detectarAnaliseLicitacao(pergunta = "") {
+  const q = normalizar(pergunta);
+  const temNao = /\b(nao analisad[oa]s?|sem analise|pendente de analise)\b/.test(q);
+  const temSim = /\b(analisad[oa]s?|com analise)\b/.test(q) && !temNao;
+  if (/\bpropost/.test(q)) return { campo: "proposta_analisada", valor: temNao ? "Não" : temSim ? "Sim" : "" };
+  if (/\bhabilitac/.test(q)) return { campo: "habilitacao_analisada", valor: temNao ? "Não" : temSim ? "Sim" : "" };
+  if (/\blicitac/.test(q) && (temNao || temSim)) return { ambiguo: true };
+  return null;
+}
+
+function analisarContextoPergunta(pergunta = "", estado = null) {
+  const escopoExplicito = detectarEscopoExplicito(pergunta);
+  const statusExplicito = detectarStatusSemanticoNaPergunta(pergunta);
+  const dimensaoExplicita = detectarDimensaoExplicita(pergunta);
+  const acao = detectarAcaoSemantica(pergunta);
+  const metrica = detectarMetricaFinanceira(pergunta);
+  const referencia = perguntaTemReferenciaAoContexto(pergunta);
+  const resetAmplo = perguntaPedeResetAmplo(pergunta);
+  const licitacaoAnalise = detectarAnaliseLicitacao(pergunta);
+
+  let modoContexto = "none";
+  if (resetAmplo) modoContexto = escopoExplicito || estado?.escopo?.length ? "scope_only" : "none";
+  else if (referencia) modoContexto = "recorte";
+  else if (!escopoExplicito && statusExplicito && estado?.escopo?.length) modoContexto = "recorte";
+  else if (!escopoExplicito && acao === "soma" && estado?.escopo?.length && pergunta.split(/\s+/).length <= 7) modoContexto = "recorte";
+  else if (!escopoExplicito && acao === "ranking" && dimensaoExplicita && estado?.escopo?.length) modoContexto = "scope_only";
+
+  // Um novo pedido de ranking/contagem/listagem com universo escrito explicitamente
+  // e sem pronome e uma consulta nova; nao herda filtros/status/dimensao antigos.
+  if (escopoExplicito && !referencia && !resetAmplo) modoContexto = "none";
+
+  return {
+    escopoExplicito,
+    statusExplicito,
+    dimensaoExplicita,
+    acao,
+    metrica,
+    referencia,
+    resetAmplo,
+    modoContexto,
+    licitacaoAnalise,
+  };
+}
+
+function estadoParaPlanner(estado, analise) {
+  if (!estado || !analise || analise.modoContexto === "none") return null;
+  if (analise.modoContexto === "scope_only") {
+    return { escopo: estado.escopo || [], fonte: estado.fonte, versao: estado.versao };
+  }
+  return estado;
+}
+
+function historicoParaPlanner(historico = [], analise) {
+  if (!analise || analise.modoContexto === "none") return [];
+  return historicoCompacto(historico).slice(-4);
+}
+
+function planoDeterministicoDeAltaConfianca(pergunta, analise) {
+  const q = normalizar(pergunta);
+  if (!q) return null;
+
+  if (/^(oi|ola|olá|bom dia|boa tarde|boa noite|e ai|e aí)\b/.test(q)) {
+    return { tool: "responder", inherit_scope: false, label: "", args: {}, answer: "Oi! Como posso ajudar com as obras, projetos ou licitações?" };
+  }
+
+  if (analise?.licitacaoAnalise?.ambiguo) {
+    return {
+      tool: "responder",
+      inherit_scope: false,
+      label: "",
+      args: {},
+      answer: "Você quer saber das licitações com *proposta* não analisada ou com *habilitação* não analisada?"
+    };
+  }
+
+  // Ranking sem entidade/dimensao e ambiguo. Nao reutiliza "bairro" do turno anterior.
+  if (analise?.acao === "ranking" && !analise?.dimensaoExplicita) {
+    return {
+      tool: "responder",
+      inherit_scope: false,
+      label: "",
+      args: {},
+      answer: "Você quer o ranking por *engenheiro/responsável*, *bairro* ou *empresa*?"
+    };
+  }
+
+  const escopo = analise?.escopoExplicito ? [analise.escopoExplicito] : undefined;
+  const baseArgs = {};
+  if (escopo) baseArgs.escopo = escopo;
+  if (analise?.statusExplicito) baseArgs.status_semantico = analise.statusExplicito;
+
+  if (analise?.licitacaoAnalise?.campo && analise.licitacaoAnalise.valor) {
+    baseArgs.escopo = ["licitacao"];
+    baseArgs.filtros = [{ campo: analise.licitacaoAnalise.campo, operador: "eq", valor: analise.licitacaoAnalise.valor }];
+  }
+
+  if (analise?.acao === "ranking" && analise?.dimensaoExplicita) {
+    if (analise?.metrica) {
+      const campo = analise.metrica === "pago" ? null : analise.metrica;
+      const args = { ...baseArgs, agrupar_por: analise.dimensaoExplicita, direcao: "desc", limite: 20 };
+      if (analise.metrica === "pago") args.campos = ["pago_gestao_anterior", "pago_gestao_atual"];
+      else args.campo = campo;
+      if (analise.dimensaoExplicita === "bairro") {
+        args.normalizar_dimensao = true;
+        args.conceito = "bairro";
+      }
+      return { tool: "somar", inherit_scope: analise.modoContexto !== "none", label: `ranking por ${analise.dimensaoExplicita}`, args };
+    }
+    const args = {
+      ...baseArgs,
+      campo: analise.dimensaoExplicita,
+      ordenar_por: "quantidade",
+      direcao: "desc",
+      limite: 20,
+    };
+    if (analise.dimensaoExplicita === "bairro") {
+      args.normalizar_dimensao = true;
+      args.conceito = "bairro";
+    }
+    return { tool: "agrupar_por", inherit_scope: analise.modoContexto !== "none", label: `${analise.dimensaoExplicita}s com mais registros`, args };
+  }
+
+  // Perguntas "bairros/empresas/engenheiros e quantidade" sao agrupamentos, nao listas.
+  if (analise?.dimensaoExplicita && /\b(quantidade|quantos|quantas|mais|menos)\b/.test(q) && analise.acao !== "soma") {
+    const args = { ...baseArgs, campo: analise.dimensaoExplicita, ordenar_por: "quantidade", direcao: "desc", limite: 50 };
+    if (analise.dimensaoExplicita === "bairro") {
+      args.normalizar_dimensao = true;
+      args.conceito = "bairro";
+    }
+    return { tool: "agrupar_por", inherit_scope: analise.modoContexto !== "none", label: `${analise.dimensaoExplicita}s`, args };
+  }
+
+  // Soma financeira simples e agrupada.
+  if (analise?.acao === "soma" && analise?.metrica) {
+    const args = { ...baseArgs };
+    if (analise.metrica === "pago") args.campos = ["pago_gestao_anterior", "pago_gestao_atual"];
+    else args.campo = analise.metrica;
+    if (analise.dimensaoExplicita) {
+      args.agrupar_por = analise.dimensaoExplicita;
+      args.direcao = "desc";
+      args.limite = 50;
+      if (analise.dimensaoExplicita === "bairro") {
+        args.normalizar_dimensao = true;
+        args.conceito = "bairro";
+      }
+    }
+    const labelMetrica = analise.metrica === "pago" ? "total pago" :
+      analise.metrica === "valor_total" ? "valor total" :
+      analise.metrica === "valor_executado" ? "valor executado" : "saldo devedor";
+    return { tool: "somar", inherit_scope: analise.modoContexto !== "none", label: analise.dimensaoExplicita ? `${labelMetrica} por ${analise.dimensaoExplicita}` : labelMetrica, args };
+  }
+
+  // Contagens simples com escopo/status explicitos sao deterministicas.
+  if (analise?.acao === "contar" && (analise?.escopoExplicito || analise?.statusExplicito || analise?.licitacaoAnalise?.campo)) {
+    return { tool: "contar_obras", inherit_scope: analise.modoContexto !== "none", label: analise.escopoExplicito || "registros", args: baseArgs };
+  }
+
+  // Listagens simples de um universo/status conhecido.
+  if (analise?.acao === "listar" && (analise?.escopoExplicito || analise?.statusExplicito || analise?.licitacaoAnalise?.campo)) {
+    return {
+      tool: "buscar_obras",
+      inherit_scope: analise.modoContexto !== "none",
+      label: analise.escopoExplicito || "registros",
+      args: { ...baseArgs, campos: ["objeto", "status", "bairro", "engenheiro", "empresa", "valor_total"], limite: MAX_LISTA }
+    };
+  }
+
+  return null;
+}
+
+function validarPlano(plano = {}) {
+  const ferramentas = new Set(["buscar_obras", "contar_obras", "agrupar_por", "somar", "listar_colunas", "responder"]);
   const p = { ...plano, args: { ...(plano.args || {}) } };
-  const escopo = detectarEscopoExplicito(pergunta);
-  const status = detectarStatusSemanticoNaPergunta(pergunta);
+  if (!ferramentas.has(p.tool)) return null;
+  p.inherit_scope = p.inherit_scope === true;
+  if (!p.args || typeof p.args !== "object" || Array.isArray(p.args)) p.args = {};
+  return p;
+}
+
+function aplicarGuardasSemanticas(pergunta, plano = {}, analise = null) {
+  const p = { ...plano, args: { ...(plano.args || {}) } };
+  const info = analise || analisarContextoPergunta(pergunta, null);
+  const escopo = info.escopoExplicito || detectarEscopoExplicito(pergunta);
+  const status = info.statusExplicito || detectarStatusSemanticoNaPergunta(pergunta);
 
   if (escopo) {
     p.args.escopo = [escopo];
-    p.inherit_scope = false;
+    // Consulta explicitamente nova nao herda recorte antigo.
+    if (info.modoContexto === "none") p.inherit_scope = false;
   }
   if (status) p.args.status_semantico = status;
+
+  // Evita o bug "valor executado" => status EXECUTADA.
+  if (info.metrica === "valor_executado" && !/\bobras?\s+executad/.test(normalizar(pergunta))) {
+    if (p.args.status_semantico === "executada") delete p.args.status_semantico;
+  }
 
   // "quais projetos concluídos?" nunca deve virar uma distribuição por status.
   const campoGrupo = normalizar(p.args.campo || "");
@@ -494,6 +749,54 @@ function aplicarGuardasSemanticas(pergunta, plano = {}) {
     delete p.args.ordenar_por;
     p.args.campos = p.args.campos?.length ? p.args.campos : ["objeto", "status", "engenheiro", "empresa", "valor_total"];
   }
+
+  // Ranking: a dimensao vem da pergunta atual, nunca da memoria antiga.
+  if (info.acao === "ranking" && info.dimensaoExplicita) {
+    if (info.metrica) {
+      p.tool = "somar";
+      delete p.args.campo;
+      p.args.agrupar_por = info.dimensaoExplicita;
+      p.args.direcao = "desc";
+      if (info.metrica === "pago") p.args.campos = ["pago_gestao_anterior", "pago_gestao_atual"];
+      else p.args.campo = info.metrica;
+    } else {
+      p.tool = "agrupar_por";
+      p.args.campo = info.dimensaoExplicita;
+      p.args.ordenar_por = "quantidade";
+      p.args.direcao = "desc";
+    }
+  }
+
+  if (info.dimensaoExplicita === "bairro" && (p.tool === "agrupar_por" || p.tool === "somar")) {
+    if (p.tool === "agrupar_por") p.args.campo = "bairro";
+    if (p.tool === "somar" && info.acao === "soma") p.args.agrupar_por = "bairro";
+    p.args.normalizar_dimensao = true;
+    p.args.conceito = "bairro";
+  }
+
+  // Regras de analise de licitacao.
+  if (info.licitacaoAnalise?.campo && info.licitacaoAnalise.valor) {
+    p.args.escopo = ["licitacao"];
+    // "habilitacao analisada = Não" é coluna de análise, NÃO significa
+    // que o STATUS do certame esteja em "Habilitação em andamento".
+    delete p.args.status_semantico;
+    const atuais = Array.isArray(p.args.filtros) ? p.args.filtros : [];
+    const semMesmoCampo = atuais.filter((f) => normalizar(f?.campo || f?.field || "") !== normalizar(info.licitacaoAnalise.campo));
+    p.args.filtros = [...semMesmoCampo, { campo: info.licitacaoAnalise.campo, operador: "eq", valor: info.licitacaoAnalise.valor }];
+  }
+
+  // Regra financeira: a metrica escrita pelo usuario vence qualquer coluna inferida pela IA.
+  if (info.acao === "soma" && info.metrica) {
+    p.tool = "somar";
+    if (info.metrica === "pago") {
+      delete p.args.campo;
+      p.args.campos = ["pago_gestao_anterior", "pago_gestao_atual"];
+    } else {
+      delete p.args.campos;
+      p.args.campo = info.metrica;
+    }
+  }
+
   return p;
 }
 
@@ -714,6 +1017,53 @@ function extrairLocalidadeMarcadaDeTexto(bruto = "") {
   return "";
 }
 
+
+let LOCALIDADES_CONHECIDAS = [];
+
+function localidadeLimpaCandidata(v = "") {
+  const t = texto(v);
+  const n = normalizar(t);
+  if (!n || ehDescricaoLocalGenerica(t) || ehTrechoEndereco(t)) return "";
+  if (n.length < 3 || n.length > 60) return "";
+  if (/\d{2,}/.test(n)) return "";
+  if (/\b(rua|avenida|travessa|rodovia|estrada|numero|s n|sn)\b/.test(n)) return "";
+  return capitalizarRotuloDimensao(t, "bairro");
+}
+
+function atualizarDicionarioLocalidades(rows = []) {
+  const mapa = new Map();
+  for (const row of rows) {
+    const fontes = [
+      valorColunaExata(row, ["bairro"]),
+      valorColunaExata(row, ["localidade", "comunidade", "distrito", "loteamento"]),
+    ].filter(Boolean);
+    for (const bruto of fontes) {
+      // Se e endereco sujo, tente primeiro extracao explicita ja existente.
+      const extraido = extrairLocalidadeDeTexto(bruto, { permitirValorInteiro: true });
+      const candidato = localidadeLimpaCandidata(extraido || bruto);
+      if (!candidato) continue;
+      const k = normalizar(candidato);
+      if (!mapa.has(k)) mapa.set(k, candidato);
+    }
+  }
+  LOCALIDADES_CONHECIDAS = [...mapa.entries()]
+    .sort((a, b) => b[0].length - a[0].length)
+    .map(([norm, rotulo]) => ({ norm, rotulo }));
+}
+
+function acharLocalidadeConhecidaEmTexto(v = "") {
+  const raw = texto(v);
+  if (!raw || !LOCALIDADES_CONHECIDAS.length) return "";
+  const segmentos = raw
+    .split(/[-,;()|]/g)
+    .map((x) => normalizar(x))
+    .filter(Boolean);
+  for (const loc of LOCALIDADES_CONHECIDAS) {
+    if (segmentos.includes(loc.norm)) return loc.rotulo;
+  }
+  return "";
+}
+
 function bairroDerivadoDaLinha(row) {
   // 1) Campo BAIRRO e a fonte preferida. Pode conter bairro puro ou endereco sujo.
   const brutoBairro = valorColunaExata(row, ["bairro"]);
@@ -734,6 +1084,8 @@ function bairroDerivadoDaLinha(row) {
   if (rua) {
     const b = extrairLocalidadeDeTexto(rua, { permitirValorInteiro: false });
     if (b) return { grupo: b, fonte: "rua/endereco", bruto: rua };
+    const conhecida = acharLocalidadeConhecidaEmTexto(rua);
+    if (conhecida) return { grupo: conhecida, fonte: "dicionario_planilha", bruto: rua };
   }
 
   // 4) Ultimo recurso: no OBJETO aceitamos SOMENTE marcadores explicitos
@@ -744,6 +1096,8 @@ function bairroDerivadoDaLinha(row) {
   if (objeto) {
     const b = extrairLocalidadeMarcadaDeTexto(objeto);
     if (b) return { grupo: b, fonte: "objeto", bruto: objeto };
+    const conhecida = acharLocalidadeConhecidaEmTexto(objeto);
+    if (conhecida) return { grupo: conhecida, fonte: "dicionario_planilha", bruto: objeto };
   }
   return null;
 }
@@ -1092,24 +1446,47 @@ function historicoCompacto(historico = []) {
   })).filter((m) => m.role && m.content);
 }
 
-function mergeArgsComEstado(args = {}, plano = {}, estado = null) {
+function mergeArgsComEstado(args = {}, plano = {}, estado = null, analise = null) {
   const a = { ...args };
-  if (!plano.inherit_scope || !estado) return a;
+  const modo = analise?.modoContexto || (plano.inherit_scope ? "recorte" : "none");
+  if (modo === "none" || !estado) return a;
 
-  if ((!a.escopo || (Array.isArray(a.escopo) && !a.escopo.length)) && estado.escopo) a.escopo = estado.escopo;
+  // "em geral / ao todo" preserva no maximo o universo, nunca filtros antigos.
+  if ((!a.escopo || (Array.isArray(a.escopo) && !a.escopo.length)) && estado.escopo) a.escopo = [...estado.escopo];
+  if (modo === "scope_only") {
+    delete a.status_semantico;
+    a.filtros = Array.isArray(a.filtros) ? a.filtros : [];
+    return a;
+  }
+
   if ((!a.termos || !a.termos.length) && estado.termos?.length) a.termos = [...estado.termos];
   if ((!a.campos_busca || !a.campos_busca.length) && estado.campos_busca?.length) a.campos_busca = [...estado.campos_busca];
   if (!a.status_semantico && estado.status_semantico) a.status_semantico = estado.status_semantico;
 
-  let anteriores = Array.isArray(estado.filtros) ? estado.filtros : [];
-  const atuais = Array.isArray(a.filtros) ? a.filtros : [];
-  // Um novo status semantico substitui filtros antigos de status, em vez de somar
-  // "concluido" + "em andamento" no mesmo follow-up.
+  let anteriores = Array.isArray(estado.filtros) ? [...estado.filtros] : [];
+  const atuais = Array.isArray(a.filtros) ? [...a.filtros] : [];
+
+  // Novo status substitui qualquer status anterior.
   if (a.status_semantico) {
     anteriores = anteriores.filter((f) => !["status", "situacao", "situacao atual"].includes(normalizar(f?.campo || f?.field || "")));
   }
-  a.filtros = [...anteriores, ...atuais];
 
+  // Filtro atual de um campo substitui filtro antigo do mesmo campo.
+  const camposAtuais = new Set(atuais.map((f) => normalizar(f?.campo || f?.field || "")).filter(Boolean));
+  anteriores = anteriores.filter((f) => !camposAtuais.has(normalizar(f?.campo || f?.field || "")));
+
+  // Pronome depois de ranking ("quais sao as obras dele?") usa o primeiro colocado,
+  // mas somente quando a dimensao anterior era inequivoca.
+  const q = normalizar(analise?.pergunta || "");
+  const referenciaGrupo = /\b(dele|dela|deles|delas|desse|dessa|desse responsavel|dessa empresa)\b/.test(q);
+  if (referenciaGrupo && estado.dimensao && estado.grupo_principal) {
+    const campo = estado.dimensao;
+    const operador = ["bairro", "localidade"].includes(normalizar(campo)) ? "contains" : "eq";
+    const jaTem = atuais.some((f) => normalizar(f?.campo || f?.field || "") === normalizar(campo));
+    if (!jaTem) atuais.push({ campo, operador, valor: estado.grupo_principal });
+  }
+
+  a.filtros = [...anteriores, ...atuais];
   return a;
 }
 
@@ -1130,6 +1507,12 @@ function construirEstado(plano, args, resultado) {
   if (resultado?.tipo === "agrupamento") {
     estado.dimensao = resultado.campo;
     estado.grupos_recentes = resultado.itens.slice(0, 10).map((x) => x.grupo);
+    estado.grupo_principal = resultado.itens?.[0]?.grupo || null;
+  }
+  if (resultado?.tipo === "soma_agrupada") {
+    estado.dimensao = resultado.campo_grupo;
+    estado.grupos_recentes = resultado.itens.slice(0, 10).map((x) => x.grupo);
+    estado.grupo_principal = resultado.itens?.[0]?.grupo || null;
   }
   if (resultado?.tipo === "lista") {
     estado.objetos_recentes = resultado.itens.slice(0, 20).map((x) => x.objeto).filter(Boolean);
@@ -1166,14 +1549,21 @@ ESCOPOS DO NEGOCIO:
 
 CONTEXTO:
 - O bloco ESTADO_ATUAL abaixo e o UNICO estado anterior autorizado.
-- Se a mensagem atual for follow-up como "quais sao?", "dessas", "e os responsaveis?", preserve o estado com inherit_scope=true.
+- O campo modo_contexto informa se o turno atual pode usar memoria. Se for "none", ignore completamente assuntos, filtros e dimensoes de turnos anteriores.
+- Se a mensagem atual for follow-up como "quais sao?", "dessas", "e os responsaveis?", preserve o recorte com inherit_scope=true.
 - Se a mensagem atual trouxer um novo alvo/universo explicito, use inherit_scope=false. NUNCA ressuscite um assunto mais antigo.
+- "em geral", "no geral" e "ao todo" removem filtros especificos antigos; no maximo preservam o universo.
+- NUNCA reutilize uma dimensao antiga (bairro/engenheiro/empresa/status) para um ranking novo se ela nao estiver escrita ou claramente indicada na pergunta atual.
+- Ranking sem dimensao clara deve usar tool=responder e perguntar: engenheiro/responsavel, bairro ou empresa.
 - Mudar a acao (contar -> listar -> somar -> agrupar) nao deve apagar o recorte quando for follow-up.
 
 SEMANTICA:
 - Use os nomes de coluna reais informados no CATALOGO quando possivel; nomes canonicos como objeto, bairro, engenheiro, empresa, status, recurso, valor_total, valor_executado tambem sao aceitos.
-- Quando o usuario pedir um ciclo de status, prefira status_semantico: em_andamento, concluida, a_iniciar, paralisada, retomada, em_revisao, em_elaboracao, aguardando_aprovacao, homologada ou habilitacao. O Node valida o status real da planilha antes de responder.
-- "obras em andamento" NAO significa todas as linhas da aba de obras: exige status_semantico="em_andamento". "obras concluídas/executadas" exige status_semantico="concluida".
+- Quando o usuario pedir um ciclo de status, prefira status_semantico: em_andamento, concluida, executada, a_iniciar, paralisada, retomada, em_revisao, em_elaboracao, aguardando_aprovacao, homologada ou habilitacao. O Node valida o status real da planilha antes de responder.
+- REGRA OBRIGATORIA: "EXECUTADA" e "CONCLUIDA" sao status diferentes. Nunca trate obra/pavimentacao EXECUTADA como CONCLUIDA.
+- "obras em andamento" exige status_semantico="em_andamento".
+- "obras concluidas" exige status_semantico="concluida" e NAO inclui status EXECUTADA.
+- "obras executadas" exige status_semantico="executada" e NAO inclui status CONCLUIDA.
 - "valor pago", "quanto foi gasto" ou "desembolsado" NAO e automaticamente "valor executado" nem "valor total". Se houver colunas de pagamento, use as de pagamento; se a planilha nao permitir distinguir, nao invente.
 - Para "total investido", "valor das obras" ou "valor contratado" use valor_total, salvo se o usuario pedir outra metrica.
 - Nunca invente filtros, nomes, bairros, empresas, engenheiros ou valores.
@@ -1183,6 +1573,7 @@ SEMANTICA:
 - Nunca trate TRECHO numerado, nome de servico/obra (reforma, recuperacao, manutencao, pavimentacao etc.), rua/avenida ou endereco como bairro. O Node tambem valida isso.
 - Se pedir soma/valor por bairro ou localidade, use somar com agrupar_por="bairro", normalizar_dimensao=true e conceito="bairro". NUNCA agrupe valor financeiro pelo texto bruto de endereco.
 - Palavras que apenas nomeiam o universo ("obras", "projetos", "licitacoes") definem escopo; NAO as coloque em termos nem em filtro de objeto. Ex.: "quantas licitacoes existem?" = contar_obras({escopo:["licitacao"]}) sem termos.
+- Licitacao: "proposta analisada/nao analisada" usa proposta_analisada. "habilitacao analisada/nao analisada" usa habilitacao_analisada. Se o usuario disser apenas "licitacoes nao analisadas", pergunte se ele quer proposta ou habilitacao; nao adivinhe.
 - Para um assunto literal como UBS, mercado, escola, drenagem etc., use termos e normalmente campos_busca=["objeto"].
 
 OPERADORES DE FILTRO: eq, neq, contains, not_contains, one_of, not_one_of, gt, gte, lt, lte, is_empty, not_empty.
@@ -1196,17 +1587,19 @@ Retorne SOMENTE JSON neste formato:
   "answer":"texto somente se tool=responder"
 }`;
 
-async function planejar(pergunta, historico, estadoAtual, catalogo, observacaoFerramenta = null) {
+async function planejar(pergunta, historico, estadoAtual, catalogo, observacaoFerramenta = null, analise = null) {
+  const estadoVisivel = estadoParaPlanner(estadoAtual, analise);
   const userPayload = {
     pergunta,
-    estado_atual: estadoAtual || null,
+    estado_atual: estadoVisivel || null,
+    modo_contexto: analise?.modoContexto || "none",
     catalogo: resumoCatalogo(catalogo),
     resultado_ferramenta_anterior: observacaoFerramenta || null,
   };
 
   const mensagens = [
     { role: "system", content: SYSTEM_PLANNER },
-    ...historicoCompacto(historico),
+    ...historicoParaPlanner(historico, analise),
     { role: "user", content: limitarTexto(userPayload, 16000) },
   ];
 
@@ -1215,7 +1608,7 @@ async function planejar(pergunta, historico, estadoAtual, catalogo, observacaoFe
     temperature: 0,
     reasoning_effort: "low",
   });
-  return parseJSONSeguro(raw);
+  return validarPlano(parseJSONSeguro(raw));
 }
 
 // ------------------------------------------------------------
@@ -1246,8 +1639,45 @@ function limparLabelHumano(v = "") {
     .trim();
 }
 
+
+
+function statusHumano(status = "", unidade = { singular: "registro", plural: "registros" }, total = 2) {
+  const s = normalizar(status).replace(/\s+/g, "_");
+  const plural = total !== 1;
+  const fem = ["obra", "licitacao", "pavimentacao"].includes(normalizar(unidade.singular));
+  const mapa = {
+    em_andamento: "em andamento",
+    concluida: fem ? (plural ? "concluídas" : "concluída") : (plural ? "concluídos" : "concluído"),
+    executada: fem ? (plural ? "executadas" : "executada") : (plural ? "executados" : "executado"),
+    a_iniciar: "a iniciar",
+    paralisada: fem ? (plural ? "paralisadas" : "paralisada") : (plural ? "paralisados" : "paralisado"),
+    retomada: fem ? (plural ? "retomadas" : "retomada") : (plural ? "retomados" : "retomado"),
+    em_revisao: "em revisão",
+    em_elaboracao: "em elaboração",
+    aguardando_aprovacao: "aguardando aprovação",
+    homologada: fem ? (plural ? "homologadas" : "homologada") : (plural ? "homologados" : "homologado"),
+    habilitacao: "em habilitação",
+  };
+  return mapa[s] || s.replace(/_/g, " ");
+}
+
+function labelDeterministico(plano, resultado) {
+  const args = plano?.args || {};
+  const escopo = Array.isArray(args.escopo) ? args.escopo[0] : args.escopo;
+  const unidade = unidadeDoEscopo(escopo ? [escopo] : []);
+  const status = texto(args.status_semantico);
+  const total = resultado?.total ?? resultado?.total_registros ?? 2;
+  const base = total === 1 ? unidade.singular : unidade.plural;
+
+  if (resultado?.tipo === "contagem" || resultado?.tipo === "lista") {
+    if (status) return `${base} ${statusHumano(status, unidade, total)}`;
+    if (escopo) return base;
+  }
+  return limparLabelHumano(plano?.label) || "registros";
+}
+
 function formatarResultado(plano, resultado) {
-  const label = limparLabelHumano(plano?.label) || "registros";
+  const label = labelDeterministico(plano, resultado);
 
   if (!resultado || resultado.tipo === "erro_ferramenta") {
     return resultado?.erro || "Não consegui consultar os dados da planilha.";
@@ -1357,7 +1787,7 @@ export async function responderPergunta(pergunta, historico = []) {
       linhas: 0,
       erro: "pergunta vazia",
       estado: ultimoEstadoValido(historico),
-      modoAgente: "google_sheets_arquero_decimal_v5",
+      modoAgente: "google_sheets_arquero_decimal_v7",
     };
   }
 
@@ -1371,12 +1801,14 @@ export async function responderPergunta(pergunta, historico = []) {
       linhas: 0,
       erro: e?.message || String(e),
       estado: ultimoEstadoValido(historico),
-      modoAgente: "google_sheets_arquero_decimal_v5",
+      modoAgente: "google_sheets_arquero_decimal_v7",
     };
   }
 
+  atualizarDicionarioLocalidades(rows);
   const catalogo = construirCatalogo(rows);
   const estadoAtual = ultimoEstadoValido(historico);
+  const analiseLocal = { ...analisarContextoPergunta(q, estadoAtual), pergunta: q };
   let observacao = null;
   let plano = null;
   let argsFinais = null;
@@ -1384,8 +1816,9 @@ export async function responderPergunta(pergunta, historico = []) {
 
   for (let passo = 0; passo < MAX_PASSOS; passo++) {
     try {
-      plano = await planejar(q, historico, estadoAtual, catalogo, observacao);
-      plano = aplicarGuardasSemanticas(q, plano || {});
+      if (passo === 0) plano = planoDeterministicoDeAltaConfianca(q, analiseLocal);
+      if (!plano) plano = await planejar(q, historico, estadoAtual, catalogo, observacao, analiseLocal);
+      plano = validarPlano(aplicarGuardasSemanticas(q, plano || {}, analiseLocal));
     } catch (e) {
       return {
         resposta: "Não consegui interpretar a pergunta agora. Tente novamente em alguns segundos.",
@@ -1393,7 +1826,7 @@ export async function responderPergunta(pergunta, historico = []) {
         linhas: 0,
         erro: e?.message || String(e),
         estado: estadoAtual,
-        modoAgente: "google_sheets_arquero_decimal_v5",
+        modoAgente: "google_sheets_arquero_decimal_v7",
       };
     }
 
@@ -1404,7 +1837,7 @@ export async function responderPergunta(pergunta, historico = []) {
         linhas: 0,
         erro: "planner sem ferramenta",
         estado: estadoAtual,
-        modoAgente: "google_sheets_arquero_decimal_v5",
+        modoAgente: "google_sheets_arquero_decimal_v7",
       };
     }
 
@@ -1415,11 +1848,11 @@ export async function responderPergunta(pergunta, historico = []) {
         linhas: 0,
         erro: "",
         estado: estadoAtual,
-        modoAgente: "google_sheets_arquero_decimal_v5",
+        modoAgente: "google_sheets_arquero_decimal_v7",
       };
     }
 
-    const args = mergeArgsComEstado(plano.args || {}, plano, estadoAtual);
+    const args = mergeArgsComEstado(plano.args || {}, plano, estadoAtual, analiseLocal);
     argsFinais = args;
     resultado = await executarFerramenta(plano.tool, rows, args);
 
@@ -1432,7 +1865,8 @@ export async function responderPergunta(pergunta, historico = []) {
     break;
   }
 
-  const resposta = formatarResultado(plano, resultado);
+  const planoResposta = { ...(plano || {}), args: { ...(argsFinais || plano?.args || {}) } };
+  const resposta = formatarResultado(planoResposta, resultado);
   const estado = construirEstado(plano || {}, argsFinais || {}, resultado || {});
   const linhas = resultado?.tipo === "lista" ? resultado.total
     : resultado?.tipo === "agrupamento" ? resultado.total_registros
@@ -1441,6 +1875,7 @@ export async function responderPergunta(pergunta, historico = []) {
     : resultado?.tipo === "soma_agrupada" ? resultado.total_registros
     : 0;
 
+  console.log("AGENTE SHEETS - CONTEXTO:", limitarTexto(analiseLocal || {}, 2200));
   console.log("AGENTE SHEETS - FERRAMENTA:", plano?.tool || "");
   console.log("AGENTE SHEETS - ARGS:", limitarTexto(argsFinais || {}, 3000));
   console.log("AGENTE SHEETS - RESULTADO:", limitarTexto(resultado || {}, 3000));
@@ -1452,7 +1887,7 @@ export async function responderPergunta(pergunta, historico = []) {
     erro: "",
     estado,
     ferramenta: plano?.tool || null,
-    modoAgente: "google_sheets_arquero_decimal_v5",
+    modoAgente: "google_sheets_arquero_decimal_v7",
     fonte: "Google Sheets",
   };
 }
