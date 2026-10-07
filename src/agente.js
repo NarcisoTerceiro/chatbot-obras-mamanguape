@@ -986,6 +986,450 @@ function regrasNegocio(ctx) {
     `- recurso e tipo_recurso nao sao a mesma coisa.\n`;
 }
 
+
+// ------------------------------------------------------------
+// PIPELINE SEMANTICO V14
+// Inspirado em DIN-SQL (planejamento/schema linking), DAIL-SQL
+// (exemplos dinamicos compactos) e CHASE-SQL (candidatos + selecao).
+// Tudo permanece neste unico agente.js: nenhum arquivo/tabela extra e exigido.
+// ------------------------------------------------------------
+const EXEMPLOS_SEMANTICOS = [
+  {
+    intent: "count", universes: ["obra"], concepts: ["status", "quantidade"], shape: "scalar_count",
+    pergunta: "Quantas obras concluidas existem?",
+    sql: "SELECT COUNT(*) AS total_obras FROM public.obras_chatbot WHERE tipo_negocio = 'obra' AND concluido = true"
+  },
+  {
+    intent: "list", universes: ["obra"], concepts: ["responsavel"], shape: "records",
+    pergunta: "Quais os responsaveis dessas obras?",
+    sql: "SELECT objeto, engenheiro FROM public.obras_chatbot WHERE tipo_negocio = 'obra'"
+  },
+  {
+    intent: "sum", universes: ["obra"], concepts: ["valor_total"], shape: "records_with_aggregate",
+    pergunta: "Qual o valor total das obras concluidas?",
+    sql: "SELECT objeto, valor_total, SUM(valor_total) OVER () AS total_valor FROM public.obras_chatbot WHERE tipo_negocio = 'obra' AND concluido = true"
+  },
+  {
+    intent: "rank", universes: ["obra"], concepts: ["engenheiro", "valor_total"], shape: "ranking",
+    pergunta: "Qual engenheiro tem o maior valor total em obras?",
+    sql: "SELECT engenheiro, SUM(valor_total) AS total_valor FROM public.obras_chatbot WHERE tipo_negocio = 'obra' AND engenheiro IS NOT NULL GROUP BY engenheiro ORDER BY total_valor DESC NULLS LAST LIMIT 1"
+  },
+  {
+    intent: "rank", universes: ["obra"], concepts: ["engenheiro", "quantidade"], shape: "ranking",
+    pergunta: "Qual engenheiro tem mais obras?",
+    sql: "SELECT engenheiro, COUNT(*) AS total_obras FROM public.obras_chatbot WHERE tipo_negocio = 'obra' AND engenheiro IS NOT NULL GROUP BY engenheiro ORDER BY total_obras DESC, engenheiro"
+  },
+  {
+    intent: "list", universes: ["projeto"], concepts: ["status"], shape: "records",
+    pergunta: "Quais projetos estao concluidos?",
+    sql: "SELECT objeto, status_original FROM public.obras_chatbot WHERE tipo_negocio = 'projeto' AND status_original ILIKE 'Conclu%'"
+  },
+  {
+    intent: "list", universes: ["licitacao"], concepts: ["proposta_analisada"], shape: "records",
+    pergunta: "Quais licitacoes estao com proposta nao analisada?",
+    sql: "SELECT objeto, dados_extras->>'PROPOSTA ANALISADA' AS proposta_analisada FROM public.obras_chatbot WHERE tipo_negocio = 'licitacao' AND LOWER(COALESCE(dados_extras->>'PROPOSTA ANALISADA','')) = 'nao'"
+  },
+  {
+    intent: "distinct", universes: ["obra"], concepts: ["bairro"], shape: "distinct_list",
+    pergunta: "Quais bairros tem obras?",
+    sql: "SELECT DISTINCT bairro AS bairro_bruto FROM public.obras_chatbot WHERE tipo_negocio = 'obra' AND bairro IS NOT NULL AND BTRIM(bairro) <> '' ORDER BY bairro_bruto"
+  },
+];
+
+function listaTextoCurta(arr = [], max = 12) {
+  return (arr || []).slice(0, max).map((x) => String(x)).join(" | ");
+}
+
+function schemaCompactoParaPlanejamento(ctx) {
+  const colunas = (ctx.colunas || [])
+    .map((c) => `${c.column_name}:${c.data_type}`)
+    .join(" | ");
+
+  const valores = Object.entries(ctx.categorias || {})
+    .filter(([, arr]) => Array.isArray(arr) && arr.length)
+    .map(([campo, arr]) => `${campo}=[${listaTextoCurta(arr, campo === "bairro" ? 20 : 10)}]`)
+    .join("\n");
+
+  const extras = listaTextoCurta(ctx.chavesDadosExtras || [], 120);
+  const objetos = (ctx.objetosCatalogo || []).slice(0, 35).map((r) => {
+    const p = [r.tipo_negocio, r.objeto, r.bairro ? `bairro=${r.bairro}` : null].filter(Boolean);
+    return p.join(" | ");
+  }).join("\n");
+
+  return `RELACAO public.${ctx.relacao}\nCOLUNAS: ${colunas}\n` +
+    `CHAVES JSONB: ${extras || "(nenhuma)"}\n` +
+    `AMOSTRAS DE VALORES CATEGORICOS:\n${valores || "(nenhuma)"}\n` +
+    `AMOSTRA DE OBJETOS REAIS:\n${objetos || "(nenhuma)"}`;
+}
+
+function planoPadrao() {
+  return {
+    intent: "other",
+    universes: [],
+    subject_terms: [],
+    entities: [],
+    measures: [],
+    filters: [],
+    requested_fields: [],
+    expected_result: { shape: "records", primary_concept: null, numeric_kind: null },
+    result_normalization: { needed: false, concept: null, reason: "" },
+    needs_semantic_validation: true,
+    needs_multiple_candidates: false,
+    complexity: "medium",
+    confidence: 0,
+    clarification: { needed: false, question: "" },
+    notes: [],
+  };
+}
+
+function normalizarPlano(obj) {
+  const base = planoPadrao();
+  if (!obj || typeof obj !== "object") return base;
+  const p = { ...base, ...obj };
+  p.universes = Array.isArray(obj.universes) ? obj.universes.filter(Boolean) : [];
+  p.subject_terms = Array.isArray(obj.subject_terms) ? obj.subject_terms.filter(Boolean).slice(0, 12) : [];
+  p.entities = Array.isArray(obj.entities) ? obj.entities.filter(Boolean).slice(0, 12) : [];
+  p.measures = Array.isArray(obj.measures) ? obj.measures.filter(Boolean).slice(0, 12) : [];
+  p.filters = Array.isArray(obj.filters) ? obj.filters.filter(Boolean).slice(0, 20) : [];
+  p.requested_fields = Array.isArray(obj.requested_fields) ? obj.requested_fields.filter(Boolean).slice(0, 20) : [];
+  p.expected_result = { ...base.expected_result, ...(obj.expected_result || {}) };
+  p.result_normalization = { ...base.result_normalization, ...(obj.result_normalization || {}) };
+  p.clarification = { ...base.clarification, ...(obj.clarification || {}) };
+  p.notes = Array.isArray(obj.notes) ? obj.notes.filter(Boolean).slice(0, 12) : [];
+  p.confidence = Math.max(0, Math.min(1, Number(obj.confidence || 0)));
+  p.needs_semantic_validation = obj.needs_semantic_validation !== false;
+  p.needs_multiple_candidates = obj.needs_multiple_candidates === true;
+  return p;
+}
+
+async function planejarConsultaSemantica(pergunta, historico, ctx) {
+  const prompt = `Voce e o PLANEJADOR SEMANTICO de um agente Text-to-SQL. NAO gere SQL nesta etapa.\n` +
+    `Converta a pergunta em um plano estruturado e faca schema linking: ligue cada conceito pedido a coluna/chave JSON real.\n` +
+    `O objetivo e evitar correcoes por frase/regex. Pense em INTENCAO, UNIVERSO, ENTIDADE, MEDIDA, FILTROS, CAMPOS e FORMATO ESPERADO.\n\n` +
+    `${regrasNegocio(ctx)}\n` +
+    `REGRAS SEMANTICAS GERAIS:\n` +
+    `- "valor executado" e conceito de execucao; nao o renomeie para "valor pago".\n` +
+    `- "pago", "ja pago", "valor pago" deve usar campos EXPLICITOS de pagamento quando existirem em dados_extras (por exemplo VALOR PAGO por ano). Nao use valor_executado como substituto silencioso. Para total pago sem periodo, prefira somar os campos anuais de pagamento disponiveis e NAO some ao mesmo tempo campos de gestao que representam os mesmos pagamentos.\n` +
+    `- COUNT/quantidade e diferente de SUM/valor.\n` +
+    `- Se um campo categorico estiver semanticamente sujo nas AMOSTRAS (ex.: mistura nome de bairro com endereco completo/localidade), marque result_normalization.needed=true. A normalizacao posterior so podera extrair valores explicitamente presentes, nunca adivinhar.\n` +
+    `- Para follow-up, herde somente o recorte semanticamente ativo do historico; novo alvo explicito substitui contexto incompatível.\n` +
+    `- Se a pergunta for realmente ambigua e houver duas interpretacoes de negocio materialmente diferentes, use clarification.needed=true e formule UMA pergunta curta.\n` +
+    `- needs_multiple_candidates=true apenas para consulta complexa/ambigua, ranking delicado, multiplas agregacoes ou quando ha mais de um caminho SQL plausivel.\n` +
+    `- needs_semantic_validation=true quando execucao SQL bem-sucedida ainda puder nao responder a pergunta (campo sujo, conceito parecido, JSONB, ranking/medida ambigua).\n\n` +
+    `SCHEMA COMPACTO E VALORES REAIS:\n${schemaCompactoParaPlanejamento(ctx)}\n\n` +
+    `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
+    `PERGUNTA: ${JSON.stringify(pergunta)}\n\n` +
+    `Retorne SOMENTE JSON neste formato:\n` +
+    `{"intent":"list|distinct|count|sum|avg|rank|detail|existence|compare|other",` +
+    `"universes":["obra|projeto|licitacao"],` +
+    `"subject_terms":[],` +
+    `"entities":[{"concept":"...","source":"coluna ou dados_extras","json_keys":[],"role":"dimension|subject|field","required":true}],` +
+    `"measures":[{"concept":"...","source":"coluna ou dados_extras","json_keys":[],"aggregation":"sum|avg|count|max|min|none","required":true}],` +
+    `"filters":[{"concept":"...","source":"...","operator":"=|ilike|in|boolean|range","value":"...","origin":"current|history"}],` +
+    `"requested_fields":[],` +
+    `"expected_result":{"shape":"scalar_count|scalar_money|scalar|distinct_list|records|records_with_aggregate|ranking|grouped","primary_concept":"...","numeric_kind":"count|money|percent|null"},` +
+    `"result_normalization":{"needed":false,"concept":null,"reason":""},` +
+    `"needs_semantic_validation":false,"needs_multiple_candidates":false,"complexity":"simple|medium|complex","confidence":0.0,` +
+    `"clarification":{"needed":false,"question":""},"notes":[]}`;
+
+  try {
+    const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
+      max_tokens: 750,
+      temperature: 0,
+      reasoning_effort: "low",
+    });
+    return normalizarPlano(objetoJSONEmTexto(bruto));
+  } catch (e) {
+    console.warn("SQL AGENT - planejamento semantico falhou; usando plano neutro:", e?.message || e);
+    const p = planoPadrao();
+    p.notes = ["planejamento_semantico_indisponivel"];
+    return p;
+  }
+}
+
+function conceitosDoPlano(plano = {}) {
+  const itens = [];
+  for (const e of plano.entities || []) itens.push(e?.concept, e?.role);
+  for (const m of plano.measures || []) itens.push(m?.concept, m?.aggregation);
+  itens.push(plano.intent, plano.expected_result?.shape, plano.expected_result?.primary_concept);
+  return new Set(itens.filter(Boolean).map((x) => normalizar(String(x))));
+}
+
+function selecionarExemplosSemanticos(plano, max = 4) {
+  const alvos = conceitosDoPlano(plano);
+  const universos = new Set((plano.universes || []).map((x) => normalizar(String(x))));
+  return EXEMPLOS_SEMANTICOS
+    .map((ex) => {
+      let score = 0;
+      if (normalizar(ex.intent) === normalizar(plano.intent || "")) score += 5;
+      if (normalizar(ex.shape) === normalizar(plano.expected_result?.shape || "")) score += 4;
+      for (const u of ex.universes || []) if (universos.has(normalizar(u))) score += 2;
+      for (const c of ex.concepts || []) if (alvos.has(normalizar(c))) score += 2;
+      return { ex, score };
+    })
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, max)
+    .map((x) => x.ex);
+}
+
+function exemplosParaPrompt(exemplos = []) {
+  if (!exemplos.length) return "(nenhum exemplo necessario)";
+  return exemplos.map((e, i) => `${i + 1}) ${e.pergunta}\nSQL: ${e.sql}`).join("\n\n");
+}
+
+async function gerarSQLPorPlano(pergunta, historico, ctx, plano, exemplos = [], variante = "direta", correcao = "") {
+  const estrategia = variante === "decomposicao"
+    ? "Antes de escrever a SQL, decomponha mentalmente em conjunto-base -> filtros -> dimensoes/medidas -> agregacao -> ordenacao. Nao exponha o raciocinio."
+    : "Gere a SQL mais simples que satisfaz integralmente o plano, evitando CTE/subquery sem necessidade.";
+
+  const prompt = `Voce e o GERADOR SQL de um pipeline Text-to-SQL. O PLANO SEMANTICO abaixo e a fonte principal de intencao; nao volte a adivinhar a pergunta do zero.\n` +
+    `${estrategia}\n\n` +
+    `${regrasNegocio(ctx)}\n` +
+    `REGRAS DE GERACAO:\n` +
+    `- Somente SELECT ou WITH ... SELECT em public.${ctx.relacao}.\n` +
+    `- Responda EXATAMENTE ao plano: universo, entidades, medidas, filtros e shape esperado.\n` +
+    `- Se o plano marcou result_normalization.needed=true, NAO tente limpar texto com regex SQL. Retorne o valor bruto da fonte com alias claro (ex.: bairro_bruto) para a camada semantica normalizar depois.\n` +
+    `- Se medida for pagamento e houver json_keys explicitas, use essas chaves. Para "total pago" sem periodo, some uma familia nao sobreposta (preferencialmente VALOR PAGO por ano); nao some junto PAGO_GESTAO_* se eles duplicarem os mesmos pagamentos.\n` +
+    `- Nao transforme valor monetario em contagem. Use aliases semanticamente claros: total_pago, total_executado, total_investido, total_obras etc.\n` +
+    `- Em ranking por valor acumulado de entidade, use SUM da medida por entidade. MAX so para maior valor individual quando isso estiver no plano.\n` +
+    `- Para dimensoes nulas como engenheiro/empresa/bairro em ranking/lista, exclua NULL e texto vazio quando isso representar "nao informado" e nao uma entidade real.\n` +
+    `- Preserve associacao entre objeto e campos pedidos na mesma linha.\n` +
+    `- Nao force resultado: 0 linhas pode ser correto.\n` +
+    `- Retorne SOMENTE JSON {"description":"...","query":"SELECT ..."}.\n\n` +
+    `PLANO SEMANTICO:\n${jsonSeguro(plano, 7000)}\n\n` +
+    `EXEMPLOS DINAMICOS MAIS PARECIDOS (apenas como padrao estrutural; nunca copie valores inexistentes):\n${exemplosParaPrompt(exemplos)}\n\n` +
+    `SCHEMA REAL:\n${schemaCompactoParaPlanejamento(ctx)}\n\n` +
+    `HISTORICO/ANCORA:\n${ancoraContextoRecente(historico)}\n\n` +
+    (correcao ? `FEEDBACK DA AVALIACAO ANTERIOR:\n${correcao}\n\n` : "") +
+    `PERGUNTA ORIGINAL: ${JSON.stringify(pergunta)}`;
+
+  const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
+    max_tokens: 520,
+    temperature: variante === "decomposicao" ? 0.05 : 0,
+    reasoning_effort: "low",
+  });
+  return extrairSQLDaResposta(bruto);
+}
+
+function fragmentosObrigatoriosDoPlano(plano = {}) {
+  const itens = [];
+  for (const x of [...(plano.entities || []), ...(plano.measures || [])]) {
+    if (x?.required === false) continue;
+    if (x?.source && x.source !== "dados_extras") itens.push({ tipo: "coluna", valor: x.source, concept: x.concept });
+    for (const k of x?.json_keys || []) itens.push({ tipo: "json", valor: k, concept: x.concept });
+  }
+  return itens;
+}
+
+function avaliarSQLContraPlanoLocal(plano, sql = "") {
+  const s = normalizar(sql);
+  const issues = [];
+  let score = 100;
+  for (const req of fragmentosObrigatoriosDoPlano(plano)) {
+    const alvo = normalizar(req.valor);
+    if (!alvo) continue;
+    if (!s.includes(alvo)) {
+      // Para JSON com varias chaves alternativas, nao penalize cada chave ausente.
+      if (req.tipo === "json") continue;
+      issues.push(`fonte esperada ausente na SQL: ${req.concept || req.valor} -> ${req.valor}`);
+      score -= 18;
+    }
+  }
+
+  for (const u of plano.universes || []) {
+    if (["obra", "projeto", "licitacao"].includes(u) && !s.includes(normalizar(u))) {
+      issues.push(`universo ${u} nao ficou explicito na SQL`);
+      score -= 12;
+    }
+  }
+
+  const shape = plano.expected_result?.shape;
+  if (shape === "ranking" && !/order\s+by/i.test(sql)) {
+    issues.push("ranking sem ORDER BY"); score -= 20;
+  }
+  if (["scalar_count"].includes(shape) && !/count\s*\(/i.test(sql)) {
+    issues.push("contagem esperada sem COUNT"); score -= 25;
+  }
+  if (["scalar_money", "records_with_aggregate"].includes(shape) && (plano.measures || []).some((m) => m?.aggregation === "sum") && !/sum\s*\(/i.test(sql)) {
+    issues.push("soma esperada sem SUM"); score -= 20;
+  }
+  return { score: Math.max(0, score), issues };
+}
+
+function avaliarResultadoLocalSemantico(plano, sql, rows = []) {
+  const sqlCheck = avaliarSQLContraPlanoLocal(plano, sql);
+  let score = sqlCheck.score;
+  const issues = [...sqlCheck.issues];
+  let needAI = false;
+
+  if (!Array.isArray(rows)) return { score: 0, issues: ["resultado nao e lista"], needAI: true };
+  if (rows.length === 0) return { score: Math.min(score, 90), issues, needAI: plano.needs_semantic_validation === true };
+
+  const shape = plano.expected_result?.shape || "records";
+  const campos = [...new Set(rows.flatMap((r) => Object.keys(r || {})))];
+  const temNumero = rows.some((r) => Object.values(r || {}).some((v) => v !== null && v !== "" && Number.isFinite(Number(v))));
+
+  if (shape.startsWith("scalar") && rows.length !== 1) {
+    issues.push("shape escalar esperado, mas vieram varias linhas"); score -= 25; needAI = true;
+  }
+  if ((shape === "scalar_count" || shape === "scalar_money") && !temNumero) {
+    issues.push("resultado numerico esperado sem numero"); score -= 35; needAI = true;
+  }
+  if (shape === "ranking") {
+    if (campos.length < 2 || !temNumero) { issues.push("ranking sem dimensao + medida"); score -= 30; needAI = true; }
+  }
+  if (shape === "distinct_list" && campos.length === 0) {
+    issues.push("lista distinta sem campo"); score -= 30; needAI = true;
+  }
+  if (plano.result_normalization?.needed) {
+    needAI = true;
+    score = Math.min(score, 88);
+  }
+  if (plano.needs_semantic_validation) needAI = true;
+  return { score: Math.max(0, score), issues, needAI };
+}
+
+async function avaliarCandidatoComIA({ pergunta, plano, sql, rows, avaliacaoLocal }) {
+  const prompt = `Voce e o JUIZ SEMANTICO de um Text-to-SQL. Avalie se a SQL e o RESULTADO realmente respondem ao PLANO; nao avalie apenas se a SQL executou.\n` +
+    `Procure erros como: coluna semanticamente parecida mas errada, valor tratado como contagem, universo errado, ranking por MAX quando deveria somar, dimensao suja (enderecos misturados com bairros), perda de contexto ou campos pedidos ausentes.\n` +
+    `Resultado vazio pode estar correto. Nao exija dados so para evitar vazio.\n` +
+    `Se houver problema de qualidade dos dados que SQL nao consegue resolver com seguranca, sinalize normalization_needed=true em vez de inventar.\n\n` +
+    `PERGUNTA: ${JSON.stringify(pergunta)}\n` +
+    `PLANO: ${jsonSeguro(plano, 6000)}\n` +
+    `SQL: ${sql}\n` +
+    `AVALIACAO LOCAL: ${jsonSeguro(avaliacaoLocal, 1800)}\n` +
+    `AMOSTRA RESULTADO: ${jsonSeguro((rows || []).slice(0, 10), 6500)}\n\n` +
+    `Retorne SOMENTE JSON {"score":0,"verdict":"accept|revise|reject","reason":"...","revision_hint":"...","normalization_needed":false}.`;
+  try {
+    const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
+      max_tokens: 340,
+      temperature: 0,
+      reasoning_effort: "low",
+    });
+    const o = objetoJSONEmTexto(bruto) || {};
+    return {
+      score: Math.max(0, Math.min(100, Number(o.score ?? avaliacaoLocal.score ?? 0))),
+      verdict: ["accept", "revise", "reject"].includes(o.verdict) ? o.verdict : (avaliacaoLocal.score >= 85 ? "accept" : "revise"),
+      reason: textoSeguro(o.reason || avaliacaoLocal.issues?.join("; ") || "", 700),
+      revision_hint: textoSeguro(o.revision_hint || "", 1000),
+      normalization_needed: o.normalization_needed === true || plano.result_normalization?.needed === true,
+    };
+  } catch (e) {
+    return {
+      score: avaliacaoLocal.score,
+      verdict: avaliacaoLocal.score >= 85 ? "accept" : "revise",
+      reason: avaliacaoLocal.issues?.join("; ") || "avaliacao IA indisponivel",
+      revision_hint: "",
+      normalization_needed: plano.result_normalization?.needed === true,
+    };
+  }
+}
+
+async function executarPipelineSemantico({ pergunta, historico, ctx, plano }) {
+  const exemplos = selecionarExemplosSemanticos(plano, 4);
+  const maxCand = Math.max(1, Math.min(Number(process.env.AGENTE_MAX_CANDIDATOS || 2), 3));
+  const qtd = Math.min(maxCand, (plano.needs_multiple_candidates || plano.complexity === "complex") ? 2 : 1);
+  const candidatos = [];
+
+  for (let i = 0; i < qtd; i++) {
+    const variante = i === 0 ? "direta" : "decomposicao";
+    let gerada;
+    try {
+      gerada = await gerarSQLPorPlano(pergunta, historico, ctx, plano, exemplos, variante);
+    } catch (e) {
+      candidatos.push({ variante, erro: e?.message || String(e), score: 0 });
+      continue;
+    }
+    if (!gerada?.query) continue;
+
+    try {
+      const execucao = await executarComSelfHealing({ pergunta, historico, ctx, sqlInicial: gerada.query });
+      const local = avaliarResultadoLocalSemantico(plano, execucao.sql, execucao.rows);
+      const precisaJuiz = local.needAI || qtd > 1 || local.score < 90;
+      const semantica = precisaJuiz
+        ? await avaliarCandidatoComIA({ pergunta, plano, sql: execucao.sql, rows: execucao.rows, avaliacaoLocal: local })
+        : { score: local.score, verdict: "accept", reason: "validacao local suficiente", revision_hint: "", normalization_needed: false };
+      candidatos.push({ variante, gerada, execucao, local, semantica, score: semantica.score });
+
+      if (qtd === 1 && semantica.verdict === "accept" && semantica.score >= 92) break;
+    } catch (e) {
+      candidatos.push({ variante, gerada, erro: e?.message || String(e), score: 0 });
+    }
+  }
+
+  let validos = candidatos.filter((c) => c.execucao).sort((a, b) => (b.score || 0) - (a.score || 0));
+  if (!validos.length) {
+    // Fallback: mantem compatibilidade com o gerador antigo se o novo pipeline falhar.
+    const antiga = await gerarSQL(pergunta, historico, ctx);
+    if (!antiga.query) throw new Error("Nao foi possivel gerar uma consulta SQL valida.");
+    const execucao = await executarComSelfHealing({ pergunta, historico, ctx, sqlInicial: antiga.query });
+    const local = avaliarResultadoLocalSemantico(plano, execucao.sql, execucao.rows);
+    return { plano, exemplos, candidato: { variante: "fallback", gerada: antiga, execucao, local, semantica: { score: local.score, verdict: "accept", reason: "fallback" }, score: local.score }, candidatos };
+  }
+
+  let melhor = validos[0];
+
+  // CHASE-lite: se o melhor candidato ainda pede revisao, faz UMA revisao guiada
+  // pelo feedback semantico em vez de adicionar nova regex/frase fixa ao codigo.
+  if (melhor.semantica?.verdict === "revise" && melhor.semantica?.revision_hint) {
+    try {
+      const revisada = await gerarSQLPorPlano(
+        pergunta, historico, ctx, plano, exemplos, "decomposicao",
+        melhor.semantica.revision_hint
+      );
+      if (revisada?.query && limparSQL(revisada.query) !== limparSQL(melhor.execucao.sql)) {
+        const execucao = await executarComSelfHealing({ pergunta, historico, ctx, sqlInicial: revisada.query });
+        const local = avaliarResultadoLocalSemantico(plano, execucao.sql, execucao.rows);
+        const semantica = await avaliarCandidatoComIA({ pergunta, plano, sql: execucao.sql, rows: execucao.rows, avaliacaoLocal: local });
+        const candidatoRevisado = { variante: "revisao_semantica", gerada: revisada, execucao, local, semantica, score: semantica.score };
+        candidatos.push(candidatoRevisado);
+        if (candidatoRevisado.score > melhor.score) melhor = candidatoRevisado;
+      }
+    } catch (e) {
+      console.warn("SQL AGENT - revisao semantica falhou; mantendo melhor candidato:", e?.message || e);
+    }
+  }
+
+  return { plano, exemplos, candidato: melhor, candidatos };
+}
+
+async function normalizarResultadoSemanticoSeNecessario({ pergunta, plano, rows, avaliacao }) {
+  const precisa = plano.result_normalization?.needed === true || avaliacao?.normalization_needed === true;
+  const shape = plano.expected_result?.shape || "";
+  if (!precisa || !["distinct_list", "records", "grouped"].includes(shape) || !Array.isArray(rows) || !rows.length) {
+    return { rows, changed: false, note: "" };
+  }
+
+  const conceito = plano.result_normalization?.concept || plano.expected_result?.primary_concept || "valor categorico";
+  const prompt = `Voce e uma camada de NORMALIZACAO SEMANTICA de resultados, nao um pesquisador.\n` +
+    `O usuario pediu o conceito ${JSON.stringify(conceito)}. Os valores brutos podem misturar esse conceito com endereco, descricao, caixa alta/baixa ou mais de um valor na mesma string.\n` +
+    `Extraia APENAS valores do conceito que estejam EXPLICITAMENTE presentes no texto retornado. NUNCA infira um valor que nao esteja escrito.\n` +
+    `Pode: remover duplicatas por caixa/acento, limpar rotulo/endereco ao redor, e separar dois valores quando ambos estiverem explicitamente nomeados (ex.: "Bairro: Centro e Gurguri").\n` +
+    `Nao pode: adivinhar bairro por nome de rua, CEP, coordenada ou conhecimento externo. Valores sem evidencia explicita do conceito devem ser omitidos e contabilizados na nota.\n` +
+    `Preserve outros campos quando existirem e forem necessarios para responder.\n\n` +
+    `PERGUNTA: ${JSON.stringify(pergunta)}\nPLANO: ${jsonSeguro(plano, 5000)}\n` +
+    `DADOS BRUTOS: ${jsonSeguro(rows.slice(0, 100), 18000)}\n\n` +
+    `Retorne SOMENTE JSON {"rows":[...],"note":"frase curta sobre valores omitidos/normalizados"}.`;
+  try {
+    const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
+      max_tokens: 1800,
+      temperature: 0,
+      reasoning_effort: "low",
+    });
+    const o = objetoJSONEmTexto(bruto) || {};
+    if (!Array.isArray(o.rows)) return { rows, changed: false, note: "" };
+    return {
+      rows: o.rows.slice(0, MAX_RESULTADOS),
+      changed: true,
+      note: textoSeguro(o.note || plano.result_normalization?.reason || "resultado normalizado semanticamente", 900),
+    };
+  } catch (e) {
+    console.warn("SQL AGENT - normalizacao semantica falhou; usando bruto:", e?.message || e);
+    return { rows, changed: false, note: plano.result_normalization?.reason || "" };
+  }
+}
+
 // ------------------------------------------------------------
 // Geracao SQL (estagio 1)
 // ------------------------------------------------------------
@@ -1719,22 +2163,21 @@ function respostaContagemDiretaSegura(pergunta = "", rows = []) {
   return n === 1 ? "Encontrei 1 registro com esses critérios." : `Encontrei ${n} registros com esses critérios.`;
 }
 
-async function redigirResposta(pergunta, historico, sql, rows, ctx, analiseDados = null) {
-  // Ranking/agrupamento com uma dimensao + uma medida deve citar AMBOS.
-  // Ex.: { engenheiro: "Eng. X", total_obras: 1 } nao pode virar apenas
-  // "Ha 1 obra"; o nome do engenheiro e parte essencial da resposta.
-  const agregadoComDimensao = respostaAgregadoComDimensaoSegura(pergunta, rows);
-  if (agregadoComDimensao) return agregadoComDimensao;
+async function redigirResposta(pergunta, historico, sql, rows, ctx, analiseDados = null, planoSemantico = null) {
+  // Respostas triviais continuam locais para economizar tokens, EXCETO quando
+  // a camada semantica sinalizou normalizacao/risco e a redacao precisa explicar.
+  const forcarSemantica = analiseDados?.forcar_redacao_semantica === true;
+  if (!forcarSemantica) {
+    const agregadoComDimensao = respostaAgregadoComDimensaoSegura(pergunta, rows);
+    if (agregadoComDimensao) return agregadoComDimensao;
 
-  // Agregado financeiro isolado (ex.: total_pago, total_executado,
-  // total_investido, SUM(valor_total)) tem prioridade sobre contagem.
-  // Isso impede respostas como "4.732.511,34 registros".
-  const financeiroSeguro = respostaFinanceiraDiretaSegura(pergunta, rows);
-  if (financeiroSeguro) return financeiroSeguro;
+    // Financeiro antes de contagem: total_pago nunca vira "registros".
+    const financeiroSeguro = respostaFinanceiraDiretaSegura(pergunta, rows);
+    if (financeiroSeguro) return financeiroSeguro;
 
-  // Contagem direta so aceita aliases realmente de quantidade.
-  const contagemSegura = respostaContagemDiretaSegura(pergunta, rows);
-  if (contagemSegura) return contagemSegura;
+    const contagemSegura = respostaContagemDiretaSegura(pergunta, rows);
+    if (contagemSegura) return contagemSegura;
+  }
 
   const amostra = rows.slice(0, MAX_LINHAS_PARA_IA);
   const prompt = `Voce e o redator final de um chatbot de obras publicas no WhatsApp.\n` +
@@ -1773,6 +2216,8 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx, analiseDados
     `OBRAS: em_andamento_obra/concluido servem para FILTRAR o ciclo da obra; na resposta ao usuario, mostre o texto humano de status_original quando ele estiver disponivel.\n` +
     `Recurso e tipo_recurso sao campos diferentes; nao troque um pelo outro.\n` +
     `Nao mostre SQL ao usuario na resposta natural.\n\n` +
+    `PLANO SEMANTICO (use para manter o significado exato da pergunta):\n${jsonSeguro(planoSemantico || {}, 5000)}\n\n` +
+    `NOTA DE NORMALIZACAO/QUALIDADE: ${textoSeguro(analiseDados?.nota_normalizacao || "", 1000)}\n\n` +
     `PERGUNTA: ${JSON.stringify(pergunta)}\n` +
     `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
     `SQL EXECUTADA: ${sql}\n` +
@@ -1814,7 +2259,7 @@ function estadoPublico(ctx, execucao, analiseDados = null) {
 }
 
 // ------------------------------------------------------------
-// Fluxo principal
+// Fluxo principal V14 semantico
 // ------------------------------------------------------------
 export async function responderPergunta(pergunta, historico = []) {
   const texto = textoSeguro(pergunta, 1600);
@@ -1823,181 +2268,111 @@ export async function responderPergunta(pergunta, historico = []) {
   const social = respostaSocial(texto, historico);
   if (social) return { resposta: social, social: true, modoAgente: "social" };
 
-  const ambiguidadeAnalise = respostaAmbiguidadeAnaliseLicitacao(texto);
-  if (ambiguidadeAnalise) {
-    return {
-      resposta: ambiguidadeAnalise,
-      social: false,
-      modoAgente: "clarificacao_analise_licitacao",
-    };
-  }
-
   try {
     const ctx = await carregarSchemaContexto();
 
-    // Estagio 1: para campos de ANALISE DE LICITACAO, o Node garante o
-    // universo correto (tipo_negocio='licitacao'). Para todo o resto, o fluxo
-    // continua exatamente igual e a IA gera a SQL.
-    const sqlAnaliseDireta = sqlAnaliseLicitacao(texto, ctx);
-    let gerada = sqlAnaliseDireta
-      ? { query: sqlAnaliseDireta, descricao: "consulta segura de análise de licitação" }
-      : await gerarSQL(texto, historico, ctx);
+    // DIN-SQL: primeiro entende a pergunta e faz schema linking; so depois gera SQL.
+    const plano = await planejarConsultaSemantica(texto, historico, ctx);
+    console.log("SQL AGENT - PLANO SEMANTICO:", jsonSeguro(plano, 5000));
 
-    if (!gerada.query) {
-      // Uma segunda tentativa curta so para formato/interpretacao, sem criar regra de frase.
-      gerada = await gerarSQL(texto, historico, ctx, "A tentativa anterior nao produziu SQL. Gere uma consulta SELECT valida usando apenas o schema fornecido.");
-    }
-    if (!gerada.query) {
+    if (plano.clarification?.needed && plano.clarification?.question) {
       return {
-        resposta: "Não consegui transformar essa pergunta em uma consulta segura aos dados. Pode reformular?",
-        erro: "sql_nao_gerada",
-        modoAgente: "sql_agent_self_healing_v13_6_arquero_decimal",
+        resposta: plano.clarification.question,
+        erro: null,
+        modoAgente: "sql_agent_semantic_v14_clarification",
+        plano: {
+          intent: plano.intent,
+          universes: plano.universes,
+          confidence: plano.confidence,
+        },
       };
     }
 
-    // Garante continuidade quando o usuario usa pronome para uma pessoa citada
-    // no turno anterior (ex.: "ela tem quantas obras em geral?").
-    const pessoaPerdida = referenciaPessoaPerdida(texto, historico, gerada.query);
-    if (pessoaPerdida) {
-      const refinada = await gerarSQL(
-        texto, historico, ctx,
-        `A pergunta atual usa um pronome que se refere a ${pessoaPerdida}, citado(a) no contexto recente. ` +
-        `A SQL perdeu essa entidade e consultou um universo mais amplo. Refaça preservando o filtro de engenheiro/responsavel dessa pessoa. ` +
-        `Se o usuario disse "em geral", remova apenas filtros de status/andamento anteriores; NAO remova o filtro da pessoa.`
-      );
-      if (refinada.query) gerada = refinada;
-    }
-
-    // Refinamentos gerais de qualidade. Nao sao regras de uma frase especifica:
-    // evitam respostas existenciais arbitrarias e agregados numericos sem composicao.
-    if (existencialComLimitUm(texto, gerada.query)) {
-      const refinada = await gerarSQL(
-        texto, historico, ctx,
-        "A consulta usou LIMIT 1 para uma pergunta existencial. Nao escolha um registro arbitrario. Refaça listando o conjunto real encontrado, preservando o recorte da conversa. Prefira objeto + campos relevantes + COUNT(*) OVER() AS total_encontrados, com no maximo 20 itens para exibicao."
-      );
-      if (refinada.query) gerada = refinada;
-    }
-
-    // Regra-mestra: se a pergunta esta bloqueada em um unico universo e a IA
-    // misturou obra/projeto/licitacao ou separou campos do mesmo conjunto por
-    // UNION, pede uma nova SQL antes de executar.
-    const universoEsperadoInicial = universoNegocioDaPergunta(texto);
-    const universosSQLInicial = universosEncontradosNaSQL(gerada.query);
-    const misturaUniversoInicial = universoEsperadoInicial && universosSQLInicial.some((u) => u !== universoEsperadoInicial);
-    const compostoSeparadoInicial = pedidoCompostoMesmoUniverso(texto, gerada.query);
-    if (misturaUniversoInicial || compostoSeparadoInicial) {
-      const refinada = await gerarSQL(
-        texto, historico, ctx,
-        `REGRA DE NEGOCIO OBRIGATORIA: o universo atual e ${universoEsperadoInicial}. ` +
-        `Toda a consulta deve permanecer nesse mesmo tipo_negocio. O usuario pediu informacoes/campos do MESMO conjunto. ` +
-        `Use UMA linha por registro com objeto + todos os campos pedidos (por exemplo responsavel/engenheiro, status, recurso, valor). ` +
-        `Nao use UNION para separar nomes e atributos e nao consulte outro universo, salvo se a pergunta citar explicitamente mais de um universo.`
-      );
-      if (refinada.query) gerada = refinada;
-    }
-
-    if (existencialComAgregadoSeco(texto, gerada.query)) {
-      const refinada = await gerarSQL(
-        texto, historico, ctx,
-        "A pergunta e existencial e a consulta retornaria apenas uma contagem. Preserve EXATAMENTE o mesmo recorte, mas traga tambem os registros encontrados para o usuario ver quais sao. Prefira objeto + status/tipo relevante + COUNT(*) OVER() AS total_encontrados. Se houver ate 20, liste todos; nao explique SQL nem filtros na resposta."
-      );
-      if (refinada.query) gerada = refinada;
-    }
-
-    if (contagemComAgregadoSeco(texto, gerada.query)) {
-      const refinada = await gerarSQL(
-        texto, historico, ctx,
-        "A pergunta pede uma contagem, mas a SQL retornaria apenas COUNT sem os registros que sustentam o total. Preserve EXATAMENTE o mesmo recorte e os mesmos criterios sem inventar categorias. Refaça trazendo objeto + campos uteis disponiveis + COUNT(*) OVER() AS total_encontrados. Para categorias amplas como area da saude, use somente equivalencias semanticamente corretas e objetos reais do catalogo; creche/escola nao sao saude."
-      );
-      if (refinada.query) gerada = refinada;
-    }
-
-    if (consultaAgregadaSeca(texto, gerada.query)) {
-      const refinada = await gerarSQL(
-        texto, historico, ctx,
-        "A consulta retornaria apenas um agregado seco. Preserve EXATAMENTE o mesmo recorte e refaça de forma explicavel: traga objeto + valor componente e o agregado por window function (SUM/AVG ... OVER()), para a resposta mostrar de onde saiu o total. Nao remova filtros anteriores."
-      );
-      if (refinada.query) gerada = refinada;
-    }
-
-    // Guardrail semantico financeiro: em ranking de valor TOTAL por entidade,
-    // MAX(valor_total) mede a maior obra individual. Para o total da entidade,
-    // corrige deterministicamente para SUM(valor_total), preservando todo o recorte.
-    const sqlRankingTotalCorrigido = corrigirRankingValorTotalPorEntidade(texto, gerada.query);
-    if (sqlRankingTotalCorrigido && sqlRankingTotalCorrigido !== limparSQL(gerada.query)) {
-      console.log("SQL AGENT - RANKING DE VALOR TOTAL CORRIGIDO: MAX -> SUM");
-      gerada = { ...gerada, query: sqlRankingTotalCorrigido };
-    }
-
-    // Guardrail universal de status por aba/universo. Corrige projetos e
-    // licitacoes para status_original; em obras usa os booleanos normalizados
-    // para "em andamento"/"concluida" e status_original nos demais status.
-    const sqlStatusCorrigido = corrigirStatusPorUniverso(texto, historico, gerada.query, ctx);
-    if (sqlStatusCorrigido && sqlStatusCorrigido !== limparSQL(gerada.query)) {
-      console.log("SQL AGENT - STATUS CORRIGIDO PELO MAPA DE UNIVERSOS");
-      gerada = { ...gerada, query: sqlStatusCorrigido };
-    }
-
-    // Protecao de continuidade: em perguntas puramente referenciais (ex.:
-    // "quais sao?"), restaura o WHERE do ultimo recorte confirmado. Isso evita
-    // misturar obra/projeto/licitacao quando a IA simplifica demais a SQL.
-    const sqlComRecorte = preservarRecorteFollowUp(texto, historico, gerada.query);
-    if (sqlComRecorte && sqlComRecorte !== limparSQL(gerada.query)) {
-      console.log("SQL AGENT - RECORTE DE FOLLOW-UP PRESERVADO");
-      gerada = { ...gerada, query: sqlComRecorte };
-    }
-
-    // Guardrail semantico do universo: garante obra/projeto/licitacao quando a
-    // regra de negocio e inequívoca. Em "quais sao?", usa a pergunta anterior.
-    const sqlComUniverso = garantirUniversoNegocio(texto, historico, gerada.query);
-    if (sqlComUniverso && sqlComUniverso !== limparSQL(gerada.query)) {
-      console.log("SQL AGENT - UNIVERSO DE NEGOCIO CORRIGIDO");
-      gerada = { ...gerada, query: sqlComUniverso };
-    }
-
-    // Segunda passagem depois de garantir o universo: importante quando a IA
-    // esquece tipo_negocio e ele e adicionado pelo guardrail acima.
-    const sqlStatusFinal = corrigirStatusPorUniverso(texto, historico, gerada.query, ctx);
-    if (sqlStatusFinal && sqlStatusFinal !== limparSQL(gerada.query)) {
-      console.log("SQL AGENT - STATUS REVALIDADO APOS UNIVERSO");
-      gerada = { ...gerada, query: sqlStatusFinal };
-    }
-
-    console.log("SQL AGENT - SQL INICIAL:", gerada.query);
-
-    // Estagio 2: executa + self-healing com diagnostico real do PostgreSQL.
-    const execucao = await executarComSelfHealing({
-      pergunta: texto,
-      historico,
-      ctx,
-      sqlInicial: gerada.query,
-    });
+    // DAIL-SQL + CHASE-SQL lite: exemplos relevantes, um ou dois caminhos e
+    // selecao pelo quanto a consulta/resultado realmente responde ao plano.
+    const pipeline = await executarPipelineSemantico({ pergunta: texto, historico, ctx, plano });
+    const escolhido = pipeline.candidato;
+    const execucao = escolhido.execucao;
 
     console.log("SQL AGENT - SQL FINAL:", execucao.sql);
-    console.log("SQL AGENT - LINHAS:", execucao.rows.length, "| REPAROS:", execucao.tentativa || 0, "| EARLY_ACCEPT:", !!execucao.earlyAccept);
+    console.log(
+      "SQL AGENT - LINHAS:", execucao.rows.length,
+      "| REPAROS:", execucao.tentativa || 0,
+      "| SCORE SEMANTICO:", escolhido.score,
+      "| VEREDITO:", escolhido.semantica?.verdict || "local"
+    );
 
-    // Camada local de conferencia. Se Arquero/Decimal.js nao estiverem instalados,
-    // os imports dinamicos falham de forma controlada e o agente segue com fallback.
-    const analiseDados = await analisarResultadoLocal(execucao.rows);
-    console.log("SQL AGENT - ANALISE LOCAL:", jsonSeguro(analiseDados, 2000));
+    // Quando a propria base mistura tipos de dado em um campo (ex.: bairro +
+    // endereco), normaliza apenas o que estiver explicitamente escrito. Isso
+    // evita chamar endereco de bairro sem criar regex por pergunta.
+    const normalizado = await normalizarResultadoSemanticoSeNecessario({
+      pergunta: texto,
+      plano,
+      rows: execucao.rows,
+      avaliacao: escolhido.semantica,
+    });
 
-    const resposta = await redigirResposta(texto, historico, execucao.sql, execucao.rows, ctx, analiseDados);
+    const rowsResposta = normalizado.rows;
+    const analiseDados = await analisarResultadoLocal(rowsResposta);
+    analiseDados.plano_semantico = {
+      intent: plano.intent,
+      universes: plano.universes,
+      expected_result: plano.expected_result,
+      confidence: plano.confidence,
+    };
+    analiseDados.avaliacao_semantica = {
+      score: escolhido.score,
+      verdict: escolhido.semantica?.verdict || "local",
+      reason: escolhido.semantica?.reason || "",
+    };
+    analiseDados.nota_normalizacao = normalizado.note || "";
+    analiseDados.forcar_redacao_semantica = normalizado.changed === true || escolhido.semantica?.normalization_needed === true;
+
+    const resposta = await redigirResposta(
+      texto,
+      historico,
+      execucao.sql,
+      rowsResposta,
+      ctx,
+      analiseDados,
+      plano
+    );
+
     return {
       resposta,
       sql: execucao.sql,
       linhas: execucao.rows.length,
-      estado: estadoPublico(ctx, execucao, analiseDados),
+      linhas_resposta: rowsResposta.length,
+      estado: {
+        ...estadoPublico(ctx, execucao, analiseDados),
+        semantic_score: escolhido.score,
+        semantic_verdict: escolhido.semantica?.verdict || "local",
+        normalizacao_aplicada: normalizado.changed === true,
+      },
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
       tentativas: execucao.tentativas,
-      modoAgente: "sql_agent_self_healing_v13_status_universal",
+      candidatos: (pipeline.candidatos || []).map((c) => ({
+        variante: c.variante,
+        score: c.score || 0,
+        sql: c.execucao?.sql || c.gerada?.query || null,
+        erro: c.erro || null,
+        verdict: c.semantica?.verdict || null,
+      })),
+      plano: {
+        intent: plano.intent,
+        universes: plano.universes,
+        expected_result: plano.expected_result,
+        confidence: plano.confidence,
+      },
+      modoAgente: "sql_agent_semantic_v14_din_dail_chase",
     };
   } catch (e) {
     console.error("SQL AGENT: falha final:", e);
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "sql_agent_self_healing_v13_7_arquero_decimal_erro",
+      modoAgente: "sql_agent_semantic_v14_erro",
     };
   }
 }
