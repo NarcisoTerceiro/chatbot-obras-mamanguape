@@ -1375,6 +1375,14 @@ function rotuloHumano(campo = "") {
     saldo_devedor: "Saldo devedor",
     observacoes: "Observações",
     quantidade: "Quantidade",
+    total_pago: "Total pago",
+    total_executado: "Total executado",
+    total_investido: "Valor total",
+    total_valor: "Valor total",
+    soma_valor: "Valor total",
+    custo_total: "Custo total",
+    saldo_total: "Saldo total",
+    valor_restante: "Valor restante",
   };
   return mapa[campo] || campo.replace(/_/g, " ");
 }
@@ -1430,7 +1438,17 @@ function campoParecePercentual(campo = "") {
 
 function campoPareceFinanceiro(campo = "") {
   if (campoPareceContagem(campo) || campoParecePercentual(campo)) return false;
-  return /(valor|invest|custo|gasto|pago|saldo|aditivo|contrapartida|restante|falta|orcamento|or[cç]amento)/i.test(campo);
+  return /(valor|invest|custo|gasto|pago|pagamento|executad|saldo|aditivo|contrapartida|restante|falta|orcamento|or[cç]amento|desembols)/i.test(campo);
+}
+
+function perguntaPedeContagem(pergunta = "") {
+  const p = normalizar(pergunta);
+  return /\b(quantos|quantas|quantidade|qtd|numero de|n[uú]mero de|total de (?:obras|projetos|licitacoes|licitações|registros|itens))\b/.test(p);
+}
+
+function perguntaPedeValorFinanceiro(pergunta = "") {
+  const p = normalizar(pergunta);
+  return /\b(quanto|valor|investid|pago|pagamento|pagou|executad|gasto|custo|saldo|restante|falta|desembols)\b/.test(p);
 }
 
 function decimalSomar(valores = []) {
@@ -1517,20 +1535,31 @@ function respostaFinanceiraDiretaSegura(pergunta = "", rows = []) {
   const r = rows[0] || {};
   if (r.objeto) return null;
 
-  const candidatos = Object.entries(r).filter(([campo, valor]) =>
-    campoPareceFinanceiro(campo) &&
-    numeroParaAnalise(valor) !== null
-  );
+  const p = normalizar(pergunta);
+  const perguntaFinanceira = perguntaPedeValorFinanceiro(pergunta);
+
+  // Regra geral: aliases como total_pago, total_executado, total_investido,
+  // soma_valor etc. sao MEDIDAS financeiras, nunca quantidade de registros.
+  // O alias generico "total" so e tratado como dinheiro quando a pergunta
+  // claramente pede valor/quanto/pago/investido/executado/custo/saldo.
+  const candidatos = Object.entries(r).filter(([campo, valor]) => {
+    const nome = normalizar(campo);
+    const ehFinanceiro = campoPareceFinanceiro(campo) || (perguntaFinanceira && nome === "total");
+    return ehFinanceiro && numeroParaAnalise(valor) !== null;
+  });
   if (candidatos.length !== 1) return null;
 
   const [campo, valor] = candidatos[0];
   const moeda = formatarMoedaSegura(valor);
   if (!moeda) return null;
 
-  const p = normalizar(pergunta);
-  if (/invest|valor total|quanto (?:foi|e|é)|custo|gasto/.test(p)) {
-    return `O valor total nesse recorte é ${moeda}.`;
-  }
+  if (/\b(pago|pagamento|pagou|desembols)\b/.test(p)) return `O total já pago é ${moeda}.`;
+  if (/\bexecutad/.test(p)) return `O total executado é ${moeda}.`;
+  if (/\binvest/.test(p)) return `O valor total investido é ${moeda}.`;
+  if (/\b(saldo|restante|falta)\b/.test(p)) return `O valor restante é ${moeda}.`;
+  if (/\b(custo|gasto)\b/.test(p)) return `O valor total é ${moeda}.`;
+  if (/\b(quanto|valor)\b/.test(p)) return `O valor total é ${moeda}.`;
+
   return `${rotuloHumano(campo)}: ${moeda}.`;
 }
 
@@ -1659,10 +1688,19 @@ function respostaContagemDiretaSegura(pergunta = "", rows = []) {
   const r = rows[0] || {};
   if (r.objeto) return null;
 
-  const candidatos = Object.entries(r).filter(([k, v]) =>
-    /(?:^count$|count_|_count$|^total|total_|quantidade|qtd)/i.test(k) &&
-    v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v))
-  );
+  const p = normalizar(pergunta);
+  const pedeContagem = perguntaPedeContagem(pergunta);
+
+  // IMPORTANTE: nao aceite qualquer campo iniciado por "total" como contagem.
+  // total_pago, total_executado, total_investido, total_valor etc. sao valores.
+  // O alias generico "total" so vale como contagem se a pergunta pedir
+  // explicitamente quantos/quantas/quantidade/numero de.
+  const candidatos = Object.entries(r).filter(([k, v]) => {
+    const nome = normalizar(k);
+    const ehContagem = campoPareceContagem(k) || (pedeContagem && nome === "total");
+    if (!ehContagem || campoPareceFinanceiro(k) || campoParecePercentual(k)) return false;
+    return v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v));
+  });
   if (candidatos.length !== 1) return null;
 
   // Se a linha tambem possui uma dimensao (engenheiro, empresa, bairro etc.),
@@ -1675,7 +1713,6 @@ function respostaContagemDiretaSegura(pergunta = "", rows = []) {
   if (temDimensao) return null;
 
   const n = Number(candidatos[0][1]);
-  const p = normalizar(pergunta);
   if (/\bobras?\b/.test(p)) return n === 1 ? "Há 1 obra que corresponde a esses critérios." : `Há ${n} obras que correspondem a esses critérios.`;
   if (/\bprojetos?\b/.test(p)) return n === 1 ? "Há 1 projeto que corresponde a esses critérios." : `Há ${n} projetos que correspondem a esses critérios.`;
   if (/\blicita(?:cao|coes)\b/.test(p)) return n === 1 ? "Há 1 licitação que corresponde a esses critérios." : `Há ${n} licitações que correspondem a esses critérios.`;
@@ -1689,16 +1726,15 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx, analiseDados
   const agregadoComDimensao = respostaAgregadoComDimensaoSegura(pergunta, rows);
   if (agregadoComDimensao) return agregadoComDimensao;
 
-  // Se por qualquer motivo uma consulta de contagem ainda chegar apenas com o
-  // agregado, nao envia contexto insuficiente para a IA completar com nomes.
-  // Isso impede alucinacao de obras/valores que nao vieram do PostgreSQL.
-  const contagemSegura = respostaContagemDiretaSegura(pergunta, rows);
-  if (contagemSegura) return contagemSegura;
-
-  // Agregado financeiro isolado (ex.: SUM(valor_total)=503000) nunca deve ser
-  // interpretado pela IA como quantidade de registros.
+  // Agregado financeiro isolado (ex.: total_pago, total_executado,
+  // total_investido, SUM(valor_total)) tem prioridade sobre contagem.
+  // Isso impede respostas como "4.732.511,34 registros".
   const financeiroSeguro = respostaFinanceiraDiretaSegura(pergunta, rows);
   if (financeiroSeguro) return financeiroSeguro;
+
+  // Contagem direta so aceita aliases realmente de quantidade.
+  const contagemSegura = respostaContagemDiretaSegura(pergunta, rows);
+  if (contagemSegura) return contagemSegura;
 
   const amostra = rows.slice(0, MAX_LINHAS_PARA_IA);
   const prompt = `Voce e o redator final de um chatbot de obras publicas no WhatsApp.\n` +
@@ -1707,6 +1743,7 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx, analiseDados
     `Se for contagem/soma/ranking, destaque o resultado de forma direta e depois mostre os dados que sustentam a resposta em linguagem comum. EXPLICAR significa mostrar nomes, valores, status, responsaveis ou outros detalhes uteis dos registros; NAO significa explicar como o banco foi consultado.\n` +
     `AGREGADO COM DIMENSAO: se DADOS RETORNADOS trouxerem uma entidade junto de uma medida (ex.: engenheiro + total_obras, empresa + valor_total_obras, bairro + quantidade), cite SEMPRE os dois. Nunca responda somente o numero/valor e esconda a entidade.\n` +
     `DUAS MEDIDAS PEDIDAS: se o usuario pedir, por exemplo, valor investido E total executado, responda as duas separadamente. Se uma delas nao puder ser calculada porque todos os valores correspondentes vieram nulos/vazios, diga claramente que esse total nao pode ser calculado com os dados preenchidos; nao invente zero e nao assuma que obra concluida implica valor_executado = valor_total.\n` +
+    `TIPO DA MEDIDA: aliases como total_pago, total_executado, total_investido, total_valor, soma_valor, custo_total e saldo_total sao VALORES FINANCEIROS e devem ser formatados em reais; nunca os chame de quantidade ou registros. COUNT/quantidade/qtd/total_registros/total_obras/total_projetos/total_licitacoes sao CONTAGENS.\n` +
     `REGRA ANTI-ALUCINACAO: so cite nome, bairro, empresa, valor, contrato, status ou qualquer detalhe se esse valor estiver explicitamente em DADOS RETORNADOS. Se os dados trouxerem apenas uma contagem agregada e nenhum objeto, responda somente a contagem; NUNCA complete com exemplos, nomes ou detalhes vindos do historico/schema.\n` +
     `NUNCA mencione SQL, consulta, SELECT, WHERE, view, tabela, coluna, filtro tecnico, booleano, tipo_negocio, concluido=true ou qualquer mecanismo interno. O usuario quer o RESULTADO e os registros encontrados, nao a forma tecnica de obtencao.\n` +
     `RESPOSTAS DEVEM SER EXPLICATIVAS, nao secas: comece com uma frase curta respondendo diretamente e depois mostre os detalhes que ajudam a entender o resultado. Nao escreva apenas uma lista de valores quando os dados permitem dizer a qual obra/projeto/licitacao cada valor pertence.\n` +
