@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - AGENTE GOOGLE SHEETS COM FERRAMENTAS (SEM SQL) - V3 LOCALIDADE + ESCOPO
+// agente.js - AGENTE GOOGLE SHEETS COM FERRAMENTAS (SEM SQL) - V4 BAIRROS RIGOROSOS + ESCOPO
 // ============================================================
 // Inspirado no padrao de agentes de planilha do n8n:
 // - a IA entende a pergunta e escolhe uma ferramenta;
@@ -456,33 +456,69 @@ function valorColunaExata(row, nomes = []) {
 function ehDescricaoLocalGenerica(v = "") {
   const n = normalizar(v);
   if (!n) return true;
+
+  // Localizadores que descrevem uma area ampla, trecho viario ou o proprio
+  // servico, mas NAO identificam um bairro especifico.
   const genericos = [
     "diversas ruas", "ruas diversas", "diversas localidades", "localidades rurais",
     "zona rural", "zona urbana", "estradas diversas", "varias ruas", "várias ruas",
     "todo municipio", "todo o municipio", "municipio de mamanguape", "margens da br",
-    "trecho 01", "trecho 1", "trecho 02", "trecho 2"
+    "zonas rural e urbana", "zona rural e zona urbana"
   ].map(normalizar);
-  return genericos.some((g) => n === g || n.includes(g));
+  if (genericos.some((g) => n === g || n.includes(g))) return true;
+
+  // "Trecho 03", "TRECHO 04" etc. nunca sao bairro.
+  if (/^trecho\s*[0-9a-z]+\b/.test(n)) return true;
+
+  // Textos de objeto/servico que por erro foram colocados na coluna BAIRRO.
+  // A regra e estrutural: rejeita descricoes de obra, nao nomes cadastrados.
+  if (/^(recuperacao|ampliacao|manutencao|reforma|construcao|implantacao|pavimentacao|revitalizacao|requalificacao|restauracao|adequacao|execucao|urbanizacao|drenagem|melhoria|servicos?)\b/.test(n)) {
+    return true;
+  }
+  if (/\b(unidades? de ensino|estradas? vicinais|pavimentacao de vias|recuperacao de trechos)\b/.test(n)) {
+    return true;
+  }
+
+  return false;
 }
 
 function ehTrechoEndereco(v = "") {
   const n = normalizar(v);
   if (!n) return true;
-  if (/^(s n|sn|s\/n|n|numero|nº|no)\b/.test(n)) return true;
+  if (/^(s n|sn|n|numero|no)\b/.test(n)) return true;
+  if (/^trecho\s*[0-9a-z]+\b/.test(n)) return true;
   if (/^\d+[a-z]?$/.test(n)) return true;
   if (/^(pb|paraiba|mamanguape|mamanguape pb)$/.test(n)) return true;
-  if (/^(rua|r |avenida|av |travessa|rodovia|br |estrada|sitio|sítio)\b/.test(n)) return true;
+  if (/^(rua|r |avenida|av |travessa|rodovia|br |estrada|sitio)\b/.test(n)) return true;
   return false;
 }
 
+function removerSufixosDeEndereco(v = "") {
+  let s = texto(v).trim();
+  let anterior = null;
+  // Repete para lidar com "Santa Edwiges, S/N, Mamanguape - PB".
+  while (s && s !== anterior) {
+    anterior = s;
+    s = s
+      .replace(/\s*,?\s*(?:mamanguape)\s*(?:-\s*pb)?\.?\s*$/i, "")
+      .replace(/\s*,?\s*(?:pb|para[ií]ba)\s*$/i, "")
+      .replace(/\s*,?\s*(?:s\s*\/?\s*n|sn)\.?\s*$/i, "")
+      .replace(/\s*,?\s*(?:n[º°o]?\.?\s*\d+[a-z]?)\s*$/i, "")
+      .replace(/^[,;\-\s]+|[,;\-\s]+$/g, "")
+      .trim();
+  }
+  return s;
+}
+
 function limparRotuloLocalidade(v = "") {
-  let s = texto(v)
+  let s = removerSufixosDeEndereco(v)
     .replace(/^bairro\s*[:\-]\s*/i, "")
     .replace(/^localidade\s*[:\-]\s*/i, "")
     .replace(/\s*-\s*pb\s*$/i, "")
     .replace(/^[,;\-\s]+|[,;\-\s]+$/g, "")
     .replace(/\s+/g, " ")
     .trim();
+
   if (!s || ehDescricaoLocalGenerica(s) || ehTrechoEndereco(s)) return "";
   return capitalizarRotuloDimensao(s, "bairro");
 }
@@ -499,14 +535,14 @@ function extrairLocalidadeDeTexto(bruto = "", { permitirValorInteiro = false } =
     if (r) return r;
   }
 
-  if (ehDescricaoLocalGenerica(original)) return "";
-
   // Evidencia explicita em nomes/descricoes: preserva o nome completo da localidade.
   m = original.match(/\b((?:bairro|distrito\s+de|loteamento|comunidade)\s+[^,;|\-]{2,80})/i);
   if (m?.[1]) {
     const r = limparRotuloLocalidade(m[1]);
     if (r) return r;
   }
+
+  if (ehDescricaoLocalGenerica(original)) return "";
 
   // Endereco no formato "Rua X, s/n - Centro" ou "Rua X - Bela Vista".
   const partesHifen = original.split(/\s+-\s+/).map(texto).filter(Boolean);
@@ -517,11 +553,10 @@ function extrairLocalidadeDeTexto(bruto = "", { permitirValorInteiro = false } =
     }
   }
 
-  // Endereco no formato "Rua X, S/N, Centro, Mamanguape - PB".
-  const semCidade = original
-    .replace(/,?\s*Mamanguape\s*(?:-\s*PB)?\s*$/i, "")
-    .replace(/,?\s*PB\s*$/i, "");
-  const partes = semCidade.split(/[,;]/).map(texto).filter(Boolean);
+  // Endereco no formato "Rua X, S/N, Centro, Mamanguape - PB" ou
+  // "Santa Edwiges, S/N" / "Campo, Mamanguape".
+  const semSufixos = removerSufixosDeEndereco(original);
+  const partes = semSufixos.split(/[,;]/).map(texto).filter(Boolean);
   if (partes.length >= 2) {
     for (let i = partes.length - 1; i >= 0; i--) {
       const p = partes[i];
@@ -531,7 +566,31 @@ function extrairLocalidadeDeTexto(bruto = "", { permitirValorInteiro = false } =
     }
   }
 
-  if (permitirValorInteiro) return limparRotuloLocalidade(original);
+  if (permitirValorInteiro) {
+    const inteiro = limparRotuloLocalidade(semSufixos || original);
+    if (!inteiro || ehDescricaoLocalGenerica(inteiro)) return "";
+    return inteiro;
+  }
+  return "";
+}
+
+
+function extrairLocalidadeMarcadaDeTexto(bruto = "") {
+  const original = texto(bruto);
+  if (!original) return "";
+
+  let m = original.match(/\bbairro\s*[:\-]?\s+([^,;|\-]{2,80})/i);
+  if (m?.[1]) {
+    const r = limparRotuloLocalidade(m[1]);
+    if (r) return r;
+  }
+
+  m = original.match(/\b((?:distrito\s+de|loteamento|comunidade)\s+[^,;|\-]{2,80})/i);
+  if (m?.[1]) {
+    const r = limparRotuloLocalidade(m[1]);
+    if (r) return r;
+  }
+
   return "";
 }
 
@@ -557,10 +616,13 @@ function bairroDerivadoDaLinha(row) {
     if (b) return { grupo: b, fonte: "rua/endereco", bruto: rua };
   }
 
-  // 4) Ultimo recurso: apenas marcadores EXPLICITOS dentro do objeto.
+  // 4) Ultimo recurso: no OBJETO aceitamos SOMENTE marcadores explicitos
+  // ("Bairro X", "Distrito de Y", "Loteamento Z", "Comunidade W").
+  // Nao usamos sufixo apos hifen, pois "PASSAGEM MOLHADA - TEREZA SOARES"
+  // e nome de obra/local de referencia, nao prova de bairro.
   const objeto = objetoDaLinha(row);
   if (objeto) {
-    const b = extrairLocalidadeDeTexto(objeto, { permitirValorInteiro: false });
+    const b = extrairLocalidadeMarcadaDeTexto(objeto);
     if (b) return { grupo: b, fonte: "objeto", bruto: objeto };
   }
   return null;
@@ -568,7 +630,9 @@ function bairroDerivadoDaLinha(row) {
 
 function grupoDimensaoDaLinha(row, campo, normalizarDimensao = false) {
   const c = normalizar(campo);
-  if (normalizarDimensao && (c.includes("bairro") || c.includes("localidade"))) {
+  // Bairro/localidade SEMPRE passa pelo extrator seguro. Nao depende de a IA
+  // lembrar de marcar normalizar_dimensao=true.
+  if (c.includes("bairro") || c.includes("localidade")) {
     return bairroDerivadoDaLinha(row);
   }
   const bruto = valorCampo(row, campo);
@@ -698,7 +762,7 @@ async function ferramentaSomar(rows, args = {}) {
       itens,
       total_grupos: totalGrupos,
       truncado: totalGrupos > limite,
-      normalizacao_aplicada: args.normalizar_dimensao === true,
+      normalizacao_aplicada: normalizar(agruparPor).includes("bairro") || normalizar(agruparPor).includes("localidade") || args.normalizar_dimensao === true,
     };
   }
 
@@ -778,12 +842,11 @@ async function ferramentaAgrupar(rows, args = {}) {
   const registrosComValorDimensao = itensBrutos.reduce((acc, x) => acc + (Number(x.quantidade) || 0), 0);
   const registrosSemValorDimensao = Math.max(0, encontrados.length - registrosComValorDimensao);
   let itens = [...itensBrutos];
-  let normalizacaoAplicada = args.normalizar_dimensao === true && (normalizar(args.conceito || campo).includes("bairro") || normalizar(campo).includes("bairro") || normalizar(args.conceito || campo).includes("localidade"));
-  let registrosIdentificados = registrosComValorDimensao;
-  let registrosNaoIdentificados = registrosSemValorDimensao;
-
   const conceitoNorm = normalizar(args.conceito || campo);
   const dimensaoLocalidade = conceitoNorm.includes("bairro") || conceitoNorm.includes("localidade") || normalizar(campo).includes("bairro");
+  let normalizacaoAplicada = dimensaoLocalidade || args.normalizar_dimensao === true;
+  let registrosIdentificados = registrosComValorDimensao;
+  let registrosNaoIdentificados = registrosSemValorDimensao;
 
   if (args.normalizar_dimensao === true && itensBrutos.length && !dimensaoLocalidade) {
     const conceito = args.conceito || campo;
@@ -958,6 +1021,7 @@ SEMANTICA:
 - ESCOLHA DA FERRAMENTA: buscar_obras serve para identificar/listar QUAIS registros atendem a uma condicao e/ou mostrar detalhes. agrupar_por serve SOMENTE para distribuicao por dimensao (ex.: quantos em cada bairro/status/engenheiro).
 - Portanto, se o usuario pedir quais registros estao em um status especifico (ex.: quais projetos estao concluidos), use buscar_obras + filtro de status; NAO use agrupar_por status.
 - Se uma pergunta pedir "bairros e quantidade", use agrupar_por campo=bairro e normalizar_dimensao=true.
+- Nunca trate TRECHO numerado, nome de servico/obra (reforma, recuperacao, manutencao, pavimentacao etc.), rua/avenida ou endereco como bairro. O Node tambem valida isso.
 - Se pedir soma/valor por bairro ou localidade, use somar com agrupar_por="bairro", normalizar_dimensao=true e conceito="bairro". NUNCA agrupe valor financeiro pelo texto bruto de endereco.
 - Palavras que apenas nomeiam o universo ("obras", "projetos", "licitacoes") definem escopo; NAO as coloque em termos nem em filtro de objeto. Ex.: "quantas licitacoes existem?" = contar_obras({escopo:["licitacao"]}) sem termos.
 - Para um assunto literal como UBS, mercado, escola, drenagem etc., use termos e normalmente campos_busca=["objeto"].
