@@ -1011,7 +1011,7 @@ function rotuloHumano(campo = "") {
     status: "Status",
     status_original: "Etapa/status atual",
     categoria: "Categoria",
-    engenheiro: "Engenheiro",
+    engenheiro: "Responsável",
     empresa: "Empresa",
     valor_total: "Valor total",
     valor_executado: "Valor executado",
@@ -1187,42 +1187,80 @@ function respostaFinanceiraDiretaSegura(pergunta = "", rows = []) {
   return `${rotuloHumano(campo)}: ${moeda}.`;
 }
 
+function tituloListaWhatsApp(pergunta = "", rows = []) {
+  const p = normalizar(pergunta);
+  const tipos = [...new Set((rows || []).map((r) => normalizar(r?.tipo_negocio || "")).filter(Boolean))];
+  const n = Array.isArray(rows) ? rows.length : 0;
+
+  let singular = "registro";
+  let plural = "registros";
+  const tipoUnico = tipos.length === 1 ? tipos[0] : "";
+
+  if (tipoUnico === "obra" || /\bobras?\b/.test(p)) {
+    singular = "obra";
+    plural = "obras";
+  } else if (tipoUnico === "projeto" || /\bprojetos?\b/.test(p)) {
+    singular = "projeto";
+    plural = "projetos";
+  } else if (tipoUnico === "licitacao" || /\blicita(?:cao|coes)\b/.test(p)) {
+    singular = "licitação";
+    plural = "licitações";
+  }
+
+  const termo = n === 1 ? singular : plural;
+  return `📋 *${n} ${termo} encontrado${n === 1 ? "" : "s"}*`;
+}
+
 function fallbackResposta(pergunta, rows = []) {
   if (!rows.length) return "Não encontrei registros que correspondam a essa pergunta nos dados atuais.";
 
-  const camposTecnicosOcultos = new Set(["id", "objeto"]);
+  // Campos internos/repetitivos não devem poluir a leitura no WhatsApp.
+  const camposTecnicosOcultos = new Set([
+    "id", "objeto", "tipo_negocio", "subtipo_negocio", "aba_origem",
+    "total_registros", "total_obras", "total_projetos", "total_licitacoes"
+  ]);
+
   if (rows.length === 1) {
     const r = rows[0];
-    const chavesVisiveis = Object.keys(r).filter((k) => k !== "id");
+    const chavesVisiveis = Object.keys(r).filter((k) => !camposTecnicosOcultos.has(k));
 
     // Agregacoes com uma unica coluna devem sair diretas, sem nome tecnico.
-    if (chavesVisiveis.length === 1 && chavesVisiveis[0] !== "objeto") {
+    if (!r.objeto && chavesVisiveis.length === 1) {
       return `${valorFallback(chavesVisiveis[0], r[chavesVisiveis[0]]) ?? "Não informado"}`;
     }
 
     const linhas = [];
-    if (r.objeto) linhas.push(`• ${r.objeto}`);
+    if (r.objeto) linhas.push(`*${r.objeto}*`);
     for (const [k, v] of Object.entries(r)) {
       if (camposTecnicosOcultos.has(k)) continue;
       const fmt = valorFallback(k, v);
       if (fmt === null) continue;
-      linhas.push(`  ${rotuloHumano(k)}: ${fmt}`);
+      linhas.push(`• *${rotuloHumano(k)}:* ${fmt}`);
     }
     return linhas.join("\n") || "Encontrei o registro, mas não há detalhes adicionais informados.";
   }
 
   const exibidas = rows.slice(0, 20);
-  const linhas = exibidas.map((r, i) => {
+  const blocos = exibidas.map((r, i) => {
     const nome = r.objeto ? String(r.objeto) : null;
     const detalhes = Object.entries(r)
       .filter(([k, v]) => !camposTecnicosOcultos.has(k) && v !== null && v !== undefined && v !== "")
-      .slice(0, 3)
-      .map(([k, v]) => `${rotuloHumano(k)}: ${valorFallback(k, v)}`)
-      .join(" — ");
-    if (nome) return `${i + 1}. ${nome}${detalhes ? ` — ${detalhes}` : ""}`;
-    return `${i + 1}. ${detalhes || "Registro encontrado"}`;
+      .slice(0, 5)
+      .map(([k, v]) => `• *${rotuloHumano(k)}:* ${valorFallback(k, v)}`);
+
+    const linhas = [];
+    if (nome) linhas.push(`*${i + 1}. ${nome}*`);
+    else linhas.push(`*${i + 1}. Registro encontrado*`);
+    linhas.push(...detalhes);
+    return linhas.join("\n");
   });
-  return `${linhas.join("\n")}${rows.length > exibidas.length ? `\n… e mais ${rows.length - exibidas.length}.` : ""}`;
+
+  const titulo = tituloListaWhatsApp(pergunta, rows);
+  const resto = rows.length > exibidas.length
+    ? `\n\n… e mais ${rows.length - exibidas.length} registro${rows.length - exibidas.length === 1 ? "" : "s"}.`
+    : "";
+
+  return `${titulo}\n\n${blocos.join("\n\n")}${resto}`;
 }
 
 function respostaAgregadoComDimensaoSegura(pergunta = "", rows = []) {
@@ -1334,7 +1372,14 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx, analiseDados
     `Quando a consulta retornar um campo vindo de dados_extras com alias legivel, responda usando o significado desse campo; nao renomeie para outro conceito parecido.\n` +
     `Se houver exatamente 2 ou mais itens, pode abrir com "Encontrei X registros nesse recorte" ou equivalente, desde que seja natural e util.\n` +
     `Se for lista grande, seja conciso e liste no maximo 20 itens, avisando se houver mais.\n` +
-    `FORMATO WHATSAPP: NUNCA use tabela Markdown, pipes |, linhas --- ou cabecalho de tabela. Use lista simples com marcadores.\n` +
+    `FORMATO WHATSAPP: organize a resposta para leitura rapida no celular. NUNCA use tabela Markdown, pipes |, linhas --- ou cabecalho de tabela.\n` +
+    `- Para listas com varios registros, comece com um titulo curto em negrito usando apenas um asterisco do WhatsApp, por exemplo: "📋 *15 projetos encontrados*".\n` +
+    `- Separe cada registro com UMA linha em branco.\n` +
+    `- Destaque o nome de cada obra/projeto/licitacao em negrito, por exemplo: "*1. Projeto X*".\n` +
+    `- Mostre os detalhes em linhas separadas com marcadores: "• *Status:* ...", "• *Responsável:* ...", "• *Recurso:* ...".\n` +
+    `- Nao amontoe nome, status, responsavel e recurso na mesma linha usando varios travessoes.\n` +
+    `- Para respostas curtas (contagem, valor unico, sim/nao), seja direto e nao crie blocos desnecessarios.\n` +
+    `- Use no maximo um emoji discreto no titulo; nao use emojis em cada linha.\n` +
     `Nao finalize com frases mecanicas como "nao ha mais registros" ou "nao foram encontrados outros registros"; apenas responda o que foi pedido.\n` +
     `NUNCA mostre ID/identificador interno. NUNCA escreva o nome tecnico da coluna "objeto". Use diretamente o nome da obra/projeto/licitacao.\n` +
     `Exemplo correto: "1. Reforma e ampliacao da UBS do Cristo Rei — Recurso: FEDERAL". Exemplo proibido: "1. id: 3 — objeto: Reforma...".\n` +
