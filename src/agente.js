@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V13.6
+// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + REGRAS DE NEGOCIO UNIFICADAS + RESPOSTAS HUMANAS (Node.js) - V13.7
 // ============================================================
 // Arquitetura baseada em duas referencias usadas no projeto:
 // 1) Conversational SQL Agent: schema/view + SQL dinamico + memoria de conversa.
@@ -273,26 +273,60 @@ function ultimaPerguntaUsuario(historico = []) {
   return "";
 }
 
-// Resolve apenas universos inequívocos pelas regras de negocio. Se o usuario
-// citar mais de um universo na mesma pergunta, deixa a IA montar a combinacao.
+// ------------------------------------------------------------
+// Regra-mestra de UNIVERSO DE NEGOCIO
+// ------------------------------------------------------------
+// Um universo explicito BLOQUEIA toda a consulta nesse mesmo tipo_negocio.
+// Ex.: "engenheiros dos projetos e quais sao os projetos" continua 100% em
+// tipo_negocio='projeto'; "engenheiros" e "nomes" sao CAMPOS do mesmo conjunto,
+// nao universos diferentes. So liberamos mistura quando o usuario cita de forma
+// explicita mais de um universo (ex.: "compare obras e projetos").
+function universosExplicitosDaPergunta(pergunta = "") {
+  const p = normalizar(pergunta);
+  const itens = [];
+  if (/\bobras?\b/.test(p)) itens.push("obra");
+  if (/\bprojetos?\b/.test(p)) itens.push("projeto");
+  if (/\blicita(?:cao|coes)\b/.test(p)) itens.push("licitacao");
+  return [...new Set(itens)];
+}
+
 function universoNegocioDaPergunta(pergunta = "") {
   const p = normalizar(pergunta);
   if (!p) return null;
 
-  const falaObra = /\bobras?\b/.test(p);
-  const falaProjeto = /\bprojetos?\b/.test(p);
-  const falaLicitacao = /\blicita(?:cao|coes)\b/.test(p);
-  const universosExplicitos = [falaObra, falaProjeto, falaLicitacao].filter(Boolean).length;
-
-  if (universosExplicitos > 1) return null;
-  if (falaLicitacao) return "licitacao";
-  if (falaProjeto) return "projeto";
-  if (falaObra) return "obra";
+  const explicitos = universosExplicitosDaPergunta(pergunta);
+  if (explicitos.length > 1) return null; // comparacao/mistura explicitamente pedida
+  if (explicitos.length === 1) return explicitos[0];
 
   // Regra oficial do projeto: alvos fisicos, sem projeto/licitacao explicitos,
   // pertencem ao universo de obras.
   const alvoFisico = /\b(ubs|unidade basica de saude|posto de saude|psf|escola|creche|praca|mercado|campo|drenagem|quadra|pavimentacao|rua)\b/.test(p);
   return alvoFisico ? "obra" : null;
+}
+
+function universosEncontradosNaSQL(sql = "") {
+  const s = String(sql || "");
+  const out = new Set();
+  const rxEq = /\btipo_negocio\s*=\s*'(obra|projeto|licitacao)'/gi;
+  let m;
+  while ((m = rxEq.exec(s))) out.add(normalizar(m[1]));
+
+  const rxRotulo = /'(obra|projeto|licitacao)'\s+AS\s+(?:tipo|universo|tipo_negocio)\b/gi;
+  while ((m = rxRotulo.exec(s))) out.add(normalizar(m[1]));
+  return [...out];
+}
+
+function pedidoCompostoMesmoUniverso(pergunta = "", sql = "") {
+  const universo = universoNegocioDaPergunta(pergunta);
+  if (!universo) return false;
+  const p = normalizar(pergunta);
+  const pedeCampo = /\b(engenheir|arquit|responsavel|status|situacao|recurso|valor|bairro|empresa|contrato|convenio|data|percentual|executad)\w*\b/.test(p);
+  const pedeRegistros = /\b(quais|liste|lista|nomes?|mostre|fale)\b/.test(p) && /\b(obras?|projetos?|licitacoes?)\b/.test(p);
+  if (!(pedeCampo && pedeRegistros)) return false;
+
+  // Para varios campos do MESMO conjunto, UNION/CTEs separados quase sempre
+  // quebram a associacao registro -> campo. Exigimos uma linha por registro.
+  return /\bunion(?:\s+all)?\b/i.test(String(sql || ""));
 }
 
 function adicionarCondicaoWhere(sql = "", condicao = "") {
@@ -315,16 +349,30 @@ function garantirUniversoNegocio(pergunta = "", historico = [], sqlAtual = "") {
   let s = limparSQL(sqlAtual);
   if (!esperado || !s) return s;
 
-  // Se ja existe um filtro simples tipo_negocio='...', corrige eventual universo
-  // errado. Consultas que usam IN/OR deliberadamente ficam intocadas.
-  const rxIgual = /((?:\b[a-zA-Z_][\w$]*\.)?tipo_negocio\s*=\s*)'([^']+)'/i;
-  const m = s.match(rxIgual);
-  if (m) {
-    if (normalizar(m[2]) === esperado) return s;
-    return s.replace(rxIgual, `$1'${esperado}'`);
-  }
+  // UNIVERSO BLOQUEADO: quando a pergunta tem um unico universo, TODAS as
+  // subconsultas/CTEs/UNIONs devem usar esse mesmo tipo_negocio. Corrigimos
+  // todas as igualdades, nao apenas a primeira ocorrencia.
+  const rxIgualGlobal = /((?:\b[a-zA-Z_][\w$]*\.)?tipo_negocio\s*=\s*)'(obra|projeto|licitacao)'/gi;
+  let encontrouFiltro = false;
+  s = s.replace(rxIgualGlobal, (_todo, prefixo) => {
+    encontrouFiltro = true;
+    return `${prefixo}'${esperado}'`;
+  });
 
-  if (/\btipo_negocio\b/i.test(s)) return s;
+  // Se a IA tentou usar IN para misturar universos numa pergunta de universo
+  // unico, reduzimos ao universo correto.
+  const rxIn = /((?:\b[a-zA-Z_][\w$]*\.)?tipo_negocio\s+IN\s*)\([^)]*\)/gi;
+  s = s.replace(rxIn, (_todo, prefixo) => {
+    encontrouFiltro = true;
+    return `${prefixo}('${esperado}')`;
+  });
+
+  // Corrige rotulos artificiais usados em UNIONs, ex.: SELECT 'obra' AS tipo,
+  // para a resposta nao chamar projetos de obras apos o guardrail.
+  s = s.replace(/'(obra|projeto|licitacao)'(\s+AS\s+(?:tipo|universo|tipo_negocio)\b)/gi,
+    (_todo, _valor, sufixo) => `'${esperado}'${sufixo}`);
+
+  if (encontrouFiltro || /\btipo_negocio\b/i.test(s)) return limparSQL(s);
   return adicionarCondicaoWhere(s, `tipo_negocio = '${esperado}'`);
 }
 
@@ -403,6 +451,258 @@ function contagemComAgregadoSeco(pergunta = "", sql = "") {
 // maior/menor VALOR TOTAL INVESTIDO no conjunto, o correto e somar as obras de
 // cada entidade. MAX(valor_total) responderia apenas qual foi a maior obra
 // individual daquela entidade, mudando a semantica da pergunta.
+// ------------------------------------------------------------
+// Guardrail universal de STATUS por aba/universo
+// ------------------------------------------------------------
+// Mapa oficial usado pelo chatbot:
+// - EM_ANDAMENTO / PAVIMENTACAO -> tipo_negocio='obra'
+//     * "em andamento" -> em_andamento_obra = true
+//     * "concluida"    -> concluido = true
+//     * qualquer outro status especifico -> status_original
+// - EM_PROJETO -> tipo_negocio='projeto' -> status_original
+// - EM_LICITACAO -> tipo_negocio='licitacao' -> status_original
+// - proposta/habilitacao analisada -> dados_extras (tratado por sqlAnaliseLicitacao)
+//
+// A funcao corrige a SQL DEPOIS da IA gerar e tambem em cada reparo do
+// self-healing. Assim uma tentativa de reparo nao consegue voltar para a coluna
+// errada. Nao depende de nomes de obras nem de valores fixos da planilha.
+function nomesColunasContexto(ctx = null) {
+  return new Set((ctx?.colunas || []).map((c) => c?.column_name).filter(Boolean));
+}
+
+function universoPelaSQL(sql = "") {
+  const s = String(sql || "");
+  const tipo = s.match(/\btipo_negocio\s*=\s*'(obra|projeto|licitacao)'/i)?.[1];
+  if (tipo) return normalizar(tipo);
+
+  // Compatibilidade com a tabela legada quando a IA filtrar pela aba de origem.
+  if (/\bEM_PROJETO\b/i.test(s)) return "projeto";
+  if (/\bEM_LICITA(?:C|Ç)(?:AO|ÃO)\b/i.test(s)) return "licitacao";
+  if (/\bEM_ANDAMENTO\b/i.test(s) || /\bPAVIMENTA(?:C|Ç)(?:AO|ÃO)\b/i.test(s)) return "obra";
+  return null;
+}
+
+function dividirWherePorAndTopo(where = "") {
+  const partes = [];
+  let atual = "";
+  let profundidade = 0;
+  let aspasSimples = false;
+  let aspasDuplas = false;
+
+  for (let i = 0; i < where.length; i++) {
+    const ch = where[i];
+    const prox = where[i + 1];
+
+    if (aspasSimples) {
+      atual += ch;
+      if (ch === "'" && prox === "'") {
+        atual += prox;
+        i++;
+      } else if (ch === "'") {
+        aspasSimples = false;
+      }
+      continue;
+    }
+
+    if (aspasDuplas) {
+      atual += ch;
+      if (ch === '"' && prox === '"') {
+        atual += prox;
+        i++;
+      } else if (ch === '"') {
+        aspasDuplas = false;
+      }
+      continue;
+    }
+
+    if (ch === "'") {
+      aspasSimples = true;
+      atual += ch;
+      continue;
+    }
+    if (ch === '"') {
+      aspasDuplas = true;
+      atual += ch;
+      continue;
+    }
+    if (ch === "(") profundidade++;
+    if (ch === ")" && profundidade > 0) profundidade--;
+
+    if (profundidade === 0) {
+      const resto = where.slice(i);
+      const m = resto.match(/^\s+AND\s+/i);
+      if (m) {
+        if (atual.trim()) partes.push(atual.trim());
+        atual = "";
+        i += m[0].length - 1;
+        continue;
+      }
+    }
+
+    atual += ch;
+  }
+
+  if (atual.trim()) partes.push(atual.trim());
+  return partes;
+}
+
+function substituirIdentificadorStatus(sql = "", novo = "status_original") {
+  const s = String(sql || "");
+  let out = "";
+  let i = 0;
+  let aspasSimples = false;
+  let aspasDuplas = false;
+
+  while (i < s.length) {
+    const ch = s[i];
+    const prox = s[i + 1];
+
+    if (aspasSimples) {
+      out += ch;
+      if (ch === "'" && prox === "'") {
+        out += prox;
+        i += 2;
+        continue;
+      }
+      if (ch === "'") aspasSimples = false;
+      i++;
+      continue;
+    }
+
+    if (aspasDuplas) {
+      out += ch;
+      if (ch === '"' && prox === '"') {
+        out += prox;
+        i += 2;
+        continue;
+      }
+      if (ch === '"') aspasDuplas = false;
+      i++;
+      continue;
+    }
+
+    if (ch === "'") {
+      aspasSimples = true;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      aspasDuplas = true;
+      out += ch;
+      i++;
+      continue;
+    }
+
+    const trecho = s.slice(i);
+    const m = trecho.match(/^status\b(?!_original)/i);
+    const anterior = i > 0 ? s[i - 1] : "";
+    if (m && !/[A-Za-z0-9_$]/.test(anterior)) {
+      out += novo;
+      i += m[0].length;
+      continue;
+    }
+
+    out += ch;
+    i++;
+  }
+
+  return out;
+}
+
+function segmentoUsaStatusCanonico(segmento = "") {
+  return /\bstatus\b(?!_original)/i.test(String(segmento || ""));
+}
+
+function statusPadraoObraDoSegmento(segmento = "") {
+  const bruto = String(segmento || "");
+  if (!segmentoUsaStatusCanonico(bruto)) return null;
+
+  // Condicoes compostas (IN/OR) sao tratadas como status especifico para nao
+  // perder parte da logica ao tentar converter tudo para um unico booleano.
+  if (/\bin\s*\(/i.test(bruto) || /\bor\b/i.test(bruto)) return null;
+
+  const n = normalizar(bruto);
+  const negado = /\bnot\b/i.test(bruto) || /<>|!=/.test(bruto) || /\bnao\b/.test(n);
+
+  if (/\bem andamento\b/.test(n)) {
+    return { campo: "em_andamento_obra", valor: negado ? false : true };
+  }
+  if (/\bconclu(?:id|i)/.test(n)) {
+    return { campo: "concluido", valor: negado ? false : true };
+  }
+  return null;
+}
+
+function corrigirStatusPorUniverso(pergunta = "", historico = [], sql = "", ctx = null) {
+  let s = limparSQL(sql);
+  if (!s) return s;
+
+  const colunas = nomesColunasContexto(ctx);
+  const temStatusOriginal = colunas.size === 0 || colunas.has("status_original");
+  const temEmAndamento = colunas.size === 0 || colunas.has("em_andamento_obra");
+  const temConcluido = colunas.size === 0 || colunas.has("concluido");
+
+  const perguntaBase = followUpSomenteReferencia(pergunta)
+    ? ultimaPerguntaUsuario(historico)
+    : pergunta;
+  const universo = universoPelaSQL(s) || universoNegocioDaPergunta(perguntaBase);
+  if (!universo) return s;
+
+  // PROJETOS e LICITACOES: status_original e a fonte autoritativa da etapa/status
+  // real da aba. Isso vale tanto para SELECT quanto para WHERE/GROUP/ORDER.
+  if ((universo === "projeto" || universo === "licitacao") && temStatusOriginal) {
+    return substituirIdentificadorStatus(s, "status_original");
+  }
+
+  if (universo !== "obra") return s;
+
+  const whereAtual = extrairWhereSimples(s);
+  let usavaStatusCanonico = segmentoUsaStatusCanonico(s);
+
+  if (whereAtual) {
+    const partes = dividirWherePorAndTopo(whereAtual);
+    if (partes.length) {
+      const novas = partes.map((segmento) => {
+        if (!segmentoUsaStatusCanonico(segmento)) return segmento;
+
+        const padrao = statusPadraoObraDoSegmento(segmento);
+        if (padrao?.campo === "em_andamento_obra" && temEmAndamento) {
+          return `em_andamento_obra = ${padrao.valor ? "true" : "false"}`;
+        }
+        if (padrao?.campo === "concluido" && temConcluido) {
+          return `concluido = ${padrao.valor ? "true" : "false"}`;
+        }
+
+        // Paralisada, Retomada e qualquer outro status especifico da obra.
+        return temStatusOriginal
+          ? substituirIdentificadorStatus(segmento, "status_original")
+          : segmento;
+      });
+      s = substituirWhereSimples(s, novas.join(" AND "));
+    }
+  }
+
+  // Mesmo quando a IA nao colocou um filtro de status, a pergunta pode ter
+  // pedido explicitamente "obras em andamento"/"obras concluidas". Reforcamos
+  // os booleanos normalizados para abranger EM_ANDAMENTO e PAVIMENTACAO juntas.
+  const p = normalizar(perguntaBase);
+  if (/\bem andamento\b/.test(p) && temEmAndamento && !/\bem_andamento_obra\b/i.test(s)) {
+    s = adicionarCondicaoWhere(s, "em_andamento_obra = true");
+  }
+  if (/\bconclu(?:id|i)/.test(p) && temConcluido && !/\bconcluido\b/i.test(s)) {
+    s = adicionarCondicaoWhere(s, "concluido = true");
+  }
+
+  // Se restou alguma referencia generica a status (SELECT, GROUP BY, ORDER BY
+  // ou um filtro especifico), mostre/use o status real da origem.
+  if (temStatusOriginal && (usavaStatusCanonico || /\b(status|situacao|situação|etapa)\b/.test(p))) {
+    s = substituirIdentificadorStatus(s, "status_original");
+  }
+
+  return limparSQL(s);
+}
+
 function corrigirRankingValorTotalPorEntidade(pergunta = "", sql = "") {
   const p = normalizar(pergunta);
   let s = limparSQL(sql);
@@ -641,31 +941,49 @@ function schemaParaPrompt(ctx) {
 
 function regrasNegocio(ctx) {
   if (ctx.temViewSemantica) {
-    return `REGRAS DE NEGOCIO DA VIEW:\n` +
-      `- Use SOMENTE public.obras_chatbot.\n` +
-      `- tipo_negocio='obra' representa as obras fisicas e pavimentacoes do chatbot.\n` +
-      `- tipo_negocio='projeto' representa somente projetos.\n` +
-      `- tipo_negocio='licitacao' representa somente licitacoes.\n` +
-      `- subtipo_negocio='pavimentacao' identifica especificamente pavimentacoes.\n` +
-      `- Para 'obras em andamento', use tipo_negocio='obra' AND em_andamento_obra = true.\n` +
-      `- 'concluido' e um booleano normalizado quando existir.\n` +
-      `- recurso e tipo_recurso SAO conceitos diferentes. Nunca substitua um pelo outro.\n` +
-      `- UBS, escola, creche, praca, mercado, campo, drenagem, quadra, rua etc. sao assuntos/alvos no objeto. Se o usuario nao disser projeto ou licitacao, trate esses alvos como obras.\n` +
-      `- Dados como status, valores, engenheiro e empresa sao mutaveis: sempre leia o banco atual.\n`;
+    return `REGRAS DE NEGOCIO OFICIAIS DA VIEW (OBRIGATORIAS):\n` +
+      `1) UNIVERSOS / ABAS\n` +
+      `- EM_ANDAMENTO e PAVIMENTACAO -> tipo_negocio='obra'.\n` +
+      `- EM_PROJETO -> tipo_negocio='projeto'.\n` +
+      `- EM_LICITACAO -> tipo_negocio='licitacao'.\n` +
+      `- subtipo_negocio='pavimentacao' identifica as pavimentacoes dentro de obra.\n` +
+      `- Se o usuario citar UM unico universo (obra, projeto ou licitacao), BLOQUEIE TODA a SQL nesse tipo_negocio: SELECT principal, CTEs, subqueries, UNIONs, filtros e agregacoes. NAO troque de universo so porque ele pediu outro campo.\n` +
+      `- So misture universos se o usuario pedir explicitamente mais de um, por exemplo comparar obras e projetos.\n` +
+      `- Pedido composto no mesmo universo e UMA consulta do mesmo conjunto: "engenheiros dos projetos e quais projetos" = objeto + engenheiro de tipo_negocio='projeto'. NAO crie um CTE de engenheiros e outro de obras, NAO use UNION e NAO perca a associacao entre registro e campo.\n\n` +
+      `2) STATUS / SITUACAO\n` +
+      `- Obra em andamento -> em_andamento_obra = true.\n` +
+      `- Obra concluida -> concluido = true.\n` +
+      `- Outro status especifico de obra (Paralisada, Retomada etc.) -> status_original.\n` +
+      `- Projeto: TODO status especifico e status_original (Em elaboração, Em revisão, Aguardando aprovação, Concluído etc.).\n` +
+      `- Licitacao: etapa/status real e status_original (Edital publicado, Habilitação em andamento, Homologada etc.).\n` +
+      `- Se pedir "qual o status" de projeto/licitacao, retorne status_original. Em obra, use booleanos para filtrar ciclo e status_original para mostrar a descricao humana quando existir.\n\n` +
+      `3) ANALISE DE LICITACAO\n` +
+      `- Proposta analisada/nao analisada -> EXCLUSIVAMENTE dados_extras->>'PROPOSTA ANALISADA'.\n` +
+      `- Habilitacao analisada/nao analisada -> EXCLUSIVAMENTE dados_extras->>'HABILITAÇÃO ANALISADA'.\n` +
+      `- Nunca deduza proposta/habilitacao por status ou status_original.\n\n` +
+      `4) CAMPOS E ASSOCIACAO\n` +
+      `- objeto = nome da obra/projeto/licitacao no chatbot. engenheiro = responsavel. recurso e tipo_recurso sao conceitos diferentes.\n` +
+      `- Quando o usuario pedir varios campos do mesmo conjunto (nome + engenheiro, nome + valor, nome + recurso, nome + status), retorne UMA LINHA POR REGISTRO com objeto + todos os campos pedidos. Preserve a associacao.\n` +
+      `- DISTINCT de um campo sozinho so quando ele pedir explicitamente valores unicos/nomes unicos, sem precisar saber a qual registro pertencem.\n` +
+      `- Campos nao canonicos podem existir em dados_extras; use a CHAVE REAL exibida pelo schema, sem substituir por um campo apenas parecido.\n\n` +
+      `5) VALORES / CALCULOS / RANKINGS\n` +
+      `- Valor total investido de um conjunto -> SUM(valor_total), salvo pedido explicito por valor executado/pago.\n` +
+      `- Quanto falta -> valor_total - valor_executado quando disponiveis.\n` +
+      `- Ranking de entidade por valor total (engenheiro/empresa/bairro) -> GROUP BY entidade + SUM(valor_total), nunca MAX(valor_total).\n` +
+      `- Ranking por quantidade -> GROUP BY entidade + COUNT(*).\n` +
+      `- ORDER BY numerico deve usar NULLS LAST; nao deixe NULL ganhar ranking.\n\n` +
+      `6) SEMANTICA DE ASSUNTO\n` +
+      `- UBS, unidade basica de saude, posto, PSF, escola, creche, praca, mercado, campo, drenagem, quadra, rua etc. sao alvos/assuntos. Sem projeto/licitacao explicitos, trate-os como obras.\n` +
+      `- Saude: somente equipamentos/servicos claramente de saude. Creche e escola sao educacao, nao saude.\n` +
+      `- Nao invente nomes, status, bairros, responsaveis, empresas, recursos ou valores. Sempre leia o banco atual.\n` +
+      `- Use SOMENTE public.obras_chatbot.\n`;
   }
   return `REGRAS DE NEGOCIO DA TABELA LEGADA:\n` +
     `- Use SOMENTE public.obras.\n` +
-    `- 'obras' = aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO').\n` +
-    `- 'projetos' = aba_origem='EM_PROJETO'.\n` +
-    `- 'licitacoes' = aba_origem='EM_LICITAÇÃO'.\n` +
-    `- 'pavimentacoes' = aba_origem='PAVIMENTAÇÃO'.\n` +
-    `- 'obras em andamento' inclui EM_ANDAMENTO com status de andamento E PAVIMENTAÇÃO com status de execucao/andamento.\n` +
-    `- UBS, escola, creche, praca, mercado, campo, drenagem, quadra, rua etc. sao assuntos do objeto; sem projeto/licitacao explicitos, procure somente no universo de obras.\n` +
-    `- recurso e tipo de recurso podem estar em dados_extras e nao devem ser confundidos.\n` +
-    `- RANKING/EXTREMOS ("mais avancada", "maior", "menor", "mais caro", "menos executado"): ` +
-    `ao ordenar por percentual_executado, valor_total, valor_executado etc., use sempre ` +
-    `"ORDER BY campo DESC NULLS LAST" (ou ASC NULLS LAST) e adicione "AND campo IS NOT NULL" ` +
-    `no WHERE, para que obras com o valor vazio NUNCA ganhem o topo do ranking.\n`;
+    `- obras = aba_origem IN ('EM_ANDAMENTO','PAVIMENTAÇÃO'). projetos = EM_PROJETO. licitacoes = EM_LICITAÇÃO.\n` +
+    `- Se o usuario citar um unico universo, mantenha TODA a consulta nesse universo; so misture quando ele pedir comparacao explicita.\n` +
+    `- Pedidos de varios campos do mesmo registro devem retornar uma linha por registro, preservando associacoes.\n` +
+    `- recurso e tipo_recurso nao sao a mesma coisa.\n`;
 }
 
 // ------------------------------------------------------------
@@ -684,6 +1002,8 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `- Se o usuario disser 'em geral/no total', remova filtros de status/andamento herdados quando eles apenas limitavam o conjunto anterior, mas preserve entidades explicitamente referenciadas, principalmente a pessoa apontada por ele/ela/dele/dela.\n` +
     `- PRONOME DE PESSOA: se a resposta anterior identificou um engenheiro/arquiteto e o usuario perguntar 'ela tem quantas obras em geral?', 'quais obras ela tem?', 'e os projetos dele?' etc., filtre pelo mesmo engenheiro/responsavel. Nunca transforme isso em contagem de toda a base.\n\n` +
     `REGRAS SQL:\n` +
+    `- UNIVERSO BLOQUEADO: se REGRAS DE NEGOCIO identificarem um unico universo, TODAS as partes da SQL devem usar somente esse universo. Campos diferentes pedidos pelo usuario NAO autorizam trocar projeto por obra, obra por licitacao etc.\n` +
+    `- PEDIDO COMPOSTO: se o usuario pedir nome dos registros + responsavel/status/recurso/valor/etc., prefira um unico SELECT com objeto + campos pedidos. Nao separe em listas por UNION quando os dados pertencem aos mesmos registros.\n` +
     `- Apenas SELECT ou WITH ... SELECT. Nunca escreva dados.\n` +
     `- Consulte SOMENTE public.${ctx.relacao}.\n` +
     `- Nao consulte information_schema, pg_catalog, auth, storage ou outras tabelas.\n` +
@@ -702,8 +1022,6 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `- Se houver coluna canonica E chave JSON com sentidos diferentes, preserve a semantica pedida pelo usuario e escolha a fonte que corresponde ao nome/conceito solicitado.\n` +
     `- Para 'valor total investido' de um conjunto, some valor_total, salvo quando o usuario pedir explicitamente valor executado/pago.\n` +
     `- Para 'quanto falta', use valor_total - valor_executado quando essas colunas existirem.\n` +
-    `- 'status de X' pede o campo status do alvo X; nao transforme a palavra status em filtro.\n` +
-    `- LICITACOES E ETAPA REAL: ao listar/detalhar licitacoes ou responder sobre seu status, se a coluna status_original existir selecione status_original junto de status. status_original representa a etapa especifica cadastrada (ex.: Habilitacao em andamento, Edital publicado) e deve ser preferida na resposta ao rotulo generico 'Em licitacao'.\n` +
     `- Nao invente valores de status, nomes, bairros, engenheiros ou empresas; use os valores reais do schema/contexto.\n` +
     `- LIGACAO SEMANTICA: quando o usuario pedir uma CLASSE ou CONCEITO amplo (sigla, tipo de equipamento, servico ou categoria), nao filtre apenas a palavra literal. Considere abreviacoes, forma por extenso e sinonimos realmente equivalentes em portugues e compare com o CATALOGO DE OBJETOS REAIS. Use OR com ILIKE apenas para equivalencias semanticamente justificadas.\n` +
     `- AREA DA SAUDE: considere apenas equipamentos/servicos claramente de saude, como UBS/unidade basica de saude, posto de saude, PSF, hospital, policlinica, unidade de saude e academia da saude quando existirem no catalogo real. CRECHE e ESCOLA pertencem a educacao e NAO devem entrar como saude apenas por inferencia. Nunca invente nomes de equipamentos para completar uma categoria.\n` +
@@ -858,8 +1176,16 @@ function resultadoSoComCamposVazios(rows = []) {
   return !temAlgumValor;
 }
 
+function aplicarGuardrailsNegocio(pergunta = "", historico = [], sql = "", ctx = null) {
+  let s = limparSQL(sql);
+  s = garantirUniversoNegocio(pergunta, historico, s);
+  s = corrigirStatusPorUniverso(pergunta, historico, s, ctx);
+  s = garantirUniversoNegocio(pergunta, historico, s); // revalida apos ajuste de status
+  return limparSQL(s);
+}
+
 async function executarComSelfHealing({ pergunta, historico, ctx, sqlInicial }) {
-  let sqlAtual = limparSQL(sqlInicial);
+  let sqlAtual = aplicarGuardrailsNegocio(pergunta, historico, sqlInicial, ctx);
   let melhor = null; // melhor consulta executada (inclusive vazia)
   const tentativas = [];
 
@@ -876,11 +1202,32 @@ async function executarComSelfHealing({ pergunta, historico, ctx, sqlInicial }) 
         erro: { tipo: "GuardrailError", mensagem: validacao.motivo },
       });
       if (!reparo.query || limparSQL(reparo.query) === sqlAtual) break;
-      sqlAtual = limparSQL(reparo.query);
+      sqlAtual = aplicarGuardrailsNegocio(pergunta, historico, reparo.query, ctx);
       continue;
     }
 
     try {
+      // Regra de negocio: campos do mesmo conjunto devem permanecer associados
+      // na mesma linha. Se ainda restou UNION numa pergunta composta de universo
+      // unico, tenta reparar antes de executar.
+      if (pedidoCompostoMesmoUniverso(pergunta, validacao.sql) && tentativa < MAX_REPAROS) {
+        const reparoNegocio = await repararSQL({
+          pergunta,
+          historico,
+          ctx,
+          sqlAtual: validacao.sql,
+          erro: {
+            tipo: "BusinessRuleError",
+            mensagem: "Pedido composto do mesmo universo nao deve separar nomes e atributos por UNION. Retorne uma linha por registro com objeto + todos os campos pedidos e preserve o mesmo tipo_negocio em toda a SQL."
+          },
+        });
+        const candidataNegocio = limparSQL(reparoNegocio.query);
+        if (candidataNegocio && candidataNegocio !== validacao.sql) {
+          sqlAtual = aplicarGuardrailsNegocio(pergunta, historico, candidataNegocio, ctx);
+          continue;
+        }
+      }
+
       const sqlExecucao = aplicarLimite(validacao.sql);
       const r = await queryReadOnly(sqlExecucao);
       const rows = r.rows || [];
@@ -910,7 +1257,7 @@ async function executarComSelfHealing({ pergunta, historico, ctx, sqlInicial }) 
         });
         const candidata = limparSQL(reparo.query);
         if (!candidata || candidata === validacao.sql) break;
-        sqlAtual = candidata;
+        sqlAtual = aplicarGuardrailsNegocio(pergunta, historico, candidata, ctx);
         continue;
       }
 
@@ -920,7 +1267,7 @@ async function executarComSelfHealing({ pergunta, historico, ctx, sqlInicial }) 
       const reparo = await repararSQL({ pergunta, historico, ctx, sqlAtual: validacao.sql, linhas: rows });
       const candidata = limparSQL(reparo.query);
       if (!candidata || candidata === validacao.sql) break;
-      sqlAtual = candidata;
+      sqlAtual = aplicarGuardrailsNegocio(pergunta, historico, candidata, ctx);
     } catch (e) {
       const diag = diagnosticoErroPG(e);
       tentativas.push({ tentativa, sql: validacao.sql, ok: false, erro: diag });
@@ -928,7 +1275,7 @@ async function executarComSelfHealing({ pergunta, historico, ctx, sqlInicial }) 
       const reparo = await repararSQL({ pergunta, historico, ctx, sqlAtual: validacao.sql, erro: diag });
       const candidata = limparSQL(reparo.query);
       if (!candidata || candidata === validacao.sql) break;
-      sqlAtual = candidata;
+      sqlAtual = aplicarGuardrailsNegocio(pergunta, historico, candidata, ctx);
     }
   }
 
@@ -1385,7 +1732,8 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx, analiseDados
     `Exemplo correto: "1. Reforma e ampliacao da UBS do Cristo Rei — Recurso: FEDERAL". Exemplo proibido: "1. id: 3 — objeto: Reforma...".\n` +
     `Diferencie obra, projeto e licitacao conforme os campos da view/tabela. Se tipo_negocio='licitacao', chame os registros de licitacoes, nunca de obras.\n` +
     `PERCENTUAL: percentual_executado e percentual de EXECUCAO. Escreva sempre 'X% executado' ou 'X% de execucao'. NUNCA escreva 'X% concluido' para uma obra que ainda esta em andamento.\n` +
-    `LICITACAO: se status_original vier no resultado, use-o como etapa/status especifico da licitacao (ex.: 'Habilitacao em andamento', 'Edital publicado'). Nao esconda essa etapa atras do rotulo generico 'Em licitacao'.\n` +
+    `STATUS REAL: se status_original vier no resultado, ele e a descricao real da origem e deve ser preferido ao rotulo generico status. Isso vale especialmente para projetos e licitacoes e para status especificos de obras.\n` +
+    `OBRAS: em_andamento_obra/concluido servem para FILTRAR o ciclo da obra; na resposta ao usuario, mostre o texto humano de status_original quando ele estiver disponivel.\n` +
     `Recurso e tipo_recurso sao campos diferentes; nao troque um pelo outro.\n` +
     `Nao mostre SQL ao usuario na resposta natural.\n\n` +
     `PERGUNTA: ${JSON.stringify(pergunta)}\n` +
@@ -1493,6 +1841,24 @@ export async function responderPergunta(pergunta, historico = []) {
       if (refinada.query) gerada = refinada;
     }
 
+    // Regra-mestra: se a pergunta esta bloqueada em um unico universo e a IA
+    // misturou obra/projeto/licitacao ou separou campos do mesmo conjunto por
+    // UNION, pede uma nova SQL antes de executar.
+    const universoEsperadoInicial = universoNegocioDaPergunta(texto);
+    const universosSQLInicial = universosEncontradosNaSQL(gerada.query);
+    const misturaUniversoInicial = universoEsperadoInicial && universosSQLInicial.some((u) => u !== universoEsperadoInicial);
+    const compostoSeparadoInicial = pedidoCompostoMesmoUniverso(texto, gerada.query);
+    if (misturaUniversoInicial || compostoSeparadoInicial) {
+      const refinada = await gerarSQL(
+        texto, historico, ctx,
+        `REGRA DE NEGOCIO OBRIGATORIA: o universo atual e ${universoEsperadoInicial}. ` +
+        `Toda a consulta deve permanecer nesse mesmo tipo_negocio. O usuario pediu informacoes/campos do MESMO conjunto. ` +
+        `Use UMA linha por registro com objeto + todos os campos pedidos (por exemplo responsavel/engenheiro, status, recurso, valor). ` +
+        `Nao use UNION para separar nomes e atributos e nao consulte outro universo, salvo se a pergunta citar explicitamente mais de um universo.`
+      );
+      if (refinada.query) gerada = refinada;
+    }
+
     if (existencialComAgregadoSeco(texto, gerada.query)) {
       const refinada = await gerarSQL(
         texto, historico, ctx,
@@ -1526,6 +1892,15 @@ export async function responderPergunta(pergunta, historico = []) {
       gerada = { ...gerada, query: sqlRankingTotalCorrigido };
     }
 
+    // Guardrail universal de status por aba/universo. Corrige projetos e
+    // licitacoes para status_original; em obras usa os booleanos normalizados
+    // para "em andamento"/"concluida" e status_original nos demais status.
+    const sqlStatusCorrigido = corrigirStatusPorUniverso(texto, historico, gerada.query, ctx);
+    if (sqlStatusCorrigido && sqlStatusCorrigido !== limparSQL(gerada.query)) {
+      console.log("SQL AGENT - STATUS CORRIGIDO PELO MAPA DE UNIVERSOS");
+      gerada = { ...gerada, query: sqlStatusCorrigido };
+    }
+
     // Protecao de continuidade: em perguntas puramente referenciais (ex.:
     // "quais sao?"), restaura o WHERE do ultimo recorte confirmado. Isso evita
     // misturar obra/projeto/licitacao quando a IA simplifica demais a SQL.
@@ -1541,6 +1916,14 @@ export async function responderPergunta(pergunta, historico = []) {
     if (sqlComUniverso && sqlComUniverso !== limparSQL(gerada.query)) {
       console.log("SQL AGENT - UNIVERSO DE NEGOCIO CORRIGIDO");
       gerada = { ...gerada, query: sqlComUniverso };
+    }
+
+    // Segunda passagem depois de garantir o universo: importante quando a IA
+    // esquece tipo_negocio e ele e adicionado pelo guardrail acima.
+    const sqlStatusFinal = corrigirStatusPorUniverso(texto, historico, gerada.query, ctx);
+    if (sqlStatusFinal && sqlStatusFinal !== limparSQL(gerada.query)) {
+      console.log("SQL AGENT - STATUS REVALIDADO APOS UNIVERSO");
+      gerada = { ...gerada, query: sqlStatusFinal };
     }
 
     console.log("SQL AGENT - SQL INICIAL:", gerada.query);
@@ -1570,7 +1953,7 @@ export async function responderPergunta(pergunta, historico = []) {
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
       tentativas: execucao.tentativas,
-      modoAgente: "sql_agent_self_healing_v13_ram30",
+      modoAgente: "sql_agent_self_healing_v13_status_universal",
     };
   } catch (e) {
     console.error("SQL AGENT: falha final:", e);
