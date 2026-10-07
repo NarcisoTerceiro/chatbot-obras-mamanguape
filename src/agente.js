@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - AGENTE GOOGLE SHEETS COM FERRAMENTAS (SEM SQL)
+// agente.js - AGENTE GOOGLE SHEETS COM FERRAMENTAS (SEM SQL) - V3 LOCALIDADE + ESCOPO
 // ============================================================
 // Inspirado no padrao de agentes de planilha do n8n:
 // - a IA entende a pergunta e escolhe uma ferramenta;
@@ -153,6 +153,38 @@ function formatarValorCampo(campo, v) {
   return texto(v);
 }
 
+function capitalizarRotuloDimensao(v, conceito = "") {
+  const original = texto(v).replace(/\s+/g, " ");
+  if (!original) return original;
+
+  // Para dimensoes de localidade, padroniza caixa sem alterar o conteudo.
+  // Ex.: AREAL -> Areal; PITANGA DA ESTRADA -> Pitanga da Estrada.
+  const c = normalizar(conceito);
+  if (!(c.includes("bairro") || c.includes("localidade"))) return original;
+
+  const minusculas = new Set(["da", "de", "do", "das", "dos", "e"]);
+  return original
+    .toLocaleLowerCase("pt-BR")
+    .split(" ")
+    .map((palavra, idx) => {
+      if (!palavra) return palavra;
+      if (idx > 0 && minusculas.has(palavra)) return palavra;
+      return palavra.charAt(0).toLocaleUpperCase("pt-BR") + palavra.slice(1);
+    })
+    .join(" ");
+}
+
+function unidadeDoEscopo(escopo) {
+  const lista = Array.isArray(escopo) ? escopo : [escopo].filter(Boolean);
+  const unicos = unico(lista.map(normalizar));
+  if (unicos.length !== 1) return { singular: "registro", plural: "registros" };
+  if (unicos[0] === "obra") return { singular: "obra", plural: "obras" };
+  if (unicos[0] === "projeto") return { singular: "projeto", plural: "projetos" };
+  if (unicos[0] === "licitacao") return { singular: "licitação", plural: "licitações" };
+  if (unicos[0] === "pavimentacao") return { singular: "pavimentação", plural: "pavimentações" };
+  return { singular: "registro", plural: "registros" };
+}
+
 // ------------------------------------------------------------
 // Semantica minima de abas/campos.
 // Isto NAO e regex por pergunta. E apenas o dicionario da fonte de dados.
@@ -170,6 +202,8 @@ const ALIASES_CAMPOS = {
     "obra", "descricao da obra", "descricao", "servico", "nome do projeto",
   ],
   bairro: ["bairro"],
+  localidade: ["localidade", "comunidade", "distrito", "loteamento"],
+  rua: ["rua", "logradouro", "via", "avenida"],
   endereco: ["endereco", "logradouro", "local", "localizacao"],
   status: ["status", "situacao", "situacao atual", "andamento"],
   engenheiro: ["engenheiro", "engenheiro responsavel", "responsavel tecnico", "responsavel"],
@@ -341,7 +375,39 @@ function linhaContemTermo(row, termo, camposBusca = []) {
   return campos.some((campo) => normalizar(valorCampo(row, campo)).includes(t));
 }
 
+const TERMOS_GENERICOS_ESCOPO = {
+  obra: ["obra", "obras", "obra publica", "obras publicas"],
+  projeto: ["projeto", "projetos"],
+  licitacao: ["licitacao", "licitacoes", "processo licitatorio", "processos licitatorios", "certame", "certames"],
+  pavimentacao: ["pavimentacao", "pavimentacoes"],
+};
+
+function sanitizarArgsDeEscopo(args = {}) {
+  const a = { ...args };
+  const escopos = unico(Array.isArray(a.escopo) ? a.escopo : [a.escopo].filter(Boolean)).map(normalizar);
+  const genericos = new Set();
+  for (const e of escopos) {
+    for (const t of TERMOS_GENERICOS_ESCOPO[e] || []) genericos.add(normalizar(t));
+  }
+
+  const termos = unico(Array.isArray(a.termos) ? a.termos : [a.termos].filter(Boolean));
+  a.termos = termos.filter((t) => !genericos.has(normalizar(t)));
+
+  const filtros = Array.isArray(a.filtros) ? a.filtros : [];
+  a.filtros = filtros.filter((f) => {
+    const campo = normalizar(f?.campo || f?.field || "");
+    const valor = normalizar(f?.valor ?? f?.value ?? "");
+    const op = normalizar(f?.operador || f?.operator || "eq").replace(/ /g, "_");
+    const campoObjeto = ["objeto", "objeto da obra", "descricao", "nome"].includes(campo);
+    const opTexto = ["eq", "contains", "contem", "one_of", "in"].includes(op);
+    return !(campoObjeto && opTexto && genericos.has(valor));
+  });
+
+  return a;
+}
+
 function filtrarLinhas(rows, args = {}) {
+  args = sanitizarArgsDeEscopo(args);
   let out = [...(rows || [])];
   const escopos = unico(Array.isArray(args.escopo) ? args.escopo : [args.escopo].filter(Boolean));
   if (escopos.length) out = out.filter((r) => linhaNoEscopo(r, escopos));
@@ -372,6 +438,142 @@ function ordenarLinhas(rows, ordenarPor, direcao = "asc") {
     if (na !== null && nb !== null) return (na - nb) * dir;
     return texto(va).localeCompare(texto(vb), "pt-BR", { sensitivity: "base" }) * dir;
   });
+}
+
+// ------------------------------------------------------------
+// Extracao deterministica de bairro/localidade.
+// Nao inventa: usa apenas texto existente na propria linha.
+// ------------------------------------------------------------
+function valorColunaExata(row, nomes = []) {
+  const desejados = new Set(nomes.map(normalizar));
+  for (const [k, v] of Object.entries(row || {})) {
+    if (k === "_aba") continue;
+    if (desejados.has(normalizar(k)) && texto(v)) return texto(v);
+  }
+  return "";
+}
+
+function ehDescricaoLocalGenerica(v = "") {
+  const n = normalizar(v);
+  if (!n) return true;
+  const genericos = [
+    "diversas ruas", "ruas diversas", "diversas localidades", "localidades rurais",
+    "zona rural", "zona urbana", "estradas diversas", "varias ruas", "várias ruas",
+    "todo municipio", "todo o municipio", "municipio de mamanguape", "margens da br",
+    "trecho 01", "trecho 1", "trecho 02", "trecho 2"
+  ].map(normalizar);
+  return genericos.some((g) => n === g || n.includes(g));
+}
+
+function ehTrechoEndereco(v = "") {
+  const n = normalizar(v);
+  if (!n) return true;
+  if (/^(s n|sn|s\/n|n|numero|nº|no)\b/.test(n)) return true;
+  if (/^\d+[a-z]?$/.test(n)) return true;
+  if (/^(pb|paraiba|mamanguape|mamanguape pb)$/.test(n)) return true;
+  if (/^(rua|r |avenida|av |travessa|rodovia|br |estrada|sitio|sítio)\b/.test(n)) return true;
+  return false;
+}
+
+function limparRotuloLocalidade(v = "") {
+  let s = texto(v)
+    .replace(/^bairro\s*[:\-]\s*/i, "")
+    .replace(/^localidade\s*[:\-]\s*/i, "")
+    .replace(/\s*-\s*pb\s*$/i, "")
+    .replace(/^[,;\-\s]+|[,;\-\s]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!s || ehDescricaoLocalGenerica(s) || ehTrechoEndereco(s)) return "";
+  return capitalizarRotuloDimensao(s, "bairro");
+}
+
+function extrairLocalidadeDeTexto(bruto = "", { permitirValorInteiro = false } = {}) {
+  const original = texto(bruto);
+  if (!original) return "";
+
+  // Evidencia explicita vence descricoes genericas ao redor.
+  // Ex.: "Diversas Ruas; Bairro: Centro e Gurguri; s/n".
+  let m = original.match(/\bbairro\s*[:\-]\s*([^;|]+)/i);
+  if (m?.[1]) {
+    const r = limparRotuloLocalidade(m[1]);
+    if (r) return r;
+  }
+
+  if (ehDescricaoLocalGenerica(original)) return "";
+
+  // Evidencia explicita em nomes/descricoes: preserva o nome completo da localidade.
+  m = original.match(/\b((?:bairro|distrito\s+de|loteamento|comunidade)\s+[^,;|\-]{2,80})/i);
+  if (m?.[1]) {
+    const r = limparRotuloLocalidade(m[1]);
+    if (r) return r;
+  }
+
+  // Endereco no formato "Rua X, s/n - Centro" ou "Rua X - Bela Vista".
+  const partesHifen = original.split(/\s+-\s+/).map(texto).filter(Boolean);
+  if (partesHifen.length >= 2) {
+    for (let i = partesHifen.length - 1; i >= 1; i--) {
+      const candidato = limparRotuloLocalidade(partesHifen[i]);
+      if (candidato && !ehTrechoEndereco(candidato)) return candidato;
+    }
+  }
+
+  // Endereco no formato "Rua X, S/N, Centro, Mamanguape - PB".
+  const semCidade = original
+    .replace(/,?\s*Mamanguape\s*(?:-\s*PB)?\s*$/i, "")
+    .replace(/,?\s*PB\s*$/i, "");
+  const partes = semCidade.split(/[,;]/).map(texto).filter(Boolean);
+  if (partes.length >= 2) {
+    for (let i = partes.length - 1; i >= 0; i--) {
+      const p = partes[i];
+      if (ehTrechoEndereco(p) || ehDescricaoLocalGenerica(p)) continue;
+      const candidato = limparRotuloLocalidade(p);
+      if (candidato) return candidato;
+    }
+  }
+
+  if (permitirValorInteiro) return limparRotuloLocalidade(original);
+  return "";
+}
+
+function bairroDerivadoDaLinha(row) {
+  // 1) Campo BAIRRO e a fonte preferida. Pode conter bairro puro ou endereco sujo.
+  const brutoBairro = valorColunaExata(row, ["bairro"]);
+  if (brutoBairro) {
+    const b = extrairLocalidadeDeTexto(brutoBairro, { permitirValorInteiro: true });
+    if (b) return { grupo: b, fonte: "bairro", bruto: brutoBairro };
+  }
+
+  // 2) Colunas de localidade explicitas.
+  const local = valorColunaExata(row, ["localidade", "comunidade", "distrito", "loteamento"]);
+  if (local) {
+    const b = extrairLocalidadeDeTexto(local, { permitirValorInteiro: true });
+    if (b) return { grupo: b, fonte: "localidade", bruto: local };
+  }
+
+  // 3) Pavimentacao normalmente guarda o bairro/localidade no proprio nome da RUA.
+  const rua = valorColunaExata(row, ["rua", "logradouro", "endereco", "endereço"]);
+  if (rua) {
+    const b = extrairLocalidadeDeTexto(rua, { permitirValorInteiro: false });
+    if (b) return { grupo: b, fonte: "rua/endereco", bruto: rua };
+  }
+
+  // 4) Ultimo recurso: apenas marcadores EXPLICITOS dentro do objeto.
+  const objeto = objetoDaLinha(row);
+  if (objeto) {
+    const b = extrairLocalidadeDeTexto(objeto, { permitirValorInteiro: false });
+    if (b) return { grupo: b, fonte: "objeto", bruto: objeto };
+  }
+  return null;
+}
+
+function grupoDimensaoDaLinha(row, campo, normalizarDimensao = false) {
+  const c = normalizar(campo);
+  if (normalizarDimensao && (c.includes("bairro") || c.includes("localidade"))) {
+    return bairroDerivadoDaLinha(row);
+  }
+  const bruto = valorCampo(row, campo);
+  const g = texto(bruto);
+  return g ? { grupo: g, fonte: campo, bruto: g } : null;
 }
 
 // ------------------------------------------------------------
@@ -437,7 +639,8 @@ function somaCamposDaLinha(row, campos) {
   return usados ? soma : null;
 }
 
-function ferramentaSomar(rows, args = {}) {
+async function ferramentaSomar(rows, args = {}) {
+  args = sanitizarArgsDeEscopo(args);
   const encontrados = filtrarLinhas(rows, args);
   const campos = unico(Array.isArray(args.campos) && args.campos.length ? args.campos : [args.campo].filter(Boolean));
   if (!campos.length) return { tipo: "erro_ferramenta", erro: "somar exige campo ou campos" };
@@ -445,23 +648,58 @@ function ferramentaSomar(rows, args = {}) {
   const agruparPor = args.agrupar_por;
   if (agruparPor) {
     const grupos = new Map();
+    let registrosComValor = 0;
+    let registrosIdentificados = 0;
+    let valorIdentificado = 0;
+    let valorNaoIdentificado = 0;
+
     for (const row of encontrados) {
-      const gBruto = valorCampo(row, agruparPor);
-      const g = texto(gBruto);
-      if (!g) continue;
       const val = somaCamposDaLinha(row, campos);
       if (val === null) continue;
-      const key = normalizar(g);
-      if (!grupos.has(key)) grupos.set(key, { grupo: g, valor: 0, registros: 0 });
+      registrosComValor += 1;
+
+      const infoGrupo = grupoDimensaoDaLinha(row, agruparPor, args.normalizar_dimensao === true);
+      if (!infoGrupo?.grupo) {
+        valorNaoIdentificado += val;
+        continue;
+      }
+
+      const rotulo = capitalizarRotuloDimensao(infoGrupo.grupo, args.conceito || agruparPor);
+      const key = normalizar(rotulo);
+      if (!key) {
+        valorNaoIdentificado += val;
+        continue;
+      }
+      if (!grupos.has(key)) grupos.set(key, { grupo: rotulo, valor: 0, registros: 0 });
       const obj = grupos.get(key);
       obj.valor += val;
       obj.registros += 1;
+      registrosIdentificados += 1;
+      valorIdentificado += val;
     }
+
     let itens = [...grupos.values()];
-    itens.sort((a, b) => (args.direcao === "asc" ? a.valor - b.valor : b.valor - a.valor));
+    itens.sort((a, b) => (normalizar(args.direcao || "desc") === "asc" ? a.valor - b.valor : b.valor - a.valor));
     const limite = Math.max(1, Math.min(Number(args.limite || MAX_LISTA), 100));
+    const totalGrupos = itens.length;
     itens = itens.slice(0, limite);
-    return { tipo: "soma_agrupada", total_registros: encontrados.length, campo_grupo: agruparPor, campos, itens };
+
+    return {
+      tipo: "soma_agrupada",
+      total_registros: encontrados.length,
+      registros_com_valor: registrosComValor,
+      registros_identificados: registrosIdentificados,
+      registros_nao_identificados: Math.max(0, registrosComValor - registrosIdentificados),
+      cobertura_percentual: registrosComValor ? Number(((registrosIdentificados / registrosComValor) * 100).toFixed(1)) : 0,
+      valor_identificado: valorIdentificado,
+      valor_nao_identificado: valorNaoIdentificado,
+      campo_grupo: agruparPor,
+      campos,
+      itens,
+      total_grupos: totalGrupos,
+      truncado: totalGrupos > limite,
+      normalizacao_aplicada: args.normalizar_dimensao === true,
+    };
   }
 
   let total = 0;
@@ -527,28 +765,56 @@ async function ferramentaAgrupar(rows, args = {}) {
   const grupos = new Map();
 
   for (const row of encontrados) {
-    const bruto = valorCampo(row, campo);
-    const g = texto(bruto);
+    const info = grupoDimensaoDaLinha(row, campo, args.normalizar_dimensao === true);
+    const g = texto(info?.grupo);
     if (!g) continue;
-    const key = normalizar(g);
-    if (!grupos.has(key)) grupos.set(key, { grupo: g, quantidade: 0 });
+    const rotulo = capitalizarRotuloDimensao(g, args.conceito || campo);
+    const key = normalizar(rotulo);
+    if (!grupos.has(key)) grupos.set(key, { grupo: rotulo, quantidade: 0 });
     grupos.get(key).quantidade += 1;
   }
 
-  let itens = [...grupos.values()];
+  const itensBrutos = [...grupos.values()];
+  const registrosComValorDimensao = itensBrutos.reduce((acc, x) => acc + (Number(x.quantidade) || 0), 0);
+  const registrosSemValorDimensao = Math.max(0, encontrados.length - registrosComValorDimensao);
+  let itens = [...itensBrutos];
+  let normalizacaoAplicada = args.normalizar_dimensao === true && (normalizar(args.conceito || campo).includes("bairro") || normalizar(campo).includes("bairro") || normalizar(args.conceito || campo).includes("localidade"));
+  let registrosIdentificados = registrosComValorDimensao;
+  let registrosNaoIdentificados = registrosSemValorDimensao;
 
-  if (args.normalizar_dimensao === true && itens.length) {
-    const mapeados = await normalizarDimensaoComIA(itens, args.conceito || campo);
+  const conceitoNorm = normalizar(args.conceito || campo);
+  const dimensaoLocalidade = conceitoNorm.includes("bairro") || conceitoNorm.includes("localidade") || normalizar(campo).includes("bairro");
+
+  if (args.normalizar_dimensao === true && itensBrutos.length && !dimensaoLocalidade) {
+    const conceito = args.conceito || campo;
+    const mapeados = await normalizarDimensaoComIA(itensBrutos, conceito);
     if (mapeados.length) {
+      normalizacaoAplicada = true;
       const canon = new Map();
+      const fontesMapeadas = new Set();
+
       for (const m of mapeados) {
-        const k = normalizar(m.canonico);
-        if (!canon.has(k)) canon.set(k, { grupo: m.canonico, quantidade: 0, fontes: [] });
+        const rotulo = capitalizarRotuloDimensao(m.canonico, conceito);
+        const k = normalizar(rotulo);
+        if (!k) continue;
+        if (!canon.has(k)) canon.set(k, { grupo: rotulo, quantidade: 0, fontes: [] });
         const c = canon.get(k);
         c.quantidade += m.quantidade;
         c.fontes.push(m.bruto);
+        fontesMapeadas.add(normalizar(m.bruto));
       }
+
       itens = [...canon.values()];
+      registrosIdentificados = itensBrutos
+        .filter((x) => fontesMapeadas.has(normalizar(x.grupo)))
+        .reduce((acc, x) => acc + (Number(x.quantidade) || 0), 0);
+      registrosNaoIdentificados = Math.max(0, encontrados.length - registrosIdentificados);
+    } else {
+      // Se a normalizacao foi pedida e nada pôde ser classificado com evidencia,
+      // nao apresenta os valores crus como se fossem dimensoes confiaveis.
+      itens = [];
+      registrosIdentificados = 0;
+      registrosNaoIdentificados = encontrados.length;
     }
   }
 
@@ -560,6 +826,11 @@ async function ferramentaAgrupar(rows, args = {}) {
   });
 
   const limite = Math.max(1, Math.min(Number(args.limite || MAX_LISTA), 100));
+  const unidade = unidadeDoEscopo(args.escopo);
+  const coberturaPercentual = encontrados.length
+    ? Number(((registrosIdentificados / encontrados.length) * 100).toFixed(1))
+    : 0;
+
   return {
     tipo: "agrupamento",
     campo,
@@ -567,6 +838,13 @@ async function ferramentaAgrupar(rows, args = {}) {
     total_grupos: itens.length,
     itens: itens.slice(0, limite),
     truncado: itens.length > limite,
+    unidade,
+    normalizacao_aplicada: normalizacaoAplicada,
+    registros_com_valor_dimensao: registrosComValorDimensao,
+    registros_sem_valor_dimensao: registrosSemValorDimensao,
+    registros_identificados: registrosIdentificados,
+    registros_nao_identificados: registrosNaoIdentificados,
+    cobertura_percentual: coberturaPercentual,
   };
 }
 
@@ -576,7 +854,7 @@ async function executarFerramenta(nome, rows, args = {}) {
     case "buscar_obras": return ferramentaBuscar(rows, args);
     case "contar_obras": return ferramentaContar(rows, args);
     case "agrupar_por": return await ferramentaAgrupar(rows, args);
-    case "somar": return ferramentaSomar(rows, args);
+    case "somar": return await ferramentaSomar(rows, args);
     default: return { tipo: "erro_ferramenta", erro: `Ferramenta desconhecida: ${nome}` };
   }
 }
@@ -654,7 +932,7 @@ FERRAMENTAS DISPONIVEIS:
    - conta registros ou valores distintos.
 4) agrupar_por({escopo, campo, termos, modo_termos, campos_busca, filtros, ordenar_por, direcao, limite, normalizar_dimensao, conceito})
    - agrupa e conta por uma dimensao. Para dimensoes textuais sujas como bairro/localidade, use normalizar_dimensao=true.
-5) somar({escopo, campo?, campos?, termos, modo_termos, campos_busca, filtros, agrupar_por?, direcao, limite})
+5) somar({escopo, campo?, campos?, termos, modo_termos, campos_busca, filtros, agrupar_por?, normalizar_dimensao?, conceito?, direcao, limite})
    - soma valores numericos. campos permite somar mais de uma coluna por registro quando o conceito exigir.
 6) responder
    - somente para saudacao, conversa social ou quando for indispensavel pedir esclarecimento.
@@ -677,7 +955,11 @@ SEMANTICA:
 - "valor pago" NAO e automaticamente "valor executado". Se houver colunas de pagamento, use as de pagamento.
 - Para "total investido" use valor total da obra/contrato, salvo se o usuario pedir outra metrica.
 - Nunca invente filtros, nomes, bairros, empresas, engenheiros ou valores.
+- ESCOLHA DA FERRAMENTA: buscar_obras serve para identificar/listar QUAIS registros atendem a uma condicao e/ou mostrar detalhes. agrupar_por serve SOMENTE para distribuicao por dimensao (ex.: quantos em cada bairro/status/engenheiro).
+- Portanto, se o usuario pedir quais registros estao em um status especifico (ex.: quais projetos estao concluidos), use buscar_obras + filtro de status; NAO use agrupar_por status.
 - Se uma pergunta pedir "bairros e quantidade", use agrupar_por campo=bairro e normalizar_dimensao=true.
+- Se pedir soma/valor por bairro ou localidade, use somar com agrupar_por="bairro", normalizar_dimensao=true e conceito="bairro". NUNCA agrupe valor financeiro pelo texto bruto de endereco.
+- Palavras que apenas nomeiam o universo ("obras", "projetos", "licitacoes") definem escopo; NAO as coloque em termos nem em filtro de objeto. Ex.: "quantas licitacoes existem?" = contar_obras({escopo:["licitacao"]}) sem termos.
 - Para um assunto literal como UBS, mercado, escola, drenagem etc., use termos e normalmente campos_busca=["objeto"].
 
 OPERADORES DE FILTRO: eq, neq, contains, not_contains, one_of, not_one_of, gt, gte, lt, lte, is_empty, not_empty.
@@ -768,13 +1050,51 @@ function formatarResultado(plano, resultado) {
       const val = resultado.campos?.some(pareceCampoDinheiro) ? formatarMoeda(x.valor) : formatarNumero(x.valor);
       return `*${i + 1}. ${x.grupo}* — ${val}`;
     });
-    return `📋 *${label}*\n\n${linhas.join("\n")}`;
+    const notas = [];
+    if (resultado.truncado) notas.push(`Mostrando ${resultado.itens.length} de ${resultado.total_grupos} grupos.`);
+    if (resultado.normalizacao_aplicada) {
+      notas.push(`Foram alocados com segurança ${resultado.registros_identificados} de ${resultado.registros_com_valor} registros com valor (${formatarNumero(resultado.cobertura_percentual)}% de cobertura).`);
+      if (resultado.registros_nao_identificados > 0) {
+        const vf = resultado.campos?.some(pareceCampoDinheiro) ? formatarMoeda(resultado.valor_nao_identificado) : formatarNumero(resultado.valor_nao_identificado);
+        notas.push(`${resultado.registros_nao_identificados} registros com valor não foram atribuídos a um bairro/localidade específica; valor não alocado: ${vf}.`);
+      }
+    }
+    const extra = notas.length ? `\n\n_${notas.join(" ")}_` : "";
+    return `📋 *${label}*\n\n${linhas.join("\n")}${extra}`;
   }
 
   if (resultado.tipo === "agrupamento") {
-    if (!resultado.itens.length) return `Não encontrei ${label} com esses critérios.`;
-    const linhas = resultado.itens.map((x) => `• *${x.grupo}* — ${x.quantidade} ${x.quantidade === 1 ? "registro" : "registros"}`);
-    const extra = resultado.truncado ? `\n\n(Mostrando os primeiros ${resultado.itens.length} de ${resultado.total_grupos} grupos.)` : "";
+    if (!resultado.itens.length) {
+      if (resultado.total_registros > 0 && resultado.registros_nao_identificados === resultado.total_registros) {
+        return `Encontrei *${resultado.total_registros}* registros no recorte, mas não consegui identificar ${label} com segurança nos dados da planilha.`;
+      }
+      return `Não encontrei ${label} com esses critérios.`;
+    }
+
+    const unidade = resultado.unidade || { singular: "registro", plural: "registros" };
+    const linhas = resultado.itens.map((x) =>
+      `• *${x.grupo}* — ${x.quantidade} ${x.quantidade === 1 ? unidade.singular : unidade.plural}`
+    );
+
+    const notas = [];
+    if (resultado.truncado) {
+      notas.push(`Mostrando os primeiros ${resultado.itens.length} de ${resultado.total_grupos} grupos.`);
+    }
+    if (resultado.normalizacao_aplicada || resultado.registros_nao_identificados > 0) {
+      notas.push(
+        `Foi possível classificar com segurança ${resultado.registros_identificados} de ${resultado.total_registros} ` +
+        `${resultado.total_registros === 1 ? unidade.singular : unidade.plural} em ${resultado.total_grupos} grupos ` +
+        `(${formatarNumero(resultado.cobertura_percentual)}% de cobertura).`
+      );
+      if (resultado.registros_nao_identificados > 0) {
+        notas.push(
+          `${resultado.registros_nao_identificados} ${resultado.registros_nao_identificados === 1 ? unidade.singular : unidade.plural} ` +
+          `ficaram sem classificação segura porque o campo estava vazio, ambíguo ou continha apenas endereço/localização sem evidência suficiente.`
+        );
+      }
+    }
+
+    const extra = notas.length ? `\n\n_${notas.join(" ")}_` : "";
     return `📋 *${resultado.total_grupos} ${label}*\n\n${linhas.join("\n")}${extra}`;
   }
 
@@ -807,7 +1127,7 @@ export async function responderPergunta(pergunta, historico = []) {
       linhas: 0,
       erro: "pergunta vazia",
       estado: ultimoEstadoValido(historico),
-      modoAgente: "google_sheets_tools",
+      modoAgente: "google_sheets_tools_v3",
     };
   }
 
@@ -821,7 +1141,7 @@ export async function responderPergunta(pergunta, historico = []) {
       linhas: 0,
       erro: e?.message || String(e),
       estado: ultimoEstadoValido(historico),
-      modoAgente: "google_sheets_tools",
+      modoAgente: "google_sheets_tools_v3",
     };
   }
 
@@ -842,7 +1162,7 @@ export async function responderPergunta(pergunta, historico = []) {
         linhas: 0,
         erro: e?.message || String(e),
         estado: estadoAtual,
-        modoAgente: "google_sheets_tools",
+        modoAgente: "google_sheets_tools_v3",
       };
     }
 
@@ -853,7 +1173,7 @@ export async function responderPergunta(pergunta, historico = []) {
         linhas: 0,
         erro: "planner sem ferramenta",
         estado: estadoAtual,
-        modoAgente: "google_sheets_tools",
+        modoAgente: "google_sheets_tools_v3",
       };
     }
 
@@ -864,7 +1184,7 @@ export async function responderPergunta(pergunta, historico = []) {
         linhas: 0,
         erro: "",
         estado: estadoAtual,
-        modoAgente: "google_sheets_tools",
+        modoAgente: "google_sheets_tools_v3",
       };
     }
 
@@ -901,7 +1221,7 @@ export async function responderPergunta(pergunta, historico = []) {
     erro: "",
     estado,
     ferramenta: plano?.tool || null,
-    modoAgente: "google_sheets_tools",
+    modoAgente: "google_sheets_tools_v3",
     fonte: "Google Sheets",
   };
 }
