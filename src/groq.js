@@ -1,20 +1,9 @@
-// ============================================================
-//  groq.js
-//  IA do chatbot: Groq principal + Gemini de reserva.
-//
-//  Estrategia:
-//    1) Groq primeiro, com UM modelo configurado (padrao GPT-OSS-20B).
-//    2) Se Groq falhar/atingir 429, cai imediatamente para Gemini.
-//    3) Sem OpenRouter/Nemotron.
-//    4) O classificador de intencao usa prompt curto; regras de negocio,
-//       schema, SQL, calculos e validacoes ficam no Node/PostgreSQL.
-//
-//  Variaveis de ambiente:
-//    GROQ_API_KEY
-//    GROQ_MODEL       opcional; padrao openai/gpt-oss-20b
-//    GEMINI_API_KEY   (tambem aceita GOOGLE_API_KEY / GOOGLE_GENAI_API_KEY)
-//    GEMINI_MODEL     opcional; padrao gemini-3.5-flash-lite
-// ============================================================
+// groq.js — NVIDIA principal -> Groq -> Gemini.
+// Base: groq(20261006-210843).js, anterior ao pacote economia-429.
+// Somente o adaptador NVIDIA, ordem e mensagens de diagnostico foram adicionados.
+// NVIDIA_API_KEY: chave obtida em build.nvidia.com
+// NVIDIA_MODEL: opcional; nvidia/nemotron-3-super-120b-a12b por padrao.
+// Mantem configuracoes e comportamento originais de Groq/Gemini.
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_KEY = (process.env.GROQ_API_KEY || "").trim();
@@ -29,12 +18,17 @@ const GEMINI_KEY = (
 ).trim();
 const GEMINI_MODEL = (process.env.GEMINI_MODEL || "gemini-3.5-flash-lite").trim();
 
+const NVIDIA_KEY = (process.env.NVIDIA_API_KEY || "").trim();
+const NVIDIA_MODEL = (process.env.NVIDIA_MODEL || "nvidia/nemotron-3-super-120b-a12b").trim();
+const NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
+
 const PROVEDORES = [];
-// Ordem de prioridade: Groq -> Gemini.
+// Ordem de prioridade: NVIDIA -> Groq -> Gemini.
+if (NVIDIA_KEY) PROVEDORES.push({ nome: "nvidia" });
 if (GROQ_KEY) PROVEDORES.push({ nome: "groq" });
 if (GEMINI_KEY) PROVEDORES.push({ nome: "gemini" });
 if (PROVEDORES.length === 0) {
-  console.warn("AVISO: configure GROQ_API_KEY e/ou GEMINI_API_KEY.");
+  console.warn("AVISO: configure NVIDIA_API_KEY, GROQ_API_KEY e/ou GEMINI_API_KEY.");
 }
 
 // Contato para escalar quando o bot nao resolve (opcional, via .env).
@@ -153,7 +147,7 @@ async function chamarGroq(body) {
     const texto = data.choices?.[0]?.message?.content?.trim() || "";
     if (!texto) throw new Error(`groq (${model}) devolveu resposta vazia`);
     const u = data?.usage || {};
-    console.log(`DEBUG IA usada: Groq (principal) | modelo: ${model}`);
+    console.log(`DEBUG IA usada: Groq (reserva) | modelo: ${model}`);
     if (u.prompt_tokens != null || u.completion_tokens != null) {
       console.log(`DEBUG TOKENS Groq | entrada=${u.prompt_tokens ?? "?"} | saida=${u.completion_tokens ?? "?"} | total=${u.total_tokens ?? "?"}`);
     }
@@ -232,9 +226,61 @@ async function chamarGemini(body) {
   return texto;
 }
 
+// NVIDIA usa o contrato de chat completions. Nao repassar parametros
+// exclusivos de Groq/Gemini. Para Super, desliga thinking para preservar o
+// pequeno orcamento de saida do agente para o JSON/SQL efetivamente solicitado.
+async function chamarNvidia(body) {
+  const sistemas = [];
+  const mensagens = [];
+  for (const m of body.messages || []) {
+    if (!m?.content) continue;
+    if (m.role === "system") { sistemas.push(String(m.content)); continue; }
+    const role = m.role === "assistant" ? "assistant" : "user";
+    const ultima = mensagens[mensagens.length - 1];
+    if (ultima?.role === role) ultima.content += "\n\n" + String(m.content);
+    else mensagens.push({ role, content: String(m.content) });
+  }
+  if (sistemas.length) mensagens.unshift({ role: "system", content: sistemas.join("\n\n") });
+  const corpo = {
+    model: NVIDIA_MODEL,
+    messages: mensagens,
+    max_tokens: limiteSaida(body),
+    stream: false,
+  };
+  if (NVIDIA_MODEL === "nvidia/nemotron-3-super-120b-a12b") corpo.reasoning_effort = "none";
+  if (body.temperature !== undefined && Number.isFinite(Number(body.temperature))) {
+    corpo.temperature = Math.max(0, Math.min(1, Number(body.temperature)));
+  }
+  const resp = await fetchComTimeout(NVIDIA_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: `Bearer ${NVIDIA_KEY}` },
+    body: JSON.stringify(corpo),
+  });
+  if (!resp.ok || resp.status === 202) {
+    const erroTxt = await resp.text();
+    const err = new Error(`nvidia respondeu ${resp.status}: ${erroTxt.slice(0, 320)}`);
+    // Resposta ainda pendente: permitir fallback sem tratar como conclusao.
+    err.status = resp.status === 202 ? 503 : resp.status;
+    if (resp.status === 429) err.retryAfterMs = retryDepoisMs(resp, erroTxt);
+    throw err;
+  }
+  const data = await resp.json();
+  const escolha = data.choices?.[0];
+  const texto = escolha?.message?.content?.trim() || "";
+  if (!texto || escolha?.finish_reason === "length") {
+    throw new Error("nvidia devolveu resposta vazia ou truncada; tentando reserva");
+  }
+  const u = data.usage || {};
+  console.log(`DEBUG IA usada: NVIDIA (principal) | modelo: ${NVIDIA_MODEL}`);
+  if (u.prompt_tokens != null || u.completion_tokens != null) {
+    console.log(`DEBUG TOKENS NVIDIA | entrada=${u.prompt_tokens ?? "?"} | saida=${u.completion_tokens ?? "?"} | total=${u.total_tokens ?? "?"}`);
+  }
+  return texto;
+}
+
 async function chamarIA(body, tentativa429 = 0) {
   if (PROVEDORES.length === 0) {
-    throw new Error("Nenhuma chave de IA configurada (GROQ_API_KEY ou GEMINI_API_KEY).");
+    throw new Error("Nenhuma chave de IA configurada (NVIDIA_API_KEY, GROQ_API_KEY ou GEMINI_API_KEY).");
   }
 
   const agora = Date.now();
@@ -257,7 +303,8 @@ async function chamarIA(body, tentativa429 = 0) {
   let ultimoErro = null;
   for (const prov of ordem) {
     try {
-      const texto = prov.nome === "groq" ? await chamarGroq(body) : await chamarGemini(body);
+      const texto = prov.nome === "nvidia" ? await chamarNvidia(body)
+        : prov.nome === "groq" ? await chamarGroq(body) : await chamarGemini(body);
       provedorDescansando.delete(prov.nome);
       return texto;
     } catch (e) {
@@ -274,7 +321,9 @@ async function chamarIA(body, tentativa429 = 0) {
 
       if ((e.status === 401 || e.status === 403)) {
         provedorDescansando.set(prov.nome, Date.now() + 10 * 60 * 1000);
-        if (prov.nome === "groq") {
+        if (prov.nome === "nvidia") {
+          console.error("DEBUG NVIDIA: confira NVIDIA_API_KEY no Render.");
+        } else if (prov.nome === "groq") {
           console.error("DEBUG Groq: confira GROQ_API_KEY no Render.");
         } else if (prov.nome === "gemini") {
           console.error("DEBUG Gemini: confira GEMINI_API_KEY no Render (chave do Google AI Studio).");
@@ -299,7 +348,7 @@ async function chamarIA(body, tentativa429 = 0) {
     }
   }
 
-  throw ultimoErro || new Error("Groq e Gemini falharam.");
+  throw ultimoErro || new Error("Os provedores de IA configurados falharam.");
 }
 
 // Normaliza o historico em mensagens que a API entende.
@@ -358,6 +407,11 @@ REGRAS DE INTENCAO:
 - "qual engenheiro tem maior valor investido?" => ranking, agrupar_por=engenheiro, campo=valor_total, medida=soma, direcao=maior, limite=1.
 - "quais obras concluidas?" => listar universo=obra + filtro situacao=concluido.
 - "quais os recursos dessas?" => campo=recurso + usar_contexto=true.
+- AREA/TEMA: expressoes como "area da educacao", "area da saude" ou "do setor de educacao" NAO significam necessariamente coluna categoria. Coloque o tema em "termos" e deixe o sistema aplicar a semantica aos dados reais.
+- Ex.: "tem alguma licitacao da area da educacao?" => acao="existencia", universo="licitacao", filtros=[], termos=["educacao"].
+- Ex.: "qual o valor investido nas obras da area da educacao?" => acao="somar", universo="obra", campo="valor_total", termos=["educacao"], usar_contexto=false.
+- Ex.: "qual o valor investido nas obras da area da educacao e da saude?" => acao="somar", universo="obra", campo="valor_total", termos=["educacao","saude"], usar_contexto=false. Dois ou mais temas no mesmo pedido representam o conjunto combinado; o Node faz a uniao dos temas.
+- Se o usuario disser explicitamente "categoria X" ou pedir o campo categoria, ai sim use campo/filtro categoria.
 - PEDIDO DE VALORES UNICOS: se a pessoa pedir apenas todos/quais/nomes de bairros, engenheiros, empresas, status, categorias ou recursos, use acao="valores_unicos" e coloque a dimensao em "campo". NAO use acao="listar" nesses casos.
 - Ex.: "me informa todos os bairros?" => acao="valores_unicos", campo="bairro".
 - Ex.: "quais empresas?" => acao="valores_unicos", campo="empresa".
@@ -464,41 +518,46 @@ export async function interpretarPergunta(pergunta, historico = []) {
 //  PARTE 2 - REDACAO DA RESPOSTA FINAL (com memoria da conversa)
 // ============================================================
 
-const SYSTEM_PROMPT_RESPOSTA = `Voce e o Assistente de Obras da Prefeitura de Mamanguape, atendendo cidadaos
-pelo WhatsApp. Sua tarefa: entender o que a pessoa quer e entregar exatamente
-isso, de forma clara e curta.
+const SYSTEM_PROMPT_RESPOSTA = `Voce e o Assistente de Obras da Prefeitura de Mamanguape no WhatsApp.
+Sua funcao nesta etapa e SOMENTE REDIGIR. O sistema ja entendeu a pergunta, consultou
+o banco, aplicou as regras e fez os calculos. Voce nao decide filtros, nao gera SQL e
+nao recalcula nada.
 
-Voce recebe um JSON com:
-- "pergunta": o que o cidadao escreveu (pode ser informal).
-- "obras": as obras que o sistema ja filtrou da base. Pode vir vazia.
-- "fatos": (opcional) um calculo ja pronto (soma, total, contagem, media).
-- "instrucao": (opcional) orientacao de como responder este turno. Siga-a, mas
-  nunca a mencione.
+Voce recebe:
+- "pergunta": mensagem original do cidadao;
+- "fatos": resposta factual pronta e autoritativa produzida pelo sistema;
+- "obras": dados adicionais somente quando forem necessarios;
+- "instrucao": orientacao de apresentacao, nunca um novo fato.
 
-REGRA QUE NAO PODE SER QUEBRADA:
-Responda SOMENTE com o que estiver em "obras" e "fatos" - essa e a unica fonte de
-verdade. NUNCA invente, estime ou complete valores, datas, status, nomes de
-empresa ou engenheiro. Se um dado nao esta ali, diga com naturalidade que nao
-consta na base e ofereca ajudar de outro jeito. Se vier "fatos", use os numeros
-dele exatamente, sem refazer conta. Informar dado errado de obra publica e grave.
+REGRA ABSOLUTA DE VERDADE:
+- Use SOMENTE fatos/obras recebidos.
+- NUNCA altere numero, valor, nome, bairro, status, engenheiro, quantidade ou item.
+- NUNCA complete por conhecimento proprio, memoria ou suposicao.
+- NUNCA refaca soma, media, contagem ou ranking. Se "fatos" disser 7, responda 7.
+- Se um dado nao estiver presente, diga apenas que essa informacao nao consta no
+  resultado recebido.
 
-COMO RESPONDER:
-- Responda so o que foi pedido, sem despejar todos os campos. Se pediu o valor,
-  de o valor; se pediu o status, de o status.
-- Seja curto (formato WhatsApp, poucas linhas). Detalhe so se a pessoa pedir.
-- Entenda a pessoa mesmo com girias e erros. Status tem sinonimos: concluida =
-  concluido = pronta = finalizada; em andamento = sendo feita = tocando; parada =
-  atrasada = paralisada.
-- Se "obras" e "fatos" vierem vazios, peca a pista que falta (bairro, rua ou nome
-  da obra) em uma frase curta e cordial.
-- Nao repita o que ja disse antes no historico. Cada resposta traz algo novo.
-- Fale como a prefeitura falaria: cordial e humano. Nunca diga que e uma IA nem
-  cite "os dados", "a planilha" ou "o sistema".
-- Portugues do Brasil. Negrito com *asteriscos*, valores em R$ 1.408.500,00.
-  No maximo um emoji sutil.
+COMO REDIGIR:
+- Dê a resposta principal JA NA PRIMEIRA FRASE.
+- Depois, se ajudar, acrescente uma explicacao curta e natural baseada nos fatos.
+- Se o usuario pediu "todos", "quais" ou uma lista e fatos trouxerem uma lista,
+  mantenha TODOS os itens recebidos (ate 20). Nao troque a lista por um resumo.
+- Se for ranking, cite sempre a entidade E a medida: ex. "Centro, com 7 obras".
+- Se for valor, destaque o valor e diga em uma frase o que ele representa.
+- Se for contagem, informe a quantidade e o universo correto (obras/projetos/licitacoes).
+- Se for follow-up ("essas", "delas", "e o valor?"), responda diretamente sem
+  recontar toda a conversa.
+- Preserve conceitos diferentes: recurso != tipo de recurso; valor total != valor
+  executado; obra != projeto != licitacao.
+- Nao transforme pedido de bairros/engenheiros/empresas em lista de obras.
+- Nao fale "segundo a IA", "segundo o sistema", "consulta", "SQL", "banco" ou
+  "planilha".
+- Portugues do Brasil, claro e humano. Poucas linhas quando a pergunta for simples.
+- Formato WhatsApp: lista numerada ou marcadores quando houver varios itens; sem tabela.
+- Negrito pode usar *asteriscos*. Valores no formato R$ 1.408.500,00.
+- Nao termine com explicacoes tecnicas nem frases mecanicas.
 
-Responda apenas com o texto final da mensagem, sem JSON e sem aspas ao redor.
-`;
+Responda apenas com a mensagem final ao cidadao, sem JSON e sem aspas.`;
 
 // Limpa as obras antes de mandar pra IA: tira o campo interno "_aba", remove
 // campos vazios e corta textos muito longos.
@@ -530,8 +589,8 @@ export async function redigirResposta(pergunta, obras, detalhe, historico = [], 
 
   const texto = await chamarIA({
     temperature: 0.2,
-    // Cobre o raciocinio do modelo + o texto final da mensagem.
-    max_tokens: 700,
+    // Redacao apenas: o sistema ja resolveu a consulta.
+    max_tokens: 500,
     reasoning_effort: "low",
     messages: [
       { role: "system", content: SYSTEM_PROMPT_RESPOSTA },
@@ -685,7 +744,7 @@ export async function gerarCodigoPython(pergunta, colunas) {
 //  chamarIAbruta — funcao simples para o agente SQL.
 //  Recebe uma lista de mensagens [{role, content}] e devolve o
 //  texto da resposta. Reaproveita o chamarIA interno (com
-//  fallback Groq -> Gemini e limpeza de parametros por provedor).
+//  fallback NVIDIA -> Groq -> Gemini e limpeza de parametros por provedor).
 // ============================================================
 export async function chamarIAbruta(mensagens, opcoes = {}) {
   const body = {
