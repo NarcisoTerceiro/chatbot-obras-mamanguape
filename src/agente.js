@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - GOOGLE SHEETS + ARQUERO + DECIMAL.JS (SEM SQL) - V7
+// agente.js - GOOGLE SHEETS + ARQUERO + DECIMAL.JS (SEM SQL) - V8
 // ============================================================
 // Inspirado no padrao de agentes de planilha do n8n:
 // - a IA entende a pergunta e escolhe uma ferramenta;
@@ -225,9 +225,15 @@ const ALIASES_CAMPOS = {
   rua: ["rua", "logradouro", "via", "avenida"],
   endereco: ["endereco", "logradouro", "local", "localizacao"],
   status: ["status", "situacao", "situacao atual", "andamento"],
-  engenheiro: ["engenheiro", "engenheiro responsavel", "responsavel tecnico", "responsavel"],
+  engenheiro: [
+    "engenheiro", "engenheiro responsavel", "engenheiro arquiteto responsavel",
+    "arquiteto responsavel", "responsavel tecnico", "responsavel", "responsavel pelo projeto"
+  ],
   empresa: ["empresa", "empresa executora", "construtora", "contratada"],
-  recurso: ["recurso", "fonte de recurso", "fonte", "origem do recurso", "convenio recurso", "convênio/recurso"],
+  recurso: [
+    "recurso", "fonte de recurso", "fonte do recurso", "fonte recurso", "fonte",
+    "origem do recurso", "convenio recurso", "convênio/recurso"
+  ],
   tipo_recurso: ["tipo recurso", "tipo de recurso"],
   contrato: ["contrato", "n do contrato", "numero do contrato", "nº do contrato"],
   convenio: ["convenio", "proposta", "n do convenio proposta", "nº do convenio proposta"],
@@ -289,6 +295,27 @@ function resolverCampoNaLinha(row, campo) {
   if (aliases.length) {
     achou = cols.find((c) => aliases.includes(normalizar(c)));
     if (achou) return achou;
+
+    // Cabecalhos compostos sao comuns em planilhas reais, por exemplo
+    // "ENGENHEIRO/ARQUITETO RESPONSÁVEL". Para aliases com pelo menos
+    // duas palavras relevantes, aceita quando todas aparecem no cabecalho.
+    // Evitamos aliases de uma palavra aqui para nao confundir RECURSO com
+    // TIPO_RECURSO, VALOR com outros valores etc.
+    const stop = new Set(["de", "da", "do", "das", "dos", "e", "a", "o"]);
+    let melhor = null;
+    let melhorScore = 0;
+    for (const col of cols) {
+      const colTokens = new Set(normalizar(col).split(/\s+/).filter(Boolean));
+      for (const alias of aliases) {
+        const toks = normalizar(alias).split(/\s+/).filter((t) => t && !stop.has(t));
+        if (toks.length < 2) continue;
+        if (toks.every((t) => colTokens.has(t)) && toks.length > melhorScore) {
+          melhor = col;
+          melhorScore = toks.length;
+        }
+      }
+    }
+    if (melhor) return melhor;
   }
 
   // Se a IA passou um alias conhecido, descobre qual conceito canonico e tenta novamente.
@@ -508,6 +535,24 @@ function detectarDimensaoExplicita(pergunta = "") {
   return "";
 }
 
+// Perguntas do tipo "quais os engenheiros desses projetos?" pedem os VALORES
+// de uma dimensao, nao a lista completa de projetos/obras. Mantemos isso
+// deterministico para nao depender do LLM escolher a ferramenta certa.
+function perguntaPedeValoresDaDimensao(pergunta = "", dimensao = "") {
+  const q = normalizar(pergunta);
+  const d = normalizar(dimensao);
+  if (!q || !d) return false;
+
+  const padroes = {
+    engenheiro: /^(?:e\s+)?(?:quais|qual)\s+(?:os?|as?)?\s*(?:engenheiros?|arquitetos?|responsaveis?|profissionais?)\b/,
+    empresa: /^(?:e\s+)?(?:quais|qual)\s+(?:os?|as?)?\s*(?:empresas?|construtoras?|contratadas?)\b/,
+    bairro: /^(?:e\s+)?(?:quais|qual)\s+(?:os?|as?)?\s*(?:bairros?|localidades?)\b/,
+    recurso: /^(?:e\s+)?(?:quais|qual)\s+(?:os?|as?)?\s*(?:recursos?|fontes?)\b/,
+    status: /^(?:e\s+)?(?:quais|qual)\s+(?:os?|as?)?\s*(?:status|situacoes?)\b/,
+  };
+  return Boolean(padroes[d]?.test(q));
+}
+
 function detectarAcaoSemantica(pergunta = "") {
   const q = normalizar(pergunta);
   if (!q) return "desconhecida";
@@ -666,6 +711,42 @@ function planoDeterministicoDeAltaConfianca(pergunta, analise) {
     return { tool: "agrupar_por", inherit_scope: analise.modoContexto !== "none", label: `${analise.dimensaoExplicita}s com mais registros`, args };
   }
 
+  // Perguntas que pedem explicitamente os VALORES de uma dimensao
+  // ("quais os engenheiros desses projetos?", "quais as empresas das obras?",
+  // "quais os bairros dos projetos?") sao agrupamentos por dimensao.
+  // Isso evita o erro de listar novamente os projetos/obras quando o usuario
+  // pediu apenas engenheiros/empresas/bairros/recursos/status.
+  if (analise?.acao === "listar" && analise?.dimensaoExplicita &&
+      perguntaPedeValoresDaDimensao(q, analise.dimensaoExplicita)) {
+    const args = {
+      ...baseArgs,
+      campo: analise.dimensaoExplicita,
+      ordenar_por: "quantidade",
+      direcao: "desc",
+      limite: 100,
+    };
+    if (analise.dimensaoExplicita === "bairro") {
+      args.normalizar_dimensao = true;
+      args.conceito = "bairro";
+    }
+    const nomes = {
+      engenheiro: "engenheiros/responsáveis",
+      empresa: "empresas",
+      bairro: "bairros",
+      recurso: "recursos",
+      status: "status",
+    };
+    const escopoRotulo = analise.escopoExplicito === "projeto" ? " dos projetos"
+      : analise.escopoExplicito === "obra" ? " das obras"
+      : analise.escopoExplicito === "licitacao" ? " das licitações" : "";
+    return {
+      tool: "agrupar_por",
+      inherit_scope: analise.modoContexto !== "none",
+      label: `${nomes[analise.dimensaoExplicita] || analise.dimensaoExplicita}${escopoRotulo}`,
+      args,
+    };
+  }
+
   // Perguntas "bairros/empresas/engenheiros e quantidade" sao agrupamentos, nao listas.
   if (analise?.dimensaoExplicita && /\b(quantidade|quantos|quantas|mais|menos)\b/.test(q) && analise.acao !== "soma") {
     const args = { ...baseArgs, campo: analise.dimensaoExplicita, ordenar_por: "quantidade", direcao: "desc", limite: 50 };
@@ -748,6 +829,20 @@ function aplicarGuardasSemanticas(pergunta, plano = {}, analise = null) {
     delete p.args.campo;
     delete p.args.ordenar_por;
     p.args.campos = p.args.campos?.length ? p.args.campos : ["objeto", "status", "engenheiro", "empresa", "valor_total"];
+  }
+
+  // Se o usuario pediu OS VALORES de uma dimensao (ex.:
+  // "quais os engenheiros desses projetos?"), force agrupamento pela dimensao.
+  // Mesmo que o LLM tente listar os projetos de novo, a guarda corrige o plano.
+  if (info.acao === "listar" && info.dimensaoExplicita &&
+      perguntaPedeValoresDaDimensao(pergunta, info.dimensaoExplicita)) {
+    p.tool = "agrupar_por";
+    p.args.campo = info.dimensaoExplicita;
+    p.args.ordenar_por = "quantidade";
+    p.args.direcao = "desc";
+    p.args.limite = 100;
+    delete p.args.campos;
+    delete p.args.agrupar_por;
   }
 
   // Ranking: a dimensao vem da pergunta atual, nunca da memoria antiga.
@@ -1676,8 +1771,28 @@ function labelDeterministico(plano, resultado) {
   return limparLabelHumano(plano?.label) || "registros";
 }
 
+function ajustarLabelGrupos(label = "", total = 2) {
+  if (Number(total) !== 1) return label;
+  const pares = [
+    [/^engenheiros\/responsáveis\b/i, "engenheiro/responsável"],
+    [/^engenheiros\b/i, "engenheiro"],
+    [/^responsáveis\b/i, "responsável"],
+    [/^empresas\b/i, "empresa"],
+    [/^bairros\b/i, "bairro"],
+    [/^recursos\b/i, "recurso"],
+    [/^localidades\b/i, "localidade"],
+  ];
+  for (const [re, rep] of pares) {
+    if (re.test(label)) return label.replace(re, rep);
+  }
+  return label;
+}
+
 function formatarResultado(plano, resultado) {
-  const label = labelDeterministico(plano, resultado);
+  let label = labelDeterministico(plano, resultado);
+  if (resultado?.tipo === "agrupamento" || resultado?.tipo === "soma_agrupada") {
+    label = ajustarLabelGrupos(label, resultado.total_grupos);
+  }
 
   if (!resultado || resultado.tipo === "erro_ferramenta") {
     return resultado?.erro || "Não consegui consultar os dados da planilha.";
@@ -1776,6 +1891,17 @@ function formatarResultado(plano, resultado) {
 }
 
 // ------------------------------------------------------------
+// Diagnostico puro de roteamento (nao le planilha e nao chama IA).
+// Serve para testes de regressao antes do deploy.
+// ------------------------------------------------------------
+export function diagnosticarPergunta(pergunta, estado = null) {
+  const analise = { ...analisarContextoPergunta(texto(pergunta), estado), pergunta: texto(pergunta) };
+  let plano = planoDeterministicoDeAltaConfianca(texto(pergunta), analise);
+  if (plano) plano = validarPlano(aplicarGuardasSemanticas(texto(pergunta), plano, analise));
+  return { analise, plano };
+}
+
+// ------------------------------------------------------------
 // Entrada principal
 // ------------------------------------------------------------
 export async function responderPergunta(pergunta, historico = []) {
@@ -1787,7 +1913,7 @@ export async function responderPergunta(pergunta, historico = []) {
       linhas: 0,
       erro: "pergunta vazia",
       estado: ultimoEstadoValido(historico),
-      modoAgente: "google_sheets_arquero_decimal_v7",
+      modoAgente: "google_sheets_arquero_decimal_v8",
     };
   }
 
@@ -1801,7 +1927,7 @@ export async function responderPergunta(pergunta, historico = []) {
       linhas: 0,
       erro: e?.message || String(e),
       estado: ultimoEstadoValido(historico),
-      modoAgente: "google_sheets_arquero_decimal_v7",
+      modoAgente: "google_sheets_arquero_decimal_v8",
     };
   }
 
@@ -1826,7 +1952,7 @@ export async function responderPergunta(pergunta, historico = []) {
         linhas: 0,
         erro: e?.message || String(e),
         estado: estadoAtual,
-        modoAgente: "google_sheets_arquero_decimal_v7",
+        modoAgente: "google_sheets_arquero_decimal_v8",
       };
     }
 
@@ -1837,7 +1963,7 @@ export async function responderPergunta(pergunta, historico = []) {
         linhas: 0,
         erro: "planner sem ferramenta",
         estado: estadoAtual,
-        modoAgente: "google_sheets_arquero_decimal_v7",
+        modoAgente: "google_sheets_arquero_decimal_v8",
       };
     }
 
@@ -1848,7 +1974,7 @@ export async function responderPergunta(pergunta, historico = []) {
         linhas: 0,
         erro: "",
         estado: estadoAtual,
-        modoAgente: "google_sheets_arquero_decimal_v7",
+        modoAgente: "google_sheets_arquero_decimal_v8",
       };
     }
 
@@ -1887,7 +2013,7 @@ export async function responderPergunta(pergunta, historico = []) {
     erro: "",
     estado,
     ferramenta: plano?.tool || null,
-    modoAgente: "google_sheets_arquero_decimal_v7",
+    modoAgente: "google_sheets_arquero_decimal_v8",
     fonte: "Google Sheets",
   };
 }
