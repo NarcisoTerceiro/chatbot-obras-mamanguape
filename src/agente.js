@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + REGRAS DE NEGOCIO UNIFICADAS + RESPOSTAS HUMANAS (Node.js) - V13.7
+// agente.js - SQL AGENT CONVERSACIONAL SEMANTICO + SELF-HEALING + EVIDENCE GROUNDING (Node.js) - V16
 // ============================================================
 // Arquitetura baseada em duas referencias usadas no projeto:
 // 1) Conversational SQL Agent: schema/view + SQL dinamico + memoria de conversa.
@@ -60,6 +60,8 @@ const MAX_RESULTADOS = Math.max(20, Math.min(Number(process.env.AGENTE_MAX_RESUL
 const MAX_LINHAS_PARA_IA = Math.max(10, Math.min(Number(process.env.AGENTE_MAX_LINHAS_IA || 60), 100));
 const CACHE_SCHEMA_MS = Math.max(60_000, Math.min(Number(process.env.AGENTE_CACHE_SCHEMA_MS || 300_000), 30 * 60_000));
 const MAX_HISTORICO_PROMPT = 6;
+const MAX_EVIDENCE_ROWS = Math.max(500, Math.min(Number(process.env.AGENTE_MAX_EVIDENCIAS || 5000), 20000));
+const MAX_RAW_VALUES_PER_BATCH = Math.max(20, Math.min(Number(process.env.AGENTE_MAX_RAW_POR_LOTE || 70), 120));
 
 let cacheSchema = { quando: 0, contexto: null };
 
@@ -108,71 +110,8 @@ function respostaSocial(pergunta = "", historico = []) {
   return null;
 }
 
-// Perguntas genericas sobre "licitacoes nao analisadas" sao ambiguas na base:
-// existem campos separados para PROPOSTA ANALISADA e HABILITACAO ANALISADA.
-// Nesses casos, o sistema pede a dimensao correta ANTES de deixar a IA gerar SQL.
-function respostaAmbiguidadeAnaliseLicitacao(pergunta = "") {
-  const p = normalizar(pergunta);
-  const falaDeLicitacao = /\blicita(?:cao|coes)\b/.test(p);
-  const falaDeNaoAnalisada = /\bnao\b[\s\S]{0,40}\banalisad/.test(p) || /\banalisad[\s\S]{0,40}\bnao\b/.test(p);
-  const especificouProposta = /\bpropost/.test(p);
-  const especificouHabilitacao = /\bhabilit/.test(p);
-
-  if (falaDeLicitacao && falaDeNaoAnalisada && !especificouProposta && !especificouHabilitacao) {
-    return "Você quer as propostas não analisadas ou as habilitações não analisadas?";
-  }
-  return null;
-}
-
-
-// Estes dois campos pertencem ao universo de LICITACOES, nao ao de obras.
-// Para evitar que a IA escolha tipo_negocio='obra' por engano, o Node monta
-// diretamente a consulta quando a pergunta cita explicitamente proposta ou
-// habilitacao + analisada/nao analisada.
-//
-// Isso nao substitui o agente SQL geral. E apenas um mapeamento semantico de
-// campos reais da planilha para garantir que a pergunta use a categoria certa.
-function sqlAnaliseLicitacao(pergunta = "", ctx = null) {
-  const p = normalizar(pergunta);
-  const falaDeAnalise = /\banalisad/.test(p);
-  if (!falaDeAnalise) return null;
-
-  const proposta = /\bpropost/.test(p);
-  const habilitacao = /\bhabilit/.test(p);
-  if (!proposta && !habilitacao) return null;
-
-  const querNao =
-    /\bnao\b[\s\S]{0,40}\banalisad/.test(p) ||
-    /\banalisad[\s\S]{0,40}\bnao\b/.test(p);
-
-  const chave = proposta ? "PROPOSTA ANALISADA" : "HABILITAÇÃO ANALISADA";
-  const alias = proposta ? "proposta_analisada" : "habilitacao_analisada";
-  const relacao = ctx?.relacao || "obras_chatbot";
-
-  // A planilha usa Sim/Nao. Aceitamos "Não" e "Nao" para tolerar eventual
-  // normalizacao futura dos dados.
-  const condicao = querNao
-    ? `LOWER(BTRIM(COALESCE(dados_extras->>'${chave}', ''))) IN ('não','nao')`
-    : `LOWER(BTRIM(COALESCE(dados_extras->>'${chave}', ''))) = 'sim'`;
-
-  return `
-    SELECT
-      id,
-      objeto,
-      tipo_negocio,
-      status,
-      status_original,
-      engenheiro,
-      recurso,
-      tipo_recurso,
-      dados_extras->>'${chave}' AS ${alias},
-      COUNT(*) OVER()::int AS total_registros
-    FROM public.${relacao}
-    WHERE tipo_negocio = 'licitacao'
-      AND ${condicao}
-    ORDER BY objeto
-  `.trim();
-}
+// Regras de negocio por frase foram removidas no V16.
+// A interpretacao agora passa pelo resolvedor, plano semantico e validacao por evidencias.
 
 function jsonSeguro(valor, max = 12_000) {
   try {
@@ -199,526 +138,77 @@ function resumoHistorico(historico = []) {
     const papel = m?.memoriaResumo ? "MEMORIA_RESUMIDA" : (m?.role === "assistant" ? "ASSISTENTE" : "USUARIO");
     const conteudo = textoSeguro(m?.content || "", m?.memoriaResumo ? 1200 : 420);
     const sql = !m?.memoriaResumo && m?.role === "assistant" && m?.sql ? `\nSQL_ANTERIOR: ${textoSeguro(m.sql, 800)}` : "";
-    const estado = m?.estado ? `\nESTADO_ANTERIOR: ${jsonSeguro(m.estado, 800)}` : "";
+    const estado = m?.estado ? `\nESTADO_ANTERIOR: ${jsonSeguro(m.estado, 1800)}` : "";
     return `${papel}: ${conteudo}${sql}${estado}`;
   }).join("\n\n");
 }
 
-function ultimaConsultaConfirmada(historico = []) {
-  if (!Array.isArray(historico) || !historico.length) return "";
-  for (let i = historico.length - 1; i >= 0; i--) {
-    const m = historico[i];
-    if (m?.role !== "assistant") continue;
-    const sql = textoSeguro(m?.sql || m?.estado?.sql || "", 4000);
-    if (sql) return limparSQL(sql);
-  }
-  return "";
-}
-
-function ancoraContextoRecente(historico = []) {
-  const sql = ultimaConsultaConfirmada(historico);
-  if (!sql) return "(sem recorte anterior)";
-  return `ULTIMA CONSULTA/RECORTE CONFIRMADO:\n${textoSeguro(sql, 1800)}\n` +
-    `REGRA DE CONTINUIDADE: se a pergunta atual NAO nomear claramente um novo universo, alvo ou filtro incompatível, preserve o mesmo recorte/filtros desta consulta. Pedir outro campo, valor, recurso, status, quantidade ou perguntar "quais" NAO reinicia o assunto.`;
-}
-
-// Follow-ups extremamente curtos, como "quais são?", dependem integralmente do
-// recorte anterior. Nesses casos nao deixamos a preservacao do WHERE apenas a
-// cargo da IA: o Node reaplica deterministicamente o WHERE da ultima consulta.
-function followUpSomenteReferencia(pergunta = "") {
-  const p = normalizar(pergunta);
-  return /^(?:e\s+)?(?:quais(?:\s+sao)?|quem(?:\s+sao)?|qual(?:\s+e)?)[?.! ]*$/.test(p);
-}
-
-function extrairWhereSimples(sql = "") {
-  const s = limparSQL(sql);
-  const m = s.match(/\bwhere\b\s+([\s\S]*?)(?=\bgroup\s+by\b|\border\s+by\b|\blimit\b|\boffset\b|$)/i);
-  return m?.[1]?.trim() || "";
-}
-
-function substituirWhereSimples(sql = "", novoWhere = "") {
-  const s = limparSQL(sql);
-  if (!s || !novoWhere) return s;
-
-  const rxWhere = /\bwhere\b\s+[\s\S]*?(?=\bgroup\s+by\b|\border\s+by\b|\blimit\b|\boffset\b|$)/i;
-  if (rxWhere.test(s)) return s.replace(rxWhere, `WHERE ${novoWhere} `).trim();
-
-  const pos = s.search(/\b(group\s+by|order\s+by|limit|offset)\b/i);
-  if (pos >= 0) return `${s.slice(0, pos).trim()} WHERE ${novoWhere} ${s.slice(pos).trim()}`.trim();
-  return `${s} WHERE ${novoWhere}`.trim();
-}
-
-function preservarRecorteFollowUp(pergunta = "", historico = [], sqlAtual = "") {
-  if (!followUpSomenteReferencia(pergunta)) return limparSQL(sqlAtual);
-
-  const sqlAnterior = ultimaConsultaConfirmada(historico);
-  if (!sqlAnterior) return limparSQL(sqlAtual);
-
-  const whereAnterior = extrairWhereSimples(sqlAnterior);
-  if (!whereAnterior) return limparSQL(sqlAtual);
-
-  // Mantem o SELECT/projecao que a IA escolheu para responder ao novo pedido,
-  // mas restaura o conjunto de registros confirmado no turno anterior.
-  return substituirWhereSimples(sqlAtual, whereAnterior);
-}
-
-function ultimaPerguntaUsuario(historico = []) {
-  if (!Array.isArray(historico)) return "";
-  for (let i = historico.length - 1; i >= 0; i--) {
-    const m = historico[i];
-    if (m?.role !== "user" || m?.memoriaResumo === true) continue;
-    const conteudo = textoSeguro(m?.content || "", 1200);
-    if (conteudo) return conteudo;
-  }
-  return "";
-}
 
 // ------------------------------------------------------------
-// Regra-mestra de UNIVERSO DE NEGOCIO
+// Resolucao conversacional por IA (sem regex de negocio)
 // ------------------------------------------------------------
-// Um universo explicito BLOQUEIA toda a consulta nesse mesmo tipo_negocio.
-// Ex.: "engenheiros dos projetos e quais sao os projetos" continua 100% em
-// tipo_negocio='projeto'; "engenheiros" e "nomes" sao CAMPOS do mesmo conjunto,
-// nao universos diferentes. So liberamos mistura quando o usuario cita de forma
-// explicita mais de um universo (ex.: "compare obras e projetos").
-function universosExplicitosDaPergunta(pergunta = "") {
-  const p = normalizar(pergunta);
-  const itens = [];
-  if (/\bobras?\b/.test(p)) itens.push("obra");
-  if (/\bprojetos?\b/.test(p)) itens.push("projeto");
-  if (/\blicita(?:cao|coes)\b/.test(p)) itens.push("licitacao");
-  return [...new Set(itens)];
-}
-
-function universoNegocioDaPergunta(pergunta = "") {
-  const p = normalizar(pergunta);
-  if (!p) return null;
-
-  const explicitos = universosExplicitosDaPergunta(pergunta);
-  if (explicitos.length > 1) return null; // comparacao/mistura explicitamente pedida
-  if (explicitos.length === 1) return explicitos[0];
-
-  // Regra oficial do projeto: alvos fisicos, sem projeto/licitacao explicitos,
-  // pertencem ao universo de obras.
-  const alvoFisico = /\b(ubs|unidade basica de saude|posto de saude|psf|escola|creche|praca|mercado|campo|drenagem|quadra|pavimentacao|rua)\b/.test(p);
-  return alvoFisico ? "obra" : null;
-}
-
-function universosEncontradosNaSQL(sql = "") {
-  const s = String(sql || "");
-  const out = new Set();
-  const rxEq = /\btipo_negocio\s*=\s*'(obra|projeto|licitacao)'/gi;
-  let m;
-  while ((m = rxEq.exec(s))) out.add(normalizar(m[1]));
-
-  const rxRotulo = /'(obra|projeto|licitacao)'\s+AS\s+(?:tipo|universo|tipo_negocio)\b/gi;
-  while ((m = rxRotulo.exec(s))) out.add(normalizar(m[1]));
-  return [...out];
-}
-
-function pedidoCompostoMesmoUniverso(pergunta = "", sql = "") {
-  const universo = universoNegocioDaPergunta(pergunta);
-  if (!universo) return false;
-  const p = normalizar(pergunta);
-  const pedeCampo = /\b(engenheir|arquit|responsavel|status|situacao|recurso|valor|bairro|empresa|contrato|convenio|data|percentual|executad)\w*\b/.test(p);
-  const pedeRegistros = /\b(quais|liste|lista|nomes?|mostre|fale)\b/.test(p) && /\b(obras?|projetos?|licitacoes?)\b/.test(p);
-  if (!(pedeCampo && pedeRegistros)) return false;
-
-  // Para varios campos do MESMO conjunto, UNION/CTEs separados quase sempre
-  // quebram a associacao registro -> campo. Exigimos uma linha por registro.
-  return /\bunion(?:\s+all)?\b/i.test(String(sql || ""));
-}
-
-function adicionarCondicaoWhere(sql = "", condicao = "") {
-  const s = limparSQL(sql);
-  if (!s || !condicao) return s;
-
-  const whereAtual = extrairWhereSimples(s);
-  if (whereAtual) return substituirWhereSimples(s, `(${condicao}) AND (${whereAtual})`);
-
-  const pos = s.search(/\b(group\s+by|order\s+by|limit|offset)\b/i);
-  if (pos >= 0) return `${s.slice(0, pos).trim()} WHERE ${condicao} ${s.slice(pos).trim()}`.trim();
-  return `${s} WHERE ${condicao}`.trim();
-}
-
-function garantirUniversoNegocio(pergunta = "", historico = [], sqlAtual = "") {
-  const perguntaBase = followUpSomenteReferencia(pergunta)
-    ? ultimaPerguntaUsuario(historico)
-    : pergunta;
-  const esperado = universoNegocioDaPergunta(perguntaBase);
-  let s = limparSQL(sqlAtual);
-  if (!esperado || !s) return s;
-
-  // UNIVERSO BLOQUEADO: quando a pergunta tem um unico universo, TODAS as
-  // subconsultas/CTEs/UNIONs devem usar esse mesmo tipo_negocio. Corrigimos
-  // todas as igualdades, nao apenas a primeira ocorrencia.
-  const rxIgualGlobal = /((?:\b[a-zA-Z_][\w$]*\.)?tipo_negocio\s*=\s*)'(obra|projeto|licitacao)'/gi;
-  let encontrouFiltro = false;
-  s = s.replace(rxIgualGlobal, (_todo, prefixo) => {
-    encontrouFiltro = true;
-    return `${prefixo}'${esperado}'`;
-  });
-
-  // Se a IA tentou usar IN para misturar universos numa pergunta de universo
-  // unico, reduzimos ao universo correto.
-  const rxIn = /((?:\b[a-zA-Z_][\w$]*\.)?tipo_negocio\s+IN\s*)\([^)]*\)/gi;
-  s = s.replace(rxIn, (_todo, prefixo) => {
-    encontrouFiltro = true;
-    return `${prefixo}('${esperado}')`;
-  });
-
-  // Corrige rotulos artificiais usados em UNIONs, ex.: SELECT 'obra' AS tipo,
-  // para a resposta nao chamar projetos de obras apos o guardrail.
-  s = s.replace(/'(obra|projeto|licitacao)'(\s+AS\s+(?:tipo|universo|tipo_negocio)\b)/gi,
-    (_todo, _valor, sufixo) => `'${esperado}'${sufixo}`);
-
-  if (encontrouFiltro || /\btipo_negocio\b/i.test(s)) return limparSQL(s);
-  return adicionarCondicaoWhere(s, `tipo_negocio = '${esperado}'`);
-}
-
-
-function referenciaPessoaRecente(historico = [], pergunta = "") {
-  const p = normalizar(pergunta);
-  const dependeDePessoa = /\b(ele|ela|dele|dela|esse engenheiro|essa engenheira|esse arquiteto|essa arquiteta|esse responsavel|essa responsavel)\b/.test(p);
-  if (!dependeDePessoa || !Array.isArray(historico)) return null;
-
-  // Procura o ultimo responsavel citado naturalmente na conversa.
-  // E generico: nao guarda nomes fixos e nao persiste nada no banco.
-  const rx = /\b((?:Eng\.?|Arq\.?)\s+[A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇ][A-Za-zÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇáàâãéèêíïóôõöúç]+(?:\s+[A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇ][A-Za-zÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇáàâãéèêíïóôõöúç]+){1,4})\b/g;
-  for (let i = historico.length - 1; i >= 0; i--) {
-    const m = historico[i];
-    if (!m?.content) continue;
-    const encontrados = [...String(m.content).matchAll(rx)];
-    if (encontrados.length) return encontrados[encontrados.length - 1][1];
-  }
-  return null;
-}
-
-function contextoReferenciaPessoa(historico = [], pergunta = "") {
-  const pessoa = referenciaPessoaRecente(historico, pergunta);
-  if (!pessoa) return "(nenhuma referencia pessoal recente)";
-  return `REFERENCIA PESSOAL RECENTE: ${pessoa}\nREGRA: pronomes como ele/ela/dele/dela apontam para essa pessoa ate que o usuario nomeie outra. Se pedir \"em geral\", remova filtros de status/andamento do assunto anterior, mas MANTENHA o filtro dessa pessoa.`;
-}
-
-function referenciaPessoaPerdida(pergunta = "", historico = [], sql = "") {
-  const pessoa = referenciaPessoaRecente(historico, pergunta);
-  if (!pessoa) return null;
-  const p = normalizar(pergunta);
-  const pedeConjuntoDaPessoa = /\b(obras?|projetos?|licitacoes?|registros?)\b/.test(p);
-  if (!pedeConjuntoDaPessoa) return null;
-  const s = normalizar(sql);
-  const nomeSemTitulo = normalizar(pessoa.replace(/^(eng\.?|arq\.?)\s*/i, ""));
-  const preservou = /\bengenheiro\b/.test(s) && (s.includes(normalizar(pessoa)) || s.includes(nomeSemTitulo));
-  return preservou ? null : pessoa;
-}
-
-function consultaAgregadaSeca(pergunta = "", sql = "") {
-  const p = normalizar(pergunta);
-  const s = String(sql || "");
-  const pedeMedida = /\b(valor|valores|investid|investimento|gasto|gastos|custo|custos|soma|somar|media|média|executado|executada|saldo)\b/.test(p);
-  if (!pedeMedida) return false;
-  const temAgregado = /\b(?:sum|avg)\s*\(/i.test(s);
-  const jaDetalha = /\bover\s*\(/i.test(s) || /\bgroup\s+by\b/i.test(s) || /\bobjeto\b/i.test(s);
-  return temAgregado && !jaDetalha;
-}
-
-function existencialComLimitUm(pergunta = "", sql = "") {
-  const p = normalizar(pergunta);
-  const perguntaExistencial = /\b(existe|existem|ha|tem algum|tem alguma|tem alguns|tem algumas)\b/.test(p);
-  return perguntaExistencial && /\blimit\s+1\b/i.test(String(sql || ""));
-}
-
-function existencialComAgregadoSeco(pergunta = "", sql = "") {
-  const p = normalizar(pergunta);
-  const s = String(sql || "");
-  const perguntaExistencial = /\b(existe|existem|ha|tem algum|tem alguma|tem alguns|tem algumas)\b/.test(p);
-  const conta = /\bcount\s*\(/i.test(s);
-  const trazNomes = /\bobjeto\b/i.test(s);
-  return perguntaExistencial && conta && !trazNomes;
-}
-
-
-function contagemComAgregadoSeco(pergunta = "", sql = "") {
-  const p = normalizar(pergunta);
-  const s = String(sql || "");
-  const pedeContagem = /\b(quantos?|quantas?|quantidade|numero de|n[uú]mero de)\b/.test(p);
-  const conta = /\bcount\s*\(/i.test(s);
-  const trazNomes = /\bobjeto\b/i.test(s);
-  return pedeContagem && conta && !trazNomes;
-}
-
-// Quando a pergunta pede qual ENTIDADE (engenheiro, empresa, bairro etc.) tem
-// maior/menor VALOR TOTAL INVESTIDO no conjunto, o correto e somar as obras de
-// cada entidade. MAX(valor_total) responderia apenas qual foi a maior obra
-// individual daquela entidade, mudando a semantica da pergunta.
-// ------------------------------------------------------------
-// Guardrail universal de STATUS por aba/universo
-// ------------------------------------------------------------
-// Mapa oficial usado pelo chatbot:
-// - EM_ANDAMENTO / PAVIMENTACAO -> tipo_negocio='obra'
-//     * "em andamento" -> em_andamento_obra = true
-//     * "concluida"    -> concluido = true
-//     * qualquer outro status especifico -> status_original
-// - EM_PROJETO -> tipo_negocio='projeto' -> status_original
-// - EM_LICITACAO -> tipo_negocio='licitacao' -> status_original
-// - proposta/habilitacao analisada -> dados_extras (tratado por sqlAnaliseLicitacao)
-//
-// A funcao corrige a SQL DEPOIS da IA gerar e tambem em cada reparo do
-// self-healing. Assim uma tentativa de reparo nao consegue voltar para a coluna
-// errada. Nao depende de nomes de obras nem de valores fixos da planilha.
-function nomesColunasContexto(ctx = null) {
-  return new Set((ctx?.colunas || []).map((c) => c?.column_name).filter(Boolean));
-}
-
-function universoPelaSQL(sql = "") {
-  const s = String(sql || "");
-  const tipo = s.match(/\btipo_negocio\s*=\s*'(obra|projeto|licitacao)'/i)?.[1];
-  if (tipo) return normalizar(tipo);
-
-  // Compatibilidade com a tabela legada quando a IA filtrar pela aba de origem.
-  if (/\bEM_PROJETO\b/i.test(s)) return "projeto";
-  if (/\bEM_LICITA(?:C|Ç)(?:AO|ÃO)\b/i.test(s)) return "licitacao";
-  if (/\bEM_ANDAMENTO\b/i.test(s) || /\bPAVIMENTA(?:C|Ç)(?:AO|ÃO)\b/i.test(s)) return "obra";
-  return null;
-}
-
-function dividirWherePorAndTopo(where = "") {
-  const partes = [];
-  let atual = "";
-  let profundidade = 0;
-  let aspasSimples = false;
-  let aspasDuplas = false;
-
-  for (let i = 0; i < where.length; i++) {
-    const ch = where[i];
-    const prox = where[i + 1];
-
-    if (aspasSimples) {
-      atual += ch;
-      if (ch === "'" && prox === "'") {
-        atual += prox;
-        i++;
-      } else if (ch === "'") {
-        aspasSimples = false;
-      }
-      continue;
-    }
-
-    if (aspasDuplas) {
-      atual += ch;
-      if (ch === '"' && prox === '"') {
-        atual += prox;
-        i++;
-      } else if (ch === '"') {
-        aspasDuplas = false;
-      }
-      continue;
-    }
-
-    if (ch === "'") {
-      aspasSimples = true;
-      atual += ch;
-      continue;
-    }
-    if (ch === '"') {
-      aspasDuplas = true;
-      atual += ch;
-      continue;
-    }
-    if (ch === "(") profundidade++;
-    if (ch === ")" && profundidade > 0) profundidade--;
-
-    if (profundidade === 0) {
-      const resto = where.slice(i);
-      const m = resto.match(/^\s+AND\s+/i);
-      if (m) {
-        if (atual.trim()) partes.push(atual.trim());
-        atual = "";
-        i += m[0].length - 1;
-        continue;
-      }
-    }
-
-    atual += ch;
+// Antes de qualquer planejamento SQL, transforma a mensagem atual em uma
+// pergunta AUTONOMA, carregando somente o contexto que o usuario realmente
+// manteve do turno anterior. Isso resolve follow-ups como:
+//   "em quais obras?" -> "quais obras do Centro compoem o valor investido?"
+//   "e os engenheiros dessas obras?" -> "quais engenheiros das obras do Centro?"
+// A decisao de herdar/substituir filtros e feita pela IA com base no historico,
+// nao por listas de frases, palavras-chave ou regex de dominio.
+async function resolverPerguntaConversacional(pergunta, historico, ctx) {
+  if (!Array.isArray(historico) || historico.length === 0) {
+    return {
+      pergunta_autonoma: pergunta,
+      is_followup: false,
+      scope: {},
+      confidence: 1,
+      note: "sem historico",
+    };
   }
 
-  if (atual.trim()) partes.push(atual.trim());
-  return partes;
+  const prompt = `Voce e o RESOLVEDOR DE CONTEXTO de um chatbot Text-to-SQL.\n` +
+    `Sua unica tarefa e reescrever a mensagem atual como uma pergunta AUTONOMA, completa e inequívoca. NAO gere SQL.\n` +
+    `Use o historico para resolver referencias como "essas", "eles", "quais", "em quais obras", "e os engenheiros", "e o valor" etc.\n` +
+    `Preserve filtros, universo e conjunto de registros do assunto ativo quando a mensagem atual for continuacao.\n` +
+    `Se a mensagem atual trouxer explicitamente um novo filtro/alvo que substitui o anterior, use o novo.\n` +
+    `Nao herde assuntos antigos que nao estejam ligados ao encadeamento atual.\n` +
+    `Nao invente filtros, nomes, status ou valores.\n` +
+    `Quando houver ESTADO_ANTERIOR/context_scope no historico, trate-o como memoria estruturada do recorte conversacional; use-o apenas se for coerente com as ultimas mensagens do usuario.\n` +
+    `Se a pergunta ja for autonoma, devolva-a praticamente igual.\n\n` +
+    `SCHEMA DISPONIVEL (apenas para entender nomes de conceitos):\n${schemaCompactoParaPlanejamento(ctx)}\n\n` +
+    `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
+    `MENSAGEM ATUAL: ${JSON.stringify(pergunta)}\n\n` +
+    `Retorne SOMENTE JSON:\n` +
+    `{"pergunta_autonoma":"...","is_followup":true,"scope":{"universe":null,"subjects":[],"filters":[],"requested_focus":null,"source_turn":"descricao curta"},"confidence":0.0,"note":"..."}`;
+
+  try {
+    const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
+      max_tokens: 500,
+      temperature: 0,
+      reasoning_effort: "low",
+    });
+    const obj = objetoJSONEmTexto(bruto) || {};
+    const perguntaAutonoma = textoSeguro(obj.pergunta_autonoma || obj.standalone_question || "", 1800) || pergunta;
+    return {
+      pergunta_autonoma: perguntaAutonoma,
+      is_followup: obj.is_followup === true,
+      scope: obj.scope && typeof obj.scope === "object" ? obj.scope : {},
+      confidence: Math.max(0, Math.min(1, Number(obj.confidence || 0))),
+      note: textoSeguro(obj.note || "", 800),
+    };
+  } catch (e) {
+    console.warn("SQL AGENT - resolucao conversacional falhou; usando pergunta original:", e?.message || e);
+    return {
+      pergunta_autonoma: pergunta,
+      is_followup: false,
+      scope: {},
+      confidence: 0,
+      note: "resolver_indisponivel",
+    };
+  }
 }
 
-function substituirIdentificadorStatus(sql = "", novo = "status_original") {
-  const s = String(sql || "");
-  let out = "";
-  let i = 0;
-  let aspasSimples = false;
-  let aspasDuplas = false;
-
-  while (i < s.length) {
-    const ch = s[i];
-    const prox = s[i + 1];
-
-    if (aspasSimples) {
-      out += ch;
-      if (ch === "'" && prox === "'") {
-        out += prox;
-        i += 2;
-        continue;
-      }
-      if (ch === "'") aspasSimples = false;
-      i++;
-      continue;
-    }
-
-    if (aspasDuplas) {
-      out += ch;
-      if (ch === '"' && prox === '"') {
-        out += prox;
-        i += 2;
-        continue;
-      }
-      if (ch === '"') aspasDuplas = false;
-      i++;
-      continue;
-    }
-
-    if (ch === "'") {
-      aspasSimples = true;
-      out += ch;
-      i++;
-      continue;
-    }
-    if (ch === '"') {
-      aspasDuplas = true;
-      out += ch;
-      i++;
-      continue;
-    }
-
-    const trecho = s.slice(i);
-    const m = trecho.match(/^status\b(?!_original)/i);
-    const anterior = i > 0 ? s[i - 1] : "";
-    if (m && !/[A-Za-z0-9_$]/.test(anterior)) {
-      out += novo;
-      i += m[0].length;
-      continue;
-    }
-
-    out += ch;
-    i++;
-  }
-
-  return out;
-}
-
-function segmentoUsaStatusCanonico(segmento = "") {
-  return /\bstatus\b(?!_original)/i.test(String(segmento || ""));
-}
-
-function statusPadraoObraDoSegmento(segmento = "") {
-  const bruto = String(segmento || "");
-  if (!segmentoUsaStatusCanonico(bruto)) return null;
-
-  // Condicoes compostas (IN/OR) sao tratadas como status especifico para nao
-  // perder parte da logica ao tentar converter tudo para um unico booleano.
-  if (/\bin\s*\(/i.test(bruto) || /\bor\b/i.test(bruto)) return null;
-
-  const n = normalizar(bruto);
-  const negado = /\bnot\b/i.test(bruto) || /<>|!=/.test(bruto) || /\bnao\b/.test(n);
-
-  if (/\bem andamento\b/.test(n)) {
-    return { campo: "em_andamento_obra", valor: negado ? false : true };
-  }
-  if (/\bconclu(?:id|i)/.test(n)) {
-    return { campo: "concluido", valor: negado ? false : true };
-  }
-  return null;
-}
-
-function corrigirStatusPorUniverso(pergunta = "", historico = [], sql = "", ctx = null) {
-  let s = limparSQL(sql);
-  if (!s) return s;
-
-  const colunas = nomesColunasContexto(ctx);
-  const temStatusOriginal = colunas.size === 0 || colunas.has("status_original");
-  const temEmAndamento = colunas.size === 0 || colunas.has("em_andamento_obra");
-  const temConcluido = colunas.size === 0 || colunas.has("concluido");
-
-  const perguntaBase = followUpSomenteReferencia(pergunta)
-    ? ultimaPerguntaUsuario(historico)
-    : pergunta;
-  const universo = universoPelaSQL(s) || universoNegocioDaPergunta(perguntaBase);
-  if (!universo) return s;
-
-  // PROJETOS e LICITACOES: status_original e a fonte autoritativa da etapa/status
-  // real da aba. Isso vale tanto para SELECT quanto para WHERE/GROUP/ORDER.
-  if ((universo === "projeto" || universo === "licitacao") && temStatusOriginal) {
-    return substituirIdentificadorStatus(s, "status_original");
-  }
-
-  if (universo !== "obra") return s;
-
-  const whereAtual = extrairWhereSimples(s);
-  let usavaStatusCanonico = segmentoUsaStatusCanonico(s);
-
-  if (whereAtual) {
-    const partes = dividirWherePorAndTopo(whereAtual);
-    if (partes.length) {
-      const novas = partes.map((segmento) => {
-        if (!segmentoUsaStatusCanonico(segmento)) return segmento;
-
-        const padrao = statusPadraoObraDoSegmento(segmento);
-        if (padrao?.campo === "em_andamento_obra" && temEmAndamento) {
-          return `em_andamento_obra = ${padrao.valor ? "true" : "false"}`;
-        }
-        if (padrao?.campo === "concluido" && temConcluido) {
-          return `concluido = ${padrao.valor ? "true" : "false"}`;
-        }
-
-        // Paralisada, Retomada e qualquer outro status especifico da obra.
-        return temStatusOriginal
-          ? substituirIdentificadorStatus(segmento, "status_original")
-          : segmento;
-      });
-      s = substituirWhereSimples(s, novas.join(" AND "));
-    }
-  }
-
-  // Mesmo quando a IA nao colocou um filtro de status, a pergunta pode ter
-  // pedido explicitamente "obras em andamento"/"obras concluidas". Reforcamos
-  // os booleanos normalizados para abranger EM_ANDAMENTO e PAVIMENTACAO juntas.
-  const p = normalizar(perguntaBase);
-  if (/\bem andamento\b/.test(p) && temEmAndamento && !/\bem_andamento_obra\b/i.test(s)) {
-    s = adicionarCondicaoWhere(s, "em_andamento_obra = true");
-  }
-  if (/\bconclu(?:id|i)/.test(p) && temConcluido && !/\bconcluido\b/i.test(s)) {
-    s = adicionarCondicaoWhere(s, "concluido = true");
-  }
-
-  // Se restou alguma referencia generica a status (SELECT, GROUP BY, ORDER BY
-  // ou um filtro especifico), mostre/use o status real da origem.
-  if (temStatusOriginal && (usavaStatusCanonico || /\b(status|situacao|situação|etapa)\b/.test(p))) {
-    s = substituirIdentificadorStatus(s, "status_original");
-  }
-
-  return limparSQL(s);
-}
-
-function corrigirRankingValorTotalPorEntidade(pergunta = "", sql = "") {
-  const p = normalizar(pergunta);
-  let s = limparSQL(sql);
-  if (!s) return s;
-
-  const pedeEntidade = /\b(engenheir|arquit|responsavel|empresa|bairro)\w*\b/.test(p);
-  const pedeExtremo = /\b(maior|mais|menor|menos)\b/.test(p);
-  const pedeTotalFinanceiro = /\b(valor\s+(?:total\s+)?investid|investimento|valor\s+total|total\s+investid)\w*\b/.test(p);
-  const agrupada = /\bgroup\s+by\b/i.test(s);
-  const usaMaxValorTotal = /\bmax\s*\(\s*valor_total\s*\)/i.test(s);
-
-  if (!(pedeEntidade && pedeExtremo && pedeTotalFinanceiro && agrupada && usaMaxValorTotal)) return s;
-
-  // Troca apenas o agregado do valor_total. Mantem alias, GROUP BY, filtros e ORDER BY.
-  return s.replace(/\bmax\s*\(\s*valor_total\s*\)/ig, "SUM(valor_total)");
-}
+// V16: removido bloco legado de regex/rewrite de negocio.
+// Regex abaixo deste ponto servem apenas a parsing/seguranca de SQL e formatacao tecnica.
 
 function stripThink(texto = "") {
   return String(texto || "").replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
@@ -1102,7 +592,7 @@ function normalizarPlano(obj) {
   return p;
 }
 
-async function planejarConsultaSemantica(pergunta, historico, ctx) {
+async function planejarConsultaSemantica(pergunta, historico, ctx, contextScope = {}) {
   const prompt = `Voce e o PLANEJADOR SEMANTICO de um agente Text-to-SQL. NAO gere SQL nesta etapa.\n` +
     `Converta a pergunta em um plano estruturado e faca schema linking: ligue cada conceito pedido a coluna/chave JSON real.\n` +
     `O objetivo e evitar correcoes por frase/regex. Pense em INTENCAO, UNIVERSO, ENTIDADE, MEDIDA, FILTROS, CAMPOS e FORMATO ESPERADO.\n\n` +
@@ -1117,6 +607,7 @@ async function planejarConsultaSemantica(pergunta, historico, ctx) {
     `- needs_multiple_candidates=true apenas para consulta complexa/ambigua, ranking delicado, multiplas agregacoes ou quando ha mais de um caminho SQL plausivel.\n` +
     `- needs_semantic_validation=true quando execucao SQL bem-sucedida ainda puder nao responder a pergunta (campo sujo, conceito parecido, JSONB, ranking/medida ambigua).\n\n` +
     `SCHEMA COMPACTO E VALORES REAIS:\n${schemaCompactoParaPlanejamento(ctx)}\n\n` +
+    `ESCOPO CONVERSACIONAL RESOLVIDO (se houver):\n${jsonSeguro(contextScope || {}, 3000)}\n\n` +
     `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
     `PERGUNTA: ${JSON.stringify(pergunta)}\n\n` +
     `Retorne SOMENTE JSON neste formato:\n` +
@@ -1144,6 +635,32 @@ async function planejarConsultaSemantica(pergunta, historico, ctx) {
     const p = planoPadrao();
     p.notes = ["planejamento_semantico_indisponivel"];
     return p;
+  }
+}
+
+
+async function revisarPlanoComContexto({ pergunta, plano, resolucao, ctx }) {
+  if (!resolucao?.is_followup) return plano;
+  const prompt = `Voce e o VALIDADOR DE CONTEXTO de um Text-to-SQL. NAO gere SQL.\n` +
+    `A mensagem atual ja foi reescrita como pergunta autonoma. Confira se o plano preserva exatamente o conjunto referenciado pelo usuario.\n` +
+    `Nao recupere filtros de assuntos antigos. Nao remova filtros do encadeamento atual. Nao invente filtros.\n` +
+    `Se o plano estiver correto, devolva-o sem mudancas. Se perdeu o recorte, corrija somente o plano usando a pergunta autonoma e o escopo resolvido.\n\n` +
+    `PERGUNTA AUTONOMA: ${JSON.stringify(pergunta)}\n` +
+    `ESCOPO RESOLVIDO: ${jsonSeguro(resolucao.scope || {}, 3500)}\n` +
+    `PLANO ATUAL: ${jsonSeguro(plano, 7000)}\n` +
+    `SCHEMA: ${schemaCompactoParaPlanejamento(ctx)}\n\n` +
+    `Retorne SOMENTE o JSON completo do plano, no mesmo formato recebido.`;
+  try {
+    const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
+      max_tokens: 800,
+      temperature: 0,
+      reasoning_effort: "low",
+    });
+    const revisto = normalizarPlano(objetoJSONEmTexto(bruto));
+    return revisto.confidence > 0 ? revisto : plano;
+  } catch (e) {
+    console.warn("SQL AGENT - revisao de contexto falhou; mantendo plano:", e?.message || e);
+    return plano;
   }
 }
 
@@ -1200,7 +717,7 @@ async function gerarSQLPorPlano(pergunta, historico, ctx, plano, exemplos = [], 
     `PLANO SEMANTICO:\n${jsonSeguro(plano, 7000)}\n\n` +
     `EXEMPLOS DINAMICOS MAIS PARECIDOS (apenas como padrao estrutural; nunca copie valores inexistentes):\n${exemplosParaPrompt(exemplos)}\n\n` +
     `SCHEMA REAL:\n${schemaCompactoParaPlanejamento(ctx)}\n\n` +
-    `HISTORICO/ANCORA:\n${ancoraContextoRecente(historico)}\n\n` +
+    `HISTORICO/ANCORA:\n${resumoHistorico(historico)}\n\n` +
     (correcao ? `FEEDBACK DA AVALIACAO ANTERIOR:\n${correcao}\n\n` : "") +
     `PERGUNTA ORIGINAL: ${JSON.stringify(pergunta)}`;
 
@@ -1360,12 +877,17 @@ async function executarPipelineSemantico({ pergunta, historico, ctx, plano }) {
 
   let validos = candidatos.filter((c) => c.execucao).sort((a, b) => (b.score || 0) - (a.score || 0));
   if (!validos.length) {
-    // Fallback: mantem compatibilidade com o gerador antigo se o novo pipeline falhar.
-    const antiga = await gerarSQL(pergunta, historico, ctx);
-    if (!antiga.query) throw new Error("Nao foi possivel gerar uma consulta SQL valida.");
-    const execucao = await executarComSelfHealing({ pergunta, historico, ctx, sqlInicial: antiga.query });
+    // Segunda chance ainda dentro do pipeline semantico. Nao volta ao gerador
+    // legado nem a regras/regex de negocio.
+    const gerada = await gerarSQLPorPlano(
+      pergunta, [], ctx, plano, exemplos, "decomposicao",
+      "As tentativas anteriores falharam. Gere uma nova SQL seguindo estritamente o plano e o schema real."
+    );
+    if (!gerada?.query) throw new Error("Nao foi possivel gerar uma consulta SQL valida a partir do plano semantico.");
+    const execucao = await executarComSelfHealing({ pergunta, historico: [], ctx, sqlInicial: gerada.query });
     const local = avaliarResultadoLocalSemantico(plano, execucao.sql, execucao.rows);
-    return { plano, exemplos, candidato: { variante: "fallback", gerada: antiga, execucao, local, semantica: { score: local.score, verdict: "accept", reason: "fallback" }, score: local.score }, candidatos };
+    const semantica = await avaliarCandidatoComIA({ pergunta, plano, sql: execucao.sql, rows: execucao.rows, avaliacaoLocal: local });
+    return { plano, exemplos, candidato: { variante: "fallback_semantico", gerada, execucao, local, semantica, score: semantica.score }, candidatos };
   }
 
   let melhor = validos[0];
@@ -1394,104 +916,263 @@ async function executarPipelineSemantico({ pergunta, historico, ctx, plano }) {
   return { plano, exemplos, candidato: melhor, candidatos };
 }
 
-async function normalizarResultadoSemanticoSeNecessario({ pergunta, plano, rows, avaliacao }) {
-  const precisa = plano.result_normalization?.needed === true || avaliacao?.normalization_needed === true;
-  const shape = plano.expected_result?.shape || "";
-  if (!precisa || !["distinct_list", "records", "grouped"].includes(shape) || !Array.isArray(rows) || !rows.length) {
-    return { rows, changed: false, note: "" };
-  }
 
-  const conceito = plano.result_normalization?.concept || plano.expected_result?.primary_concept || "valor categorico";
-  const prompt = `Voce e uma camada de NORMALIZACAO SEMANTICA de resultados, nao um pesquisador.\n` +
-    `O usuario pediu o conceito ${JSON.stringify(conceito)}. Os valores brutos podem misturar esse conceito com endereco, descricao, caixa alta/baixa ou mais de um valor na mesma string.\n` +
-    `Extraia APENAS valores do conceito que estejam EXPLICITAMENTE presentes no texto retornado. NUNCA infira um valor que nao esteja escrito.\n` +
-    `Pode: remover duplicatas por caixa/acento, limpar rotulo/endereco ao redor, e separar dois valores quando ambos estiverem explicitamente nomeados (ex.: "Bairro: Centro e Gurguri").\n` +
-    `Nao pode: adivinhar bairro por nome de rua, CEP, coordenada ou conhecimento externo. Valores sem evidencia explicita do conceito devem ser omitidos e contabilizados na nota.\n` +
-    `Preserve outros campos quando existirem e forem necessarios para responder.\n\n` +
-    `PERGUNTA: ${JSON.stringify(pergunta)}\nPLANO: ${jsonSeguro(plano, 5000)}\n` +
-    `DADOS BRUTOS: ${jsonSeguro(rows.slice(0, 100), 18000)}\n\n` +
-    `Retorne SOMENTE JSON {"rows":[...],"note":"frase curta sobre valores omitidos/normalizados"}.`;
-  try {
-    const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
-      max_tokens: 1800,
-      temperature: 0,
-      reasoning_effort: "low",
-    });
-    const o = objetoJSONEmTexto(bruto) || {};
-    if (!Array.isArray(o.rows)) return { rows, changed: false, note: "" };
-    return {
-      rows: o.rows.slice(0, MAX_RESULTADOS),
-      changed: true,
-      note: textoSeguro(o.note || plano.result_normalization?.reason || "resultado normalizado semanticamente", 900),
-    };
-  } catch (e) {
-    console.warn("SQL AGENT - normalizacao semantica falhou; usando bruto:", e?.message || e);
-    return { rows, changed: false, note: plano.result_normalization?.reason || "" };
-  }
+function slugSemantico(s = "campo") {
+  const n = normalizar(s).replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return n || "campo";
 }
 
-// ------------------------------------------------------------
-// Geracao SQL (estagio 1)
-// ------------------------------------------------------------
-async function gerarSQL(pergunta, historico, ctx, correcao = "") {
-  const prompt = `Voce e um SQL AGENT especializado em PostgreSQL para um chatbot de obras publicas.\n` +
-    `Transforme a pergunta do usuario em UMA consulta SQL que responda exatamente ao pedido.\n\n` +
-    `${regrasNegocio(ctx)}\n` +
-    `REGRAS DE CONVERSA:\n` +
-    `- Use o historico para resolver 'essas', 'delas', 'dele', 'qual delas', 'e o valor?', 'e quem cuida?' etc.\n` +
-    `- Follow-up deve preservar o RECORTE anterior, mesmo que a consulta imediatamente anterior tenha apenas projetado/agrupado um campo.\n` +
-    `- Perguntar um NOVO CAMPO ou MEDIDA do conjunto atual (valor, recurso, status, responsavel, contrato, data, percentual, etc.) NAO e um novo assunto. Preserve os filtros WHERE do recorte anterior.\n` +
-    `- Se o conjunto atual for, por exemplo, projetos concluidos e o usuario perguntar se eles tem valor, consulte ESSES projetos concluidos. Se nenhum tiver valor, retorne 0 linhas/resultado vazio correto; NAO amplie para todas as obras so para achar dados.\n` +
-    `- Um novo alvo explicito no turno atual substitui contexto incompatível anterior.\n` +
-    `- Se o usuario disser 'em geral/no total', remova filtros de status/andamento herdados quando eles apenas limitavam o conjunto anterior, mas preserve entidades explicitamente referenciadas, principalmente a pessoa apontada por ele/ela/dele/dela.\n` +
-    `- PRONOME DE PESSOA: se a resposta anterior identificou um engenheiro/arquiteto e o usuario perguntar 'ela tem quantas obras em geral?', 'quais obras ela tem?', 'e os projetos dele?' etc., filtre pelo mesmo engenheiro/responsavel. Nunca transforme isso em contagem de toda a base.\n\n` +
-    `REGRAS SQL:\n` +
-    `- UNIVERSO BLOQUEADO: se REGRAS DE NEGOCIO identificarem um unico universo, TODAS as partes da SQL devem usar somente esse universo. Campos diferentes pedidos pelo usuario NAO autorizam trocar projeto por obra, obra por licitacao etc.\n` +
-    `- PEDIDO COMPOSTO: se o usuario pedir nome dos registros + responsavel/status/recurso/valor/etc., prefira um unico SELECT com objeto + campos pedidos. Nao separe em listas por UNION quando os dados pertencem aos mesmos registros.\n` +
-    `- Apenas SELECT ou WITH ... SELECT. Nunca escreva dados.\n` +
-    `- Consulte SOMENTE public.${ctx.relacao}.\n` +
-    `- Nao consulte information_schema, pg_catalog, auth, storage ou outras tabelas.\n` +
-    `- Prefira agregacoes SQL reais (COUNT, SUM, AVG, GROUP BY, ORDER BY) quando a pergunta pedir calculo/ranking.\n` +
-    `- SOMA/MEDIA EXPLICAVEL: quando somar ou calcular media de um conjunto e houver nomes/valores por registro, prefira retornar a composicao junto do agregado, por exemplo objeto + valor_total + SUM(valor_total) OVER () AS total_investido. Assim a resposta consegue explicar de onde saiu o total.\n` +
-    `- RANKING POR ENTIDADE + VALOR TOTAL: se a pergunta for qual engenheiro/responsavel/empresa/bairro tem MAIOR ou MENOR valor total/investido no conjunto, agrupe pela entidade e use SUM(valor_total). NUNCA use MAX(valor_total) para esse pedido, porque MAX representa somente a maior obra individual. Use MAX apenas quando o usuario pedir explicitamente a maior obra/maior valor individual.\n` +
-    `- RANKING POR QUANTIDADE: se a pergunta for qual engenheiro/responsavel/empresa/bairro tem mais ou menos obras, use COUNT(*) por entidade, GROUP BY, ORDER BY COUNT ASC/DESC e retorne sempre a entidade junto da contagem.\n` +
-    `- EXISTENCIA/ALGUM: perguntas do tipo "existe/tem algum" NAO devem ser respondidas escolhendo um registro arbitrario com LIMIT 1. Use COUNT, agrupamento por tipo_negocio ou liste o conjunto real. Se nao houver universo claro nem recorte anterior, resuma por tipo_negocio em vez de escolher um item ao acaso.\n` +
-    `- Para 'quais engenheiros dessas obras?', se o usuario quer apenas a lista de nomes, SELECT DISTINCT engenheiro e valido; se ele pedir quem e responsavel por cada obra, retorne objeto + engenheiro.\n` +
-    `- FOLLOW-UP DE CAMPO SOBRE UM CONJUNTO: quando o usuario perguntar 'quais os recursos?', 'quais os status?', 'quais os engenheiros?', 'quais os contratos?' etc. sobre varios registros ja em contexto, prefira UMA LINHA POR REGISTRO com objeto + campo pedido. So use DISTINCT campo sozinho quando ele pedir explicitamente valores unicos/diferentes ou apenas os nomes sem associar a cada registro.\n` +
-    `- RECURSOS: quando a pergunta envolver recurso de obras/projetos/licitacoes e as colunas existirem, retorne objeto, recurso e tipo_recurso. Esses campos tem significados diferentes e a resposta deve manter a associacao de cada registro.\n` +
-    `- ANALISE DE LICITACAO: "proposta analisada/nao analisada" refere-se EXCLUSIVAMENTE a chave dados_extras->>'PROPOSTA ANALISADA'. "habilitacao analisada/nao analisada" refere-se EXCLUSIVAMENTE a dados_extras->>'HABILITAÇÃO ANALISADA' (ou a chave real equivalente exibida no schema). Esses campos pertencem SEMPRE a tipo_negocio='licitacao'; NUNCA use tipo_negocio='obra' ou 'projeto' para perguntas de proposta/habilitacao analisada. NUNCA deduza esses conceitos por status ou status_original.\n` +
-    `- Para valor Sim/Nao desses campos de analise, compare o valor da chave diretamente (aceitando variacao de acento/caixa quando necessario). Nao use status_original NOT ILIKE '%analis%' como substituto.\n` +
-    `- CAMPO LIVRE/JSONB: se o usuario pedir um campo especifico que NAO exista como coluna canonica, procure o nome correspondente nas CHAVES REAIS DE dados_extras. Quando houver correspondencia clara, leia a chave exata com dados_extras->>'CHAVE' e use um alias legivel.\n` +
-    `- NUNCA substitua um campo pedido por outro apenas porque o nome parece parecido. Uma data especifica, etapa, numero, observacao ou indicador pode viver em dados_extras e NAO significa automaticamente data_inicio, data_prev_termino ou outro campo canonico.\n` +
-    `- Se houver coluna canonica E chave JSON com sentidos diferentes, preserve a semantica pedida pelo usuario e escolha a fonte que corresponde ao nome/conceito solicitado.\n` +
-    `- Para 'valor total investido' de um conjunto, some valor_total, salvo quando o usuario pedir explicitamente valor executado/pago.\n` +
-    `- Para 'quanto falta', use valor_total - valor_executado quando essas colunas existirem.\n` +
-    `- Nao invente valores de status, nomes, bairros, engenheiros ou empresas; use os valores reais do schema/contexto.\n` +
-    `- LIGACAO SEMANTICA: quando o usuario pedir uma CLASSE ou CONCEITO amplo (sigla, tipo de equipamento, servico ou categoria), nao filtre apenas a palavra literal. Considere abreviacoes, forma por extenso e sinonimos realmente equivalentes em portugues e compare com o CATALOGO DE OBJETOS REAIS. Use OR com ILIKE apenas para equivalencias semanticamente justificadas.\n` +
-    `- AREA DA SAUDE: considere apenas equipamentos/servicos claramente de saude, como UBS/unidade basica de saude, posto de saude, PSF, hospital, policlinica, unidade de saude e academia da saude quando existirem no catalogo real. CRECHE e ESCOLA pertencem a educacao e NAO devem entrar como saude apenas por inferencia. Nunca invente nomes de equipamentos para completar uma categoria.\n` +
-    `- Para alvo proprio/especifico (nome de bairro, rua, equipamento com nome proprio), seja conservador: nao expanda para conceitos diferentes.\n` +
-    `- Em busca ampla por assunto, voce pode procurar em objeto, categoria e dados_extras::text quando essas colunas existirem; mantenha o tipo_negocio correto.\n` +
-    `- Se um termo livre puder ser nome parcial, use ILIKE/LOWER de forma tolerante.\n` +
-    `- Retorne colunas suficientes para responder, mas nao SELECT * sem necessidade.\n` +
-    `- Retorne SOMENTE JSON {"description":"...","query":"SELECT ..."}. Se nao puder responder com o schema, use query="".\n\n` +
-    `SCHEMA E DADOS REAIS:\n${schemaParaPrompt(ctx)}\n\n` +
-    `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
-    `ANCORA DO CONTEXTO ATUAL:\n${ancoraContextoRecente(historico)}\n\n` +
-    `REFERENCIA DE PESSOA NO CONTEXTO:\n${contextoReferenciaPessoa(historico, pergunta)}\n\n` +
-    `REFERENCIA DE PESSOA NO CONTEXTO:\n${contextoReferenciaPessoa(historico, pergunta)}\n\n` +
-    (correcao ? `CONTEXTO DE CORRECAO: ${correcao}\n\n` : "") +
-    `PERGUNTA ATUAL: ${JSON.stringify(pergunta)}`;
+function dimensaoPrincipalDoPlano(plano = {}) {
+  const alvo = normalizar(plano.expected_result?.primary_concept || "");
+  const entidades = Array.isArray(plano.entities) ? plano.entities : [];
+  const candidatas = entidades.filter((e) => e && e.required !== false && (e.role === "dimension" || normalizar(e.concept || "") === alvo));
+  const e = candidatas[0] || entidades.find((x) => x?.role === "dimension") || null;
+  if (!e) return null;
+  return {
+    concept: e.concept || plano.expected_result?.primary_concept || "dimensao",
+    source: e.source || null,
+    json_keys: Array.isArray(e.json_keys) ? e.json_keys.filter(Boolean) : [],
+  };
+}
 
+function medidaPrincipalDoPlano(plano = {}) {
+  const medidas = Array.isArray(plano.measures) ? plano.measures.filter(Boolean) : [];
+  const m = medidas[0] || null;
+  if (!m) return null;
+  return {
+    concept: m.concept || "medida",
+    source: m.source || null,
+    json_keys: Array.isArray(m.json_keys) ? m.json_keys.filter(Boolean) : [],
+    aggregation: normalizar(m.aggregation || "none"),
+  };
+}
+
+function chaveDimensaoResultado(rows = [], dimensao = null) {
+  if (!rows.length) return dimensao?.source && dimensao.source !== "dados_extras" ? dimensao.source : slugSemantico(dimensao?.concept || "dimensao");
+  const keys = Object.keys(rows[0] || {});
+  const source = normalizar(dimensao?.source || "");
+  const concept = normalizar(dimensao?.concept || "");
+  const exata = keys.find((k) => normalizar(k) === source || normalizar(k) === concept);
+  if (exata) return exata;
+  const bruta = keys.find((k) => normalizar(k).includes(source) || normalizar(k).includes(concept));
+  return bruta || (dimensao?.source && dimensao.source !== "dados_extras" ? dimensao.source : slugSemantico(dimensao?.concept || "dimensao"));
+}
+
+function chaveMedidaResultado(rows = [], dimensaoKey = "", medida = null) {
+  if (!rows.length) {
+    if (medida?.aggregation === "count") return "quantidade";
+    return `total_${slugSemantico(medida?.concept || "valor")}`;
+  }
+  const keys = Object.keys(rows[0] || {}).filter((k) => k !== dimensaoKey && k !== "id" && k !== "objeto");
+  const numeric = keys.find((k) => rows.some((r) => numeroParaAnalise(r?.[k]) !== null));
+  if (numeric) return numeric;
+  if (medida?.aggregation === "count") return "quantidade";
+  return `total_${slugSemantico(medida?.concept || "valor")}`;
+}
+
+async function gerarSQLDeEvidenciasSemanticas({ pergunta, plano, sqlOriginal, ctx, dimensao, medida }) {
+  const prompt = `Voce e o GERADOR DE EVIDENCIAS de um pipeline Text-to-SQL.\n` +
+    `Gere UMA SELECT em nivel de registro, para o MESMO conjunto/filtros da SQL original, sem GROUP BY, DISTINCT agregado ou resumo.\n` +
+    `Objetivo: permitir ao Node validar e reagrupar uma dimensao categorica semanticamente suja sem deixar a IA inventar contagens.\n` +
+    `Retorne obrigatoriamente: id::text AS __row_id (ou uma chave estavel equivalente se id nao existir), objeto quando existir, e a fonte BRUTA da dimensao como __dim_raw.\n` +
+    `Se houver medida numerica com agregacao diferente de count/none, retorne o valor POR REGISTRO que entra no calculo como __measure_0. Para pagamento, respeite as json_keys do plano e nao duplique familias sobrepostas.\n` +
+    `Preserve EXATAMENTE universo, filtros e recorte da SQL original. Nao amplie o conjunto.\n` +
+    `Nao use LIMIT: o Node controla o limite de evidencias para nao truncar silenciosamente a agregacao.\n` +
+    `Use somente public.${ctx.relacao}. Nao limpe/extraia a dimensao na SQL; queremos o texto bruto.\n` +
+    `Retorne SOMENTE JSON {"description":"...","query":"SELECT ..."}.\n\n` +
+    `PERGUNTA: ${JSON.stringify(pergunta)}\n` +
+    `PLANO: ${jsonSeguro(plano, 6500)}\n` +
+    `DIMENSAO: ${jsonSeguro(dimensao, 1800)}\n` +
+    `MEDIDA: ${jsonSeguro(medida, 1800)}\n` +
+    `SQL ORIGINAL: ${sqlOriginal}\n` +
+    `SCHEMA: ${schemaCompactoParaPlanejamento(ctx)}`;
   const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
-    max_tokens: 420,
+    max_tokens: 520,
     temperature: 0,
     reasoning_effort: "low",
   });
   return extrairSQLDaResposta(bruto);
 }
 
+
+function catalogarValoresBrutos(evidenceRows = []) {
+  const porRaw = new Map();
+  for (const r of evidenceRows) {
+    const raw = r?.__dim_raw == null ? "" : String(r.__dim_raw);
+    const key = raw;
+    if (!porRaw.has(key)) porRaw.set(key, { raw_id: String(porRaw.size + 1), raw });
+  }
+  return [...porRaw.values()];
+}
+
+async function mapearValoresPorEvidencia({ pergunta, plano, dimensao, evidenceRows }) {
+  const catalogo = catalogarValoresBrutos(evidenceRows);
+  const mappings = [];
+  const notes = [];
+
+  for (let i = 0; i < catalogo.length; i += MAX_RAW_VALUES_PER_BATCH) {
+    const lote = catalogo.slice(i, i + MAX_RAW_VALUES_PER_BATCH);
+    const prompt = `Voce e um CLASSIFICADOR DE EVIDENCIAS. Nao conte, nao some e nao produza resposta final.\n` +
+      `Para cada valor bruto, extraia somente valores que REALMENTE representem o conceito ${JSON.stringify(dimensao.concept)} e estejam explicitamente escritos no raw.\n` +
+      `A saida de cada valor deve conter label e evidence. evidence deve ser o trecho EXATO do raw que sustenta o label.\n` +
+      `label pode apenas normalizar caixa, acento e espacos de evidence; nao pode trocar por sinonimo, completar, abreviar nem usar conhecimento externo.\n` +
+      `Se raw for endereco/descricao e nao houver evidencia suficiente de que um trecho e o conceito pedido, retorne values:[] para esse raw.\n` +
+      `Nao trate nome de rua, avenida, travessa, trecho, numero, referencia geografica ou descricao como o conceito pedido apenas porque aparece no campo.\n` +
+      `Se dois valores do conceito estiverem explicitamente presentes no mesmo raw, pode retornar os dois.\n` +
+      `Se o raw inteiro for claramente um valor categorico simples do conceito, evidence pode ser o raw inteiro.\n` +
+      `Nunca invente contagens. O Node fara toda agregacao depois de validar as evidencias.\n\n` +
+      `PERGUNTA: ${JSON.stringify(pergunta)}\nPLANO: ${jsonSeguro(plano, 4500)}\n` +
+      `VALORES BRUTOS: ${jsonSeguro(lote, 18000)}\n\n` +
+      `Retorne SOMENTE JSON {"mappings":[{"raw_id":"...","values":[{"label":"...","evidence":"..."}]}],"note":"..."}.`;
+
+    const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
+      max_tokens: 2200,
+      temperature: 0,
+      reasoning_effort: "low",
+    });
+    const obj = objetoJSONEmTexto(bruto) || {};
+    if (Array.isArray(obj.mappings)) mappings.push(...obj.mappings);
+    if (obj.note) notes.push(textoSeguro(obj.note, 600));
+  }
+
+  return { mappings, note: notes.filter(Boolean).join(" ") };
+}
+
+function validarMapeamentosPorEvidencia(evidenceRows = [], mappings = []) {
+  const catalogo = catalogarValoresBrutos(evidenceRows);
+  const porRawId = new Map(catalogo.map((x) => [String(x.raw_id), x]));
+  const validosPorRaw = new Map();
+
+  for (const m of mappings || []) {
+    const rawId = String(m?.raw_id ?? "");
+    const item = porRawId.get(rawId);
+    if (!item) continue;
+    const rawN = normalizar(item.raw);
+    const values = [];
+    const vistos = new Set();
+    for (const v of Array.isArray(m?.values) ? m.values : []) {
+      const evidence = textoSeguro(v?.evidence || "", 500);
+      const label = textoSeguro(v?.label || "", 500);
+      const eN = normalizar(evidence);
+      const lN = normalizar(label);
+      if (!eN || !lN || !rawN.includes(eN)) continue;
+      if (lN !== eN) continue;
+      if (vistos.has(lN)) continue;
+      vistos.add(lN);
+      values.push({ label, evidence, key: lN });
+    }
+    validosPorRaw.set(item.raw, values);
+  }
+
+  return { validosPorRaw };
+}
+
+function reagruparPorEvidencias({ plano, originalRows, evidenceRows, validacao, dimensao, medida }) {
+  const dimKey = chaveDimensaoResultado(originalRows, dimensao);
+  const measureKey = chaveMedidaResultado(originalRows, dimKey, medida);
+  const grupos = new Map();
+  let mapeados = 0;
+  let semEvidencia = 0;
+
+  for (let i = 0; i < evidenceRows.length; i++) {
+    const row = evidenceRows[i] || {};
+    const raw = row.__dim_raw == null ? "" : String(row.__dim_raw);
+    const values = validacao.validosPorRaw.get(raw) || [];
+    if (!values.length) { semEvidencia++; continue; }
+    mapeados++;
+    const unicos = new Map(values.map((v) => [v.key, v]));
+    for (const v of unicos.values()) {
+      if (!grupos.has(v.key)) grupos.set(v.key, { label: v.label, count: 0, nums: [] });
+      const g = grupos.get(v.key);
+      g.count += 1;
+      const n = numeroParaAnalise(row.__measure_0);
+      if (n !== null) g.nums.push(n);
+      // Prefere grafia informativa que nao seja toda caixa alta quando ambas existirem.
+      const atualMaiuscula = g.label && g.label === g.label.toUpperCase();
+      const novaMaiuscula = v.label && v.label === v.label.toUpperCase();
+      if (atualMaiuscula && !novaMaiuscula) g.label = v.label;
+    }
+  }
+
+  const agg = normalizar(medida?.aggregation || (plano.expected_result?.numeric_kind === "count" ? "count" : "none"));
+  let rows = [...grupos.values()].map((g) => {
+    const r = { [dimKey]: g.label };
+    if (agg === "count" || plano.expected_result?.numeric_kind === "count") r[measureKey] = g.count;
+    else if (agg === "sum") r[measureKey] = Number(decimalSomar(g.nums));
+    else if (agg === "avg") r[measureKey] = g.nums.length ? g.nums.reduce((a, b) => a + b, 0) / g.nums.length : null;
+    else if (agg === "max") r[measureKey] = g.nums.length ? Math.max(...g.nums) : null;
+    else if (agg === "min") r[measureKey] = g.nums.length ? Math.min(...g.nums) : null;
+    return r;
+  });
+
+  if (plano.expected_result?.shape === "distinct_list" || agg === "none") {
+    rows = rows.map((r) => ({ [dimKey]: r[dimKey] }));
+  } else if (plano.intent === "rank") {
+    rows.sort((a, b) => (numeroParaAnalise(b?.[measureKey]) ?? -Infinity) - (numeroParaAnalise(a?.[measureKey]) ?? -Infinity));
+  } else {
+    rows.sort((a, b) => String(a?.[dimKey] || "").localeCompare(String(b?.[dimKey] || ""), "pt-BR", { sensitivity: "base" }));
+  }
+
+  const total = evidenceRows.length;
+  const note = `${rows.length} valores de ${dimensao.concept} foram consolidados a partir de evidencias textuais de ${mapeados} de ${total} registros; ${semEvidencia} registro(s) sem evidencia suficiente foram omitidos da classificacao, sem inventar valores.`;
+  return { rows: rows.slice(0, MAX_RESULTADOS), note, stats: { total, mapeados, semEvidencia, grupos: rows.length } };
+}
+
+async function normalizarResultadoSemanticoSeNecessario({ pergunta, plano, rows, avaliacao, sqlOriginal, ctx }) {
+  const shape = plano.expected_result?.shape || "";
+  const dimensao = dimensaoPrincipalDoPlano(plano);
+  if (!Array.isArray(rows) || !rows.length || !dimensao) return { rows, changed: false, note: "", stats: null };
+
+  const shapesAgrupaveis = new Set(["distinct_list", "grouped", "ranking"]);
+  const precisa = plano.result_normalization?.needed === true || avaliacao?.normalization_needed === true || shapesAgrupaveis.has(shape);
+  if (!precisa) return { rows, changed: false, note: "", stats: null };
+
+  const medida = medidaPrincipalDoPlano(plano);
+  let evidenceRows = [];
+
+  try {
+    if (shape === "distinct_list") {
+      const dimKey = chaveDimensaoResultado(rows, dimensao);
+      evidenceRows = rows.map((r, i) => ({ __row_id: String(i + 1), __dim_raw: r?.[dimKey] }));
+    } else {
+      const evid = await gerarSQLDeEvidenciasSemanticas({ pergunta, plano, sqlOriginal, ctx, dimensao, medida });
+      if (!evid?.query) throw new Error("SQL de evidencias nao gerada");
+      const valid = validarSQL(evid.query, ctx);
+      if (!valid.ok) throw new Error(`SQL de evidencias rejeitada: ${valid.motivo}`);
+      const sqlEvidencia = `SELECT * FROM (${valid.sql}) AS __evidence_scope LIMIT ${MAX_EVIDENCE_ROWS}`;
+      const rr = await queryReadOnly(sqlEvidencia);
+      evidenceRows = rr.rows || [];
+      if (evidenceRows.length >= MAX_EVIDENCE_ROWS) {
+        throw new Error(`O recorte de evidencias atingiu o limite seguro de ${MAX_EVIDENCE_ROWS} linhas; a normalizacao foi interrompida para nao produzir contagem parcial.`);
+      }
+    }
+
+    if (!evidenceRows.length) {
+      return { rows: [], changed: true, note: `Nao houve registros em nivel de evidencia para validar ${dimensao.concept}; nenhum valor foi inventado.`, stats: { total: 0, mapeados: 0, semEvidencia: 0, grupos: 0 } };
+    }
+
+    const mapeamento = await mapearValoresPorEvidencia({ pergunta, plano, dimensao, evidenceRows });
+    const validacao = validarMapeamentosPorEvidencia(evidenceRows, mapeamento.mappings);
+    const regroup = reagruparPorEvidencias({ plano, originalRows: rows, evidenceRows, validacao, dimensao, medida });
+    const note = [regroup.note, mapeamento.note].filter(Boolean).join(" ");
+    return { rows: regroup.rows, changed: true, note, stats: regroup.stats };
+  } catch (e) {
+    console.warn("SQL AGENT - normalizacao por evidencias falhou; resultado bruto NAO sera reclassificado:", e?.message || e);
+    // Em caso de falha de normalizacao, nao deixamos a IA inventar uma limpeza.
+    // Mantemos o resultado bruto e deixamos a nota explicita de qualidade.
+    return {
+      rows,
+      changed: false,
+      note: `Os dados de ${dimensao.concept} nao puderam ser normalizados com evidencias suficientes; exibindo apenas o resultado bruto do banco, sem reinterpretar valores.`,
+      stats: null,
+    };
+  }
+}
+
 // ------------------------------------------------------------
-// Guardrail SQL
+// Validacao tecnica da SQL
+// Regex daqui em diante sao exclusivamente de seguranca/parsing tecnico,
+// nunca para decidir significado de pergunta ou regra de negocio.
 // ------------------------------------------------------------
 const PALAVRAS_PROIBIDAS = /\b(insert|update|delete|drop|alter|create|truncate|merge|grant|revoke|copy|call|execute|vacuum|analyze|refresh|reindex|cluster|comment|security|set\s+role|set\s+session)\b/i;
 const FUNCOES_PROIBIDAS = /\b(pg_sleep|dblink|lo_import|lo_export|pg_read_file|pg_read_binary_file|pg_ls_dir|current_setting\s*\(|set_config\s*\()/i;
@@ -1579,7 +1260,7 @@ async function repararSQL({ pergunta, historico, ctx, sqlAtual, erro = null, lin
     `SEGURANCA: somente SELECT/WITH SELECT em public.${ctx.relacao}.\n\n` +
     `SCHEMA REAL:\n${schemaParaPrompt(ctx)}\n\n` +
     `HISTORICO:\n${resumoHistorico(historico)}\n\n` +
-    `ANCORA DO CONTEXTO ATUAL:\n${ancoraContextoRecente(historico)}\n\n` +
+    `ANCORA DO CONTEXTO ATUAL:\n${resumoHistorico(historico)}\n\n` +
     `IMPORTANTE: resultado vazio pode ser a resposta correta. Nunca remova filtros herdados do recorte anterior apenas para produzir linhas.\n` +
     `PERGUNTA ORIGINAL: ${JSON.stringify(pergunta)}\n` +
     `SQL ATUAL: ${sqlAtual}\n` +
@@ -1621,11 +1302,11 @@ function resultadoSoComCamposVazios(rows = []) {
 }
 
 function aplicarGuardrailsNegocio(pergunta = "", historico = [], sql = "", ctx = null) {
-  let s = limparSQL(sql);
-  s = garantirUniversoNegocio(pergunta, historico, s);
-  s = corrigirStatusPorUniverso(pergunta, historico, s, ctx);
-  s = garantirUniversoNegocio(pergunta, historico, s); // revalida apos ajuste de status
-  return limparSQL(s);
+  // V15: nenhuma reescrita semantica por regex/regra de frase.
+  // A semantica e decidida pelo resolvedor + planejador + avaliador IA.
+  // Aqui ficam somente limpeza/parsing da SQL; a seguranca READ ONLY continua
+  // sendo garantida por validarSQL/queryReadOnly.
+  return limparSQL(sql);
 }
 
 async function executarComSelfHealing({ pergunta, historico, ctx, sqlInicial }) {
@@ -1651,27 +1332,6 @@ async function executarComSelfHealing({ pergunta, historico, ctx, sqlInicial }) 
     }
 
     try {
-      // Regra de negocio: campos do mesmo conjunto devem permanecer associados
-      // na mesma linha. Se ainda restou UNION numa pergunta composta de universo
-      // unico, tenta reparar antes de executar.
-      if (pedidoCompostoMesmoUniverso(pergunta, validacao.sql) && tentativa < MAX_REPAROS) {
-        const reparoNegocio = await repararSQL({
-          pergunta,
-          historico,
-          ctx,
-          sqlAtual: validacao.sql,
-          erro: {
-            tipo: "BusinessRuleError",
-            mensagem: "Pedido composto do mesmo universo nao deve separar nomes e atributos por UNION. Retorne uma linha por registro com objeto + todos os campos pedidos e preserve o mesmo tipo_negocio em toda a SQL."
-          },
-        });
-        const candidataNegocio = limparSQL(reparoNegocio.query);
-        if (candidataNegocio && candidataNegocio !== validacao.sql) {
-          sqlAtual = aplicarGuardrailsNegocio(pergunta, historico, candidataNegocio, ctx);
-          continue;
-        }
-      }
-
       const sqlExecucao = aplicarLimite(validacao.sql);
       const r = await queryReadOnly(sqlExecucao);
       const rows = r.rows || [];
@@ -2167,7 +1827,7 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx, analiseDados
   // Respostas triviais continuam locais para economizar tokens, EXCETO quando
   // a camada semantica sinalizou normalizacao/risco e a redacao precisa explicar.
   const forcarSemantica = analiseDados?.forcar_redacao_semantica === true;
-  if (!forcarSemantica) {
+  if (!forcarSemantica && !planoSemantico) {
     const agregadoComDimensao = respostaAgregadoComDimensaoSegura(pergunta, rows);
     if (agregadoComDimensao) return agregadoComDimensao;
 
@@ -2217,7 +1877,8 @@ async function redigirResposta(pergunta, historico, sql, rows, ctx, analiseDados
     `Recurso e tipo_recurso sao campos diferentes; nao troque um pelo outro.\n` +
     `Nao mostre SQL ao usuario na resposta natural.\n\n` +
     `PLANO SEMANTICO (use para manter o significado exato da pergunta):\n${jsonSeguro(planoSemantico || {}, 5000)}\n\n` +
-    `NOTA DE NORMALIZACAO/QUALIDADE: ${textoSeguro(analiseDados?.nota_normalizacao || "", 1000)}\n\n` +
+    `NOTA DE NORMALIZACAO/QUALIDADE: ${textoSeguro(analiseDados?.nota_normalizacao || "", 1000)}\n` +
+    `Se essa nota informar registros omitidos por falta de evidencia, mencione isso de forma curta e NAO apresente os omitidos como categorias validas. As contagens em DADOS RETORNADOS ja foram recalculadas pelo Node e sao autoritativas.\n\n` +
     `PERGUNTA: ${JSON.stringify(pergunta)}\n` +
     `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
     `SQL EXECUTADA: ${sql}\n` +
@@ -2259,7 +1920,7 @@ function estadoPublico(ctx, execucao, analiseDados = null) {
 }
 
 // ------------------------------------------------------------
-// Fluxo principal V14 semantico
+// Fluxo principal V16 semantico
 // ------------------------------------------------------------
 export async function responderPergunta(pergunta, historico = []) {
   const texto = textoSeguro(pergunta, 1600);
@@ -2271,15 +1932,25 @@ export async function responderPergunta(pergunta, historico = []) {
   try {
     const ctx = await carregarSchemaContexto();
 
-    // DIN-SQL: primeiro entende a pergunta e faz schema linking; so depois gera SQL.
-    const plano = await planejarConsultaSemantica(texto, historico, ctx);
+    // V16: primeiro resolve a conversa inteira para UMA pergunta autonoma.
+    // Depois disso, o planejador/gerador nao recebe o historico cru, evitando
+    // que filtros antigos contaminem o turno atual ou que um follow-up perca o
+    // recorte ativo.
+    const resolucao = await resolverPerguntaConversacional(texto, historico, ctx);
+    const perguntaResolvida = resolucao.pergunta_autonoma || texto;
+    console.log("SQL AGENT - PERGUNTA AUTONOMA:", perguntaResolvida);
+    console.log("SQL AGENT - CONTEXTO RESOLVIDO:", jsonSeguro(resolucao.scope || {}, 3000));
+
+    // DIN-SQL: entende a pergunta autonoma e faz schema linking; so depois gera SQL.
+    let plano = await planejarConsultaSemantica(perguntaResolvida, [], ctx, resolucao.scope || {});
+    plano = await revisarPlanoComContexto({ pergunta: perguntaResolvida, plano, resolucao, ctx });
     console.log("SQL AGENT - PLANO SEMANTICO:", jsonSeguro(plano, 5000));
 
     if (plano.clarification?.needed && plano.clarification?.question) {
       return {
         resposta: plano.clarification.question,
         erro: null,
-        modoAgente: "sql_agent_semantic_v14_clarification",
+        modoAgente: "sql_agent_semantic_v16_clarification",
         plano: {
           intent: plano.intent,
           universes: plano.universes,
@@ -2290,7 +1961,7 @@ export async function responderPergunta(pergunta, historico = []) {
 
     // DAIL-SQL + CHASE-SQL lite: exemplos relevantes, um ou dois caminhos e
     // selecao pelo quanto a consulta/resultado realmente responde ao plano.
-    const pipeline = await executarPipelineSemantico({ pergunta: texto, historico, ctx, plano });
+    const pipeline = await executarPipelineSemantico({ pergunta: perguntaResolvida, historico: [], ctx, plano });
     const escolhido = pipeline.candidato;
     const execucao = escolhido.execucao;
 
@@ -2306,10 +1977,12 @@ export async function responderPergunta(pergunta, historico = []) {
     // endereco), normaliza apenas o que estiver explicitamente escrito. Isso
     // evita chamar endereco de bairro sem criar regex por pergunta.
     const normalizado = await normalizarResultadoSemanticoSeNecessario({
-      pergunta: texto,
+      pergunta: perguntaResolvida,
       plano,
       rows: execucao.rows,
       avaliacao: escolhido.semantica,
+      sqlOriginal: execucao.sql,
+      ctx,
     });
 
     const rowsResposta = normalizado.rows;
@@ -2320,12 +1993,19 @@ export async function responderPergunta(pergunta, historico = []) {
       expected_result: plano.expected_result,
       confidence: plano.confidence,
     };
+    analiseDados.contexto_conversacional = {
+      pergunta_autonoma: perguntaResolvida,
+      is_followup: resolucao.is_followup === true,
+      scope: resolucao.scope || {},
+      confidence: resolucao.confidence || 0,
+    };
     analiseDados.avaliacao_semantica = {
       score: escolhido.score,
       verdict: escolhido.semantica?.verdict || "local",
       reason: escolhido.semantica?.reason || "",
     };
     analiseDados.nota_normalizacao = normalizado.note || "";
+    analiseDados.estatisticas_normalizacao = normalizado.stats || null;
     analiseDados.forcar_redacao_semantica = normalizado.changed === true || escolhido.semantica?.normalization_needed === true;
 
     const resposta = await redigirResposta(
@@ -2348,6 +2028,16 @@ export async function responderPergunta(pergunta, historico = []) {
         semantic_score: escolhido.score,
         semantic_verdict: escolhido.semantica?.verdict || "local",
         normalizacao_aplicada: normalizado.changed === true,
+        context_scope: resolucao.scope || {},
+        standalone_question: perguntaResolvida,
+        semantic_scope: {
+          universes: plano.universes || [],
+          subject_terms: plano.subject_terms || [],
+          filters: plano.filters || [],
+          entities: (plano.entities || []).map((e) => ({ concept: e?.concept, source: e?.source, role: e?.role })),
+          measures: (plano.measures || []).map((m) => ({ concept: m?.concept, source: m?.source, aggregation: m?.aggregation })),
+          expected_result: plano.expected_result || {},
+        },
       },
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
@@ -2365,14 +2055,14 @@ export async function responderPergunta(pergunta, historico = []) {
         expected_result: plano.expected_result,
         confidence: plano.confidence,
       },
-      modoAgente: "sql_agent_semantic_v14_din_dail_chase",
+      modoAgente: "sql_agent_semantic_v16_evidence_grounding",
     };
   } catch (e) {
     console.error("SQL AGENT: falha final:", e);
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "sql_agent_semantic_v14_erro",
+      modoAgente: "sql_agent_semantic_v16_erro",
     };
   }
 }
