@@ -1,10 +1,11 @@
 // ============================================================
-// agente.js - AGENTE GOOGLE SHEETS COM FERRAMENTAS (SEM SQL) - V4 BAIRROS RIGOROSOS + ESCOPO
+// agente.js - GOOGLE SHEETS + ARQUERO + DECIMAL.JS (SEM SQL) - V5
 // ============================================================
 // Inspirado no padrao de agentes de planilha do n8n:
 // - a IA entende a pergunta e escolhe uma ferramenta;
 // - o Node le a planilha real via getObras();
-// - filtros, contagens, somas, agrupamentos e rankings sao calculados pelo Node;
+// - Arquero executa a analise tabular (contagem/agrupamento) e o Node aplica as regras de negocio;
+// - Decimal.js executa somas financeiras sem perda de precisao;
 // - a IA NAO recebe a planilha inteira e NAO gera SQL;
 // - follow-ups usam somente o ultimo estado valido da conversa.
 //
@@ -18,6 +19,8 @@
 
 import { getObras } from "./sheets.js";
 import { chamarIAbruta } from "./groq.js";
+import * as aq from "arquero";
+import Decimal from "decimal.js";
 
 const MAX_PASSOS = Math.max(2, Math.min(Number(process.env.AGENTE_SHEETS_PASSOS || 4), 6));
 const MAX_LISTA = Math.max(5, Math.min(Number(process.env.AGENTE_SHEETS_MAX_LISTA || 30), 100));
@@ -118,8 +121,21 @@ function parseNumero(v) {
   return negativo ? -n : n;
 }
 
+function parseDecimal(v) {
+  const n = parseNumero(v);
+  if (n === null) return null;
+  try { return new Decimal(String(n)); } catch { return null; }
+}
+
+function numeroFormatavel(n) {
+  if (n instanceof Decimal) return n.toNumber();
+  if (n && typeof n.toNumber === "function") return n.toNumber();
+  const num = Number(n);
+  return Number.isFinite(num) ? num : 0;
+}
+
 function formatarNumero(n) {
-  return new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 2 }).format(Number(n) || 0);
+  return new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 2 }).format(numeroFormatavel(n));
 }
 
 function formatarMoeda(n) {
@@ -128,7 +144,7 @@ function formatarMoeda(n) {
     currency: "BRL",
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
-  }).format(Number(n) || 0);
+  }).format(numeroFormatavel(n));
 }
 
 function pareceCampoDinheiro(nome = "") {
@@ -199,7 +215,7 @@ const ESCOPOS = {
 const ALIASES_CAMPOS = {
   objeto: [
     "objeto", "objeto da obra", "objeto do projeto", "objeto da licitacao",
-    "obra", "descricao da obra", "descricao", "servico", "nome do projeto",
+    "obra", "descricao da obra", "descricao", "servico", "nome do projeto", "rua",
   ],
   bairro: ["bairro"],
   localidade: ["localidade", "comunidade", "distrito", "loteamento"],
@@ -208,13 +224,13 @@ const ALIASES_CAMPOS = {
   status: ["status", "situacao", "situacao atual", "andamento"],
   engenheiro: ["engenheiro", "engenheiro responsavel", "responsavel tecnico", "responsavel"],
   empresa: ["empresa", "empresa executora", "construtora", "contratada"],
-  recurso: ["recurso", "fonte de recurso", "fonte", "origem do recurso"],
+  recurso: ["recurso", "fonte de recurso", "fonte", "origem do recurso", "convenio recurso", "convênio/recurso"],
   tipo_recurso: ["tipo recurso", "tipo de recurso"],
   contrato: ["contrato", "n do contrato", "numero do contrato", "nº do contrato"],
   convenio: ["convenio", "proposta", "n do convenio proposta", "nº do convenio proposta"],
   valor_total: [
     "valor total da obra", "valor total", "valor global", "valor contratado",
-    "valor contratado mais aditivo", "valor contratadomaisaditivo",
+    "valor contratado mais aditivo", "valor contratadomaisaditivo", "valor (r$)", "valor r$", "valor",
   ],
   valor_executado: ["valor executado", "valor medido", "executado"],
   percentual_executado: ["% executada", "% executado", "percentual executado", "percentual executada"],
@@ -288,11 +304,20 @@ function resolverCampoNaLinha(row, campo) {
 function valorCampo(row, campo) {
   if (campo === "_aba" || campo === "aba") return row?._aba ?? null;
   const real = resolverCampoNaLinha(row, campo);
-  return real ? row[real] : null;
+  if (real) return row[real];
+
+  // Para linhas de pavimentação/endereço, BAIRRO pode estar embutido em RUA.
+  // O mesmo extrator seguro usado nos agrupamentos passa a valer também para filtros.
+  const c = normalizar(campo);
+  if (c === "bairro" || c === "localidade") {
+    return bairroDerivadoDaLinha(row)?.grupo || null;
+  }
+  return null;
 }
 
 function objetoDaLinha(row) {
-  return valorCampo(row, "objeto") || valorCampo(row, "descricao") || "Registro";
+  // PAVIMENTAÇÃO normalmente identifica o registro pela coluna RUA.
+  return valorCampo(row, "objeto") || valorCampo(row, "descricao") || valorCampo(row, "rua") || "Registro";
 }
 
 // ------------------------------------------------------------
@@ -382,6 +407,96 @@ const TERMOS_GENERICOS_ESCOPO = {
   pavimentacao: ["pavimentacao", "pavimentacoes"],
 };
 
+// ------------------------------------------------------------
+// Camada semantica deterministica de status/escopo.
+// A IA escolhe a ferramenta; estas regras impedem que termos de ciclo
+// claramente escritos pelo usuario virem apenas "escopo" e percam o filtro.
+// ------------------------------------------------------------
+function statusSemanticoDaLinha(row) {
+  const s = normalizar(valorCampo(row, "status"));
+  const escopo = escopoDaAba(row?._aba);
+  if (!s) return "";
+
+  if (escopo === "obra" || escopo === "pavimentacao") {
+    if (/\b(executada|executadas|concluida|concluidas|concluido|concluidos|finalizada|finalizadas|finalizado|finalizados)\b/.test(s)) return "concluida";
+    if (/\b(a executar|nao iniciada|nao iniciadas|nao iniciado|nao iniciados|a iniciar|para iniciar)\b/.test(s)) return "a_iniciar";
+    if (/\bparalisad/.test(s)) return "paralisada";
+    if (/\bretomad/.test(s)) return "retomada";
+    if (/\b(em andamento|em execucao|em obra|execucao)\b/.test(s)) return "em_andamento";
+  }
+
+  if (escopo === "projeto") {
+    if (/\b(concluida|concluido|concluidas|concluidos|finalizad)\b/.test(s)) return "concluida";
+    if (/\bem revisao\b/.test(s)) return "em_revisao";
+    if (/\bem elaboracao\b/.test(s)) return "em_elaboracao";
+    if (/\baguardando aprovacao\b/.test(s)) return "aguardando_aprovacao";
+    if (/\bstand by\b/.test(s)) return "stand_by";
+    if (/\b(nao iniciada|a iniciar|a executar)\b/.test(s)) return "a_iniciar";
+    if (/\b(em andamento|em execucao)\b/.test(s)) return "em_andamento";
+  }
+
+  if (escopo === "licitacao") {
+    if (/\bhomologad/.test(s)) return "homologada";
+    if (/\bhabilitacao\b/.test(s)) return "habilitacao";
+    if (/\bpropost/.test(s) && /\banalis/.test(s)) return "analise_propostas";
+    if (/\bedital publicado\b/.test(s)) return "edital_publicado";
+    if (/\bpendencia\b/.test(s)) return "pendencia";
+  }
+
+  return chaveNormalizada(s);
+}
+
+function detectarStatusSemanticoNaPergunta(pergunta = "") {
+  const q = normalizar(pergunta);
+  if (!q) return "";
+
+  // Negacoes complexas ficam para o planner; nao forcamos um status positivo.
+  if (/\bnao\s+(?:esta|estao|ficou|ficaram)?\s*(?:em )?(andamento|execucao|concluid|executad|iniciad)/.test(q)) return "";
+
+  if (/\b(em andamento|em execucao)\b/.test(q)) return "em_andamento";
+  if (/\b(concluida|concluidas|concluido|concluidos|executada|executadas|finalizada|finalizadas|finalizado|finalizados)\b/.test(q)) return "concluida";
+  if (/\b(a executar|nao iniciada|nao iniciadas|nao iniciado|nao iniciados|a iniciar|para iniciar|pra comecar|para comecar)\b/.test(q)) return "a_iniciar";
+  if (/\bparalisad/.test(q)) return "paralisada";
+  if (/\bretomad/.test(q)) return "retomada";
+  if (/\bem revisao\b/.test(q)) return "em_revisao";
+  if (/\bem elaboracao\b/.test(q)) return "em_elaboracao";
+  if (/\baguardando aprovacao\b/.test(q)) return "aguardando_aprovacao";
+  if (/\bhomologad/.test(q)) return "homologada";
+  if (/\bhabilitacao\b/.test(q)) return "habilitacao";
+  return "";
+}
+
+function detectarEscopoExplicito(pergunta = "") {
+  const q = normalizar(pergunta);
+  if (/\blicitac/.test(q) || /\bcertame/.test(q)) return "licitacao";
+  if (/\bprojet/.test(q)) return "projeto";
+  if (/\bpavimentac/.test(q)) return "pavimentacao";
+  if (/\bobras?\b/.test(q)) return "obra";
+  return "";
+}
+
+function aplicarGuardasSemanticas(pergunta, plano = {}) {
+  const p = { ...plano, args: { ...(plano.args || {}) } };
+  const escopo = detectarEscopoExplicito(pergunta);
+  const status = detectarStatusSemanticoNaPergunta(pergunta);
+
+  if (escopo) {
+    p.args.escopo = [escopo];
+    p.inherit_scope = false;
+  }
+  if (status) p.args.status_semantico = status;
+
+  // "quais projetos concluídos?" nunca deve virar uma distribuição por status.
+  const campoGrupo = normalizar(p.args.campo || "");
+  if (status && p.tool === "agrupar_por" && (campoGrupo === "status" || campoGrupo === "situacao")) {
+    p.tool = "buscar_obras";
+    delete p.args.campo;
+    delete p.args.ordenar_por;
+    p.args.campos = p.args.campos?.length ? p.args.campos : ["objeto", "status", "engenheiro", "empresa", "valor_total"];
+  }
+  return p;
+}
+
 function sanitizarArgsDeEscopo(args = {}) {
   const a = { ...args };
   const escopos = unico(Array.isArray(a.escopo) ? a.escopo : [a.escopo].filter(Boolean)).map(normalizar);
@@ -414,6 +529,11 @@ function filtrarLinhas(rows, args = {}) {
 
   const filtros = Array.isArray(args.filtros) ? args.filtros : [];
   if (filtros.length) out = out.filter((r) => filtros.every((f) => compararFiltro(r, f)));
+
+  const statusSemantico = normalizar(args.status_semantico || "").replace(/\s+/g, "_");
+  if (statusSemantico) {
+    out = out.filter((r) => statusSemanticoDaLinha(r) === statusSemantico);
+  }
 
   const termos = unico(Array.isArray(args.termos) ? args.termos : [args.termos].filter(Boolean));
   if (termos.length) {
@@ -683,20 +803,28 @@ function ferramentaBuscar(rows, args = {}) {
 function ferramentaContar(rows, args = {}) {
   const encontrados = filtrarLinhas(rows, args);
   const distinto = args.distinto_por;
+
   if (distinto) {
-    const valores = unico(encontrados.map((r) => normalizar(valorCampo(r, distinto))).filter(Boolean));
-    return { tipo: "contagem", total: valores.length, distinto_por: distinto };
+    const base = encontrados
+      .map((r) => ({ valor: normalizar(valorCampo(r, distinto)) }))
+      .filter((x) => x.valor);
+    if (!base.length) return { tipo: "contagem", total: 0, distinto_por: distinto, motor: "arquero" };
+    const tabela = aq.from(base);
+    const grupos = tabela.groupby("valor").count({ as: "quantidade" });
+    return { tipo: "contagem", total: grupos.numRows(), distinto_por: distinto, motor: "arquero" };
   }
-  return { tipo: "contagem", total: encontrados.length };
+
+  const tabela = aq.from(encontrados.map((_, i) => ({ _id: i + 1 })));
+  return { tipo: "contagem", total: tabela.numRows(), motor: "arquero" };
 }
 
 function somaCamposDaLinha(row, campos) {
-  let soma = 0;
+  let soma = new Decimal(0);
   let usados = 0;
   for (const c of campos) {
-    const n = parseNumero(valorCampo(row, c));
+    const n = parseDecimal(valorCampo(row, c));
     if (n !== null) {
-      soma += n;
+      soma = soma.plus(n);
       usados += 1;
     }
   }
@@ -714,8 +842,8 @@ async function ferramentaSomar(rows, args = {}) {
     const grupos = new Map();
     let registrosComValor = 0;
     let registrosIdentificados = 0;
-    let valorIdentificado = 0;
-    let valorNaoIdentificado = 0;
+    let valorIdentificado = new Decimal(0);
+    let valorNaoIdentificado = new Decimal(0);
 
     for (const row of encontrados) {
       const val = somaCamposDaLinha(row, campos);
@@ -724,26 +852,29 @@ async function ferramentaSomar(rows, args = {}) {
 
       const infoGrupo = grupoDimensaoDaLinha(row, agruparPor, args.normalizar_dimensao === true);
       if (!infoGrupo?.grupo) {
-        valorNaoIdentificado += val;
+        valorNaoIdentificado = valorNaoIdentificado.plus(val);
         continue;
       }
 
       const rotulo = capitalizarRotuloDimensao(infoGrupo.grupo, args.conceito || agruparPor);
       const key = normalizar(rotulo);
       if (!key) {
-        valorNaoIdentificado += val;
+        valorNaoIdentificado = valorNaoIdentificado.plus(val);
         continue;
       }
-      if (!grupos.has(key)) grupos.set(key, { grupo: rotulo, valor: 0, registros: 0 });
+      if (!grupos.has(key)) grupos.set(key, { grupo: rotulo, valor: new Decimal(0), registros: 0 });
       const obj = grupos.get(key);
-      obj.valor += val;
+      obj.valor = obj.valor.plus(val);
       obj.registros += 1;
       registrosIdentificados += 1;
-      valorIdentificado += val;
+      valorIdentificado = valorIdentificado.plus(val);
     }
 
     let itens = [...grupos.values()];
-    itens.sort((a, b) => (normalizar(args.direcao || "desc") === "asc" ? a.valor - b.valor : b.valor - a.valor));
+    itens.sort((a, b) => {
+      const cmp = a.valor.comparedTo(b.valor);
+      return normalizar(args.direcao || "desc") === "asc" ? cmp : -cmp;
+    });
     const limite = Math.max(1, Math.min(Number(args.limite || MAX_LISTA), 100));
     const totalGrupos = itens.length;
     itens = itens.slice(0, limite);
@@ -755,27 +886,34 @@ async function ferramentaSomar(rows, args = {}) {
       registros_identificados: registrosIdentificados,
       registros_nao_identificados: Math.max(0, registrosComValor - registrosIdentificados),
       cobertura_percentual: registrosComValor ? Number(((registrosIdentificados / registrosComValor) * 100).toFixed(1)) : 0,
-      valor_identificado: valorIdentificado,
-      valor_nao_identificado: valorNaoIdentificado,
+      valor_identificado: valorIdentificado.toFixed(),
+      valor_nao_identificado: valorNaoIdentificado.toFixed(),
       campo_grupo: agruparPor,
       campos,
-      itens,
+      itens: itens.map((x) => ({ ...x, valor: x.valor.toFixed() })),
       total_grupos: totalGrupos,
       truncado: totalGrupos > limite,
       normalizacao_aplicada: normalizar(agruparPor).includes("bairro") || normalizar(agruparPor).includes("localidade") || args.normalizar_dimensao === true,
     };
   }
 
-  let total = 0;
+  let total = new Decimal(0);
   let comValor = 0;
   for (const row of encontrados) {
     const val = somaCamposDaLinha(row, campos);
     if (val !== null) {
-      total += val;
+      total = total.plus(val);
       comValor += 1;
     }
   }
-  return { tipo: "soma", total, registros: encontrados.length, registros_com_valor: comValor, campos };
+  return {
+    tipo: "soma",
+    total: total.toFixed(),
+    registros: encontrados.length,
+    registros_com_valor: comValor,
+    campos,
+    motor: "decimal.js",
+  };
 }
 
 // Normalizacao generica para dimensoes textuais sujas (ex.: bairro contendo endereco).
@@ -826,7 +964,8 @@ async function ferramentaAgrupar(rows, args = {}) {
   const campo = args.campo;
   if (!campo) return { tipo: "erro_ferramenta", erro: "agrupar_por exige campo" };
   const encontrados = filtrarLinhas(rows, args);
-  const grupos = new Map();
+  const labels = new Map();
+  const baseAgrupamento = [];
 
   for (const row of encontrados) {
     const info = grupoDimensaoDaLinha(row, campo, args.normalizar_dimensao === true);
@@ -834,11 +973,21 @@ async function ferramentaAgrupar(rows, args = {}) {
     if (!g) continue;
     const rotulo = capitalizarRotuloDimensao(g, args.conceito || campo);
     const key = normalizar(rotulo);
-    if (!grupos.has(key)) grupos.set(key, { grupo: rotulo, quantidade: 0 });
-    grupos.get(key).quantidade += 1;
+    if (!key) continue;
+    if (!labels.has(key)) labels.set(key, rotulo);
+    baseAgrupamento.push({ key });
   }
 
-  const itensBrutos = [...grupos.values()];
+  let itensBrutos = [];
+  if (baseAgrupamento.length) {
+    // Arquero faz o GROUP BY/COUNT de forma tabular e deterministica.
+    const tabela = aq.from(baseAgrupamento);
+    itensBrutos = tabela
+      .groupby("key")
+      .count({ as: "quantidade" })
+      .objects()
+      .map((x) => ({ grupo: labels.get(x.key) || x.key, quantidade: Number(x.quantidade) || 0 }));
+  }
   const registrosComValorDimensao = itensBrutos.reduce((acc, x) => acc + (Number(x.quantidade) || 0), 0);
   const registrosSemValorDimensao = Math.max(0, encontrados.length - registrosComValorDimensao);
   let itens = [...itensBrutos];
@@ -908,6 +1057,7 @@ async function ferramentaAgrupar(rows, args = {}) {
     registros_identificados: registrosIdentificados,
     registros_nao_identificados: registrosNaoIdentificados,
     cobertura_percentual: coberturaPercentual,
+    motor: "arquero",
   };
 }
 
@@ -949,9 +1099,15 @@ function mergeArgsComEstado(args = {}, plano = {}, estado = null) {
   if ((!a.escopo || (Array.isArray(a.escopo) && !a.escopo.length)) && estado.escopo) a.escopo = estado.escopo;
   if ((!a.termos || !a.termos.length) && estado.termos?.length) a.termos = [...estado.termos];
   if ((!a.campos_busca || !a.campos_busca.length) && estado.campos_busca?.length) a.campos_busca = [...estado.campos_busca];
+  if (!a.status_semantico && estado.status_semantico) a.status_semantico = estado.status_semantico;
 
-  const anteriores = Array.isArray(estado.filtros) ? estado.filtros : [];
+  let anteriores = Array.isArray(estado.filtros) ? estado.filtros : [];
   const atuais = Array.isArray(a.filtros) ? a.filtros : [];
+  // Um novo status semantico substitui filtros antigos de status, em vez de somar
+  // "concluido" + "em andamento" no mesmo follow-up.
+  if (a.status_semantico) {
+    anteriores = anteriores.filter((f) => !["status", "situacao", "situacao atual"].includes(normalizar(f?.campo || f?.field || "")));
+  }
   a.filtros = [...anteriores, ...atuais];
 
   return a;
@@ -965,6 +1121,7 @@ function construirEstado(plano, args, resultado) {
     termos: Array.isArray(args.termos) ? args.termos : [args.termos].filter(Boolean),
     campos_busca: Array.isArray(args.campos_busca) ? args.campos_busca : [],
     filtros: Array.isArray(args.filtros) ? args.filtros : [],
+    status_semantico: texto(args.status_semantico),
     ferramenta: plano.tool,
     label: texto(plano.label || "registros"),
     momento: Date.now(),
@@ -989,13 +1146,13 @@ Sua funcao e escolher UMA ferramenta para consultar os dados reais de um Google 
 FERRAMENTAS DISPONIVEIS:
 1) listar_colunas({aba?})
    - descobre colunas reais e exemplos.
-2) buscar_obras({escopo, termos, modo_termos, campos_busca, filtros, campos, ordenar_por, direcao, limite})
+2) buscar_obras({escopo, status_semantico?, termos, modo_termos, campos_busca, filtros, campos, ordenar_por, direcao, limite})
    - lista registros e campos.
-3) contar_obras({escopo, termos, modo_termos, campos_busca, filtros, distinto_por?})
+3) contar_obras({escopo, status_semantico?, termos, modo_termos, campos_busca, filtros, distinto_por?})
    - conta registros ou valores distintos.
-4) agrupar_por({escopo, campo, termos, modo_termos, campos_busca, filtros, ordenar_por, direcao, limite, normalizar_dimensao, conceito})
+4) agrupar_por({escopo, campo, status_semantico?, termos, modo_termos, campos_busca, filtros, ordenar_por, direcao, limite, normalizar_dimensao, conceito})
    - agrupa e conta por uma dimensao. Para dimensoes textuais sujas como bairro/localidade, use normalizar_dimensao=true.
-5) somar({escopo, campo?, campos?, termos, modo_termos, campos_busca, filtros, agrupar_por?, normalizar_dimensao?, conceito?, direcao, limite})
+5) somar({escopo, campo?, campos?, status_semantico?, termos, modo_termos, campos_busca, filtros, agrupar_por?, normalizar_dimensao?, conceito?, direcao, limite})
    - soma valores numericos. campos permite somar mais de uma coluna por registro quando o conceito exigir.
 6) responder
    - somente para saudacao, conversa social ou quando for indispensavel pedir esclarecimento.
@@ -1015,8 +1172,10 @@ CONTEXTO:
 
 SEMANTICA:
 - Use os nomes de coluna reais informados no CATALOGO quando possivel; nomes canonicos como objeto, bairro, engenheiro, empresa, status, recurso, valor_total, valor_executado tambem sao aceitos.
-- "valor pago" NAO e automaticamente "valor executado". Se houver colunas de pagamento, use as de pagamento.
-- Para "total investido" use valor total da obra/contrato, salvo se o usuario pedir outra metrica.
+- Quando o usuario pedir um ciclo de status, prefira status_semantico: em_andamento, concluida, a_iniciar, paralisada, retomada, em_revisao, em_elaboracao, aguardando_aprovacao, homologada ou habilitacao. O Node valida o status real da planilha antes de responder.
+- "obras em andamento" NAO significa todas as linhas da aba de obras: exige status_semantico="em_andamento". "obras concluídas/executadas" exige status_semantico="concluida".
+- "valor pago", "quanto foi gasto" ou "desembolsado" NAO e automaticamente "valor executado" nem "valor total". Se houver colunas de pagamento, use as de pagamento; se a planilha nao permitir distinguir, nao invente.
+- Para "total investido", "valor das obras" ou "valor contratado" use valor_total, salvo se o usuario pedir outra metrica.
 - Nunca invente filtros, nomes, bairros, empresas, engenheiros ou valores.
 - ESCOLHA DA FERRAMENTA: buscar_obras serve para identificar/listar QUAIS registros atendem a uma condicao e/ou mostrar detalhes. agrupar_por serve SOMENTE para distribuicao por dimensao (ex.: quantos em cada bairro/status/engenheiro).
 - Portanto, se o usuario pedir quais registros estao em um status especifico (ex.: quais projetos estao concluidos), use buscar_obras + filtro de status; NAO use agrupar_por status.
@@ -1080,8 +1239,15 @@ function rotuloCampo(campo) {
   return mapa[campo] || texto(campo).replace(/_/g, " ");
 }
 
+function limparLabelHumano(v = "") {
+  return texto(v)
+    .replace(/^(?:contar|listar|buscar|mostrar|somar|agrupar)\s+/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function formatarResultado(plano, resultado) {
-  const label = texto(plano?.label) || "registros";
+  const label = limparLabelHumano(plano?.label) || "registros";
 
   if (!resultado || resultado.tipo === "erro_ferramenta") {
     return resultado?.erro || "Não consegui consultar os dados da planilha.";
@@ -1191,7 +1357,7 @@ export async function responderPergunta(pergunta, historico = []) {
       linhas: 0,
       erro: "pergunta vazia",
       estado: ultimoEstadoValido(historico),
-      modoAgente: "google_sheets_tools_v3",
+      modoAgente: "google_sheets_arquero_decimal_v5",
     };
   }
 
@@ -1205,7 +1371,7 @@ export async function responderPergunta(pergunta, historico = []) {
       linhas: 0,
       erro: e?.message || String(e),
       estado: ultimoEstadoValido(historico),
-      modoAgente: "google_sheets_tools_v3",
+      modoAgente: "google_sheets_arquero_decimal_v5",
     };
   }
 
@@ -1219,6 +1385,7 @@ export async function responderPergunta(pergunta, historico = []) {
   for (let passo = 0; passo < MAX_PASSOS; passo++) {
     try {
       plano = await planejar(q, historico, estadoAtual, catalogo, observacao);
+      plano = aplicarGuardasSemanticas(q, plano || {});
     } catch (e) {
       return {
         resposta: "Não consegui interpretar a pergunta agora. Tente novamente em alguns segundos.",
@@ -1226,7 +1393,7 @@ export async function responderPergunta(pergunta, historico = []) {
         linhas: 0,
         erro: e?.message || String(e),
         estado: estadoAtual,
-        modoAgente: "google_sheets_tools_v3",
+        modoAgente: "google_sheets_arquero_decimal_v5",
       };
     }
 
@@ -1237,7 +1404,7 @@ export async function responderPergunta(pergunta, historico = []) {
         linhas: 0,
         erro: "planner sem ferramenta",
         estado: estadoAtual,
-        modoAgente: "google_sheets_tools_v3",
+        modoAgente: "google_sheets_arquero_decimal_v5",
       };
     }
 
@@ -1248,7 +1415,7 @@ export async function responderPergunta(pergunta, historico = []) {
         linhas: 0,
         erro: "",
         estado: estadoAtual,
-        modoAgente: "google_sheets_tools_v3",
+        modoAgente: "google_sheets_arquero_decimal_v5",
       };
     }
 
@@ -1285,7 +1452,7 @@ export async function responderPergunta(pergunta, historico = []) {
     erro: "",
     estado,
     ferramenta: plano?.tool || null,
-    modoAgente: "google_sheets_tools_v3",
+    modoAgente: "google_sheets_arquero_decimal_v5",
     fonte: "Google Sheets",
   };
 }
