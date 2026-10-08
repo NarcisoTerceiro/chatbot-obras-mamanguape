@@ -253,12 +253,18 @@ function resolverCampoNaLinha(row, campo) {
 
 function valorCampo(row, campo) {
   if (campo === "_aba" || campo === "aba") return row?._aba ?? null;
+  if (campo === "status_grupo") return grupoStatus(valorCampo(row, "status"));
+  if (campo === "bairro_limpo") return bairroLimpo(row);
   const real = resolverCampoNaLinha(row, campo);
   return real ? row[real] : null;
 }
 
 function objetoDaLinha(row) {
-  return valorCampo(row, "objeto") || valorCampo(row, "descricao") || "Registro";
+  for (const c of ["objeto", "descricao", "obra", "servico"]) {
+    const v = texto(valorCampo(row, c));
+    if (v && parseNumero(v) === null && /[a-zA-Z]/.test(v)) return v;
+  }
+  return "Registro sem nome da obra";
 }
 
 // ------------------------------------------------------------
@@ -372,6 +378,281 @@ function ordenarLinhas(rows, ordenarPor, direcao = "asc") {
     if (na !== null && nb !== null) return (na - nb) * dir;
     return texto(va).localeCompare(texto(vb), "pt-BR", { sensitivity: "base" }) * dir;
   });
+}
+
+
+// ============================================================
+// CAMADA DETERMINISTICA (correcoes)
+// A IA so sugere; status, escopo, dimensao, campo financeiro e
+// heranca de contexto sao decididos aqui, por regra fixa.
+// ============================================================
+
+// ---------- Cabecalhos de abas mal lidos (ex.: EM_LICITACAO) ----------
+function colunaGenerica(c) {
+  const s = texto(c);
+  return !s || /^(_?\d+|col(una|umn)?\s*\d*|field\s*\d+|unnamed.*|__empty.*|[a-z])$/i.test(s) || parseNumero(s) !== null;
+}
+
+function pontuacaoCabecalho(valores) {
+  let pts = 0;
+  for (const v of valores) {
+    const n = normalizar(v);
+    if (!n) continue;
+    if (Object.values(ALIASES_NORMALIZADOS).some((lista) => lista.includes(n))) pts += 1;
+  }
+  return pts;
+}
+
+function corrigirCabecalhos(rows) {
+  const porAba = new Map();
+  for (const r of rows || []) {
+    const aba = texto(r?._aba) || "(sem aba)";
+    if (!porAba.has(aba)) porAba.set(aba, []);
+    porAba.get(aba).push(r);
+  }
+  const saida = [];
+  for (const [aba, lista] of porAba) {
+    const cols = unico(lista.flatMap((r) => colunasDaLinha(r)));
+    const genericas = cols.filter(colunaGenerica).length;
+    const ptsAtual = pontuacaoCabecalho(cols);
+    let idxCab = -1;
+    let melhor = ptsAtual;
+    if (genericas / Math.max(cols.length, 1) >= 0.4 || ptsAtual < 2) {
+      for (let i = 0; i < Math.min(6, lista.length); i++) {
+        const pts = pontuacaoCabecalho(cols.map((c) => lista[i][c]));
+        if (pts >= 2 && pts > melhor) { melhor = pts; idxCab = i; }
+      }
+    }
+    if (idxCab >= 0) {
+      const cab = lista[idxCab];
+      const mapa = cols.map((c) => [c, texto(cab[c]) || c]);
+      for (const r of lista.slice(idxCab + 1)) {
+        const novo = { _aba: aba };
+        for (const [antigo, nome] of mapa) novo[nome] = r[antigo];
+        saida.push(novo);
+      }
+    } else {
+      saida.push(...lista);
+    }
+  }
+  // Remove linhas totalmente vazias.
+  return saida.filter((r) => colunasDaLinha(r).some((c) => texto(r[c])));
+}
+
+// ---------- Status: grupos fixos, nunca misturados ----------
+const ORDEM_STATUS = ["a_executar", "paralisada", "em_execucao", "concluida", "executada", "em_projeto", "em_licitacao"];
+const STATUS_GRUPOS = {
+  a_executar: ["a executar", "nao iniciada", "nao iniciado", "aguardando inicio", "a iniciar"],
+  paralisada: ["paralisada", "paralisado", "suspensa", "suspenso"],
+  em_execucao: ["em execucao", "em andamento", "andamento", "em obras", "executando"],
+  concluida: ["concluida", "concluido", "finalizada", "finalizado", "entregue", "inaugurada"],
+  executada: ["executada", "executado"],
+  em_projeto: ["em projeto", "em elaboracao"],
+  em_licitacao: ["em licitacao", "licitando"],
+};
+
+function grupoStatus(v) {
+  const n = normalizar(v);
+  if (!n) return "";
+  for (const g of ORDEM_STATUS) {
+    if (STATUS_GRUPOS[g].some((p) => n === p || n.includes(p))) return g;
+  }
+  return "outro";
+}
+
+function statusDaPergunta(n) {
+  const out = [];
+  if (/\b(a executar|nao iniciad|a iniciar)/.test(n)) out.push("a_executar");
+  if (/\bparalisad|suspens/.test(n)) out.push("paralisada");
+  if (/\b(em andamento|andamento|em execucao|executando|em obras)\b/.test(n)) out.push("em_execucao");
+  if (/\bconcluid/.test(n)) out.push("concluida");
+  if (/\bexecutad/.test(n)) out.push("executada");
+  if (/\b(finalizad|pront|terminad|entregue)/.test(n)) out.push("concluida", "executada");
+  return unico(out);
+}
+
+// ---------- Bairro limpo ----------
+const RUIDO_BAIRRO = /^(rua|r|av|avenida|travessa|tv|trav|rodovia|estrada|alameda|praca|trecho|trechos|diversas|diversos|varias|varios|ce|br|km|lote|quadra|construcao|reforma|pavimentacao|ampliacao|implantacao)\b/;
+
+function tituloCaso(s) {
+  return texto(s).toLowerCase().replace(/(^|\s)(\S)/g, (m, a, b) => a + b.toUpperCase());
+}
+
+function extrairBairroDeTexto(v) {
+  const n = normalizar(v);
+  const m = n.match(/\bbairros? (?:do |da |de |dos |das )?([a-z0-9][a-z0-9 ]{2,40})/);
+  if (!m) return null;
+  const nome = m[1].split(/ (?:rua|av|avenida|travessa|no|na|e|com|trecho|ate)\b/)[0].trim();
+  return nome.length >= 3 ? tituloCaso(nome) : null;
+}
+
+function bairroLimpo(row) {
+  const bruto = texto(valorCampo(row, "bairro"));
+  const n = normalizar(bruto);
+  if (n) {
+    if (/zona rural|area rural|sitio|distrito|assentamento/.test(n)) return "Zona rural";
+    const doTexto = extrairBairroDeTexto(bruto);
+    if (doTexto) return doTexto;
+    const partes = bruto.split(/[,;/–-]/).map((x) => x.trim()).filter(Boolean);
+    for (const p of [bruto, ...partes.reverse()]) {
+      const pn = normalizar(p);
+      if (pn && !RUIDO_BAIRRO.test(pn) && !/^\d/.test(pn) && pn.split(" ").length <= 5) return tituloCaso(p);
+    }
+  }
+  for (const c of ["endereco", "objeto"]) {
+    const b = extrairBairroDeTexto(valorCampo(row, c));
+    if (b) return b;
+  }
+  return "Sem bairro identificado";
+}
+
+// ---------- Escopo, dimensao, financeiro ----------
+function escopoDaPergunta(n) {
+  if (/\blicita/.test(n)) return "licitacao";
+  if (/\bprojeto/.test(n) && !/\bobra/.test(n)) return "projeto";
+  if (/\bpavimenta/.test(n)) return "pavimentacao";
+  if (/\bobra/.test(n)) return "obra";
+  if (/\b(tudo|todas as abas|geral)\b/.test(n)) return "todas";
+  return null;
+}
+
+function dimensaoDaPergunta(n) {
+  if (/\b(engenheir|responsav|fiscal)/.test(n)) return "engenheiro";
+  if (/\b(empresa|construtora|contratada|empreiteira)/.test(n)) return "empresa";
+  if (/\b(bairro|localidade|regiao)/.test(n)) return "bairro_limpo";
+  if (/\b(fonte de recurso|recursos?|fonte)\b/.test(n)) return "recurso";
+  if (/\b(status|situac)/.test(n)) return "status";
+  return null;
+}
+
+function existeCampo(rows, canon) {
+  return (rows || []).some((r) => resolverCampoNaLinha(r, canon));
+}
+
+function camposFinanceiros(n, rows) {
+  if (/\b(pago|paga|pagos|pagamento|pagou|gasto|gastou|gastos|desembols)/.test(n)) {
+    const ano = n.match(/\b(202\d)\b/);
+    if (ano && existeCampo(rows, `valor_pago_${ano[1]}`)) return [`valor_pago_${ano[1]}`];
+    if (/gestao atual/.test(n) && existeCampo(rows, "pago_gestao_atual")) return ["pago_gestao_atual"];
+    if (/gestao anterior/.test(n) && existeCampo(rows, "pago_gestao_anterior")) return ["pago_gestao_anterior"];
+    const gestoes = ["pago_gestao_atual", "pago_gestao_anterior"].filter((c) => existeCampo(rows, c));
+    if (gestoes.length) return gestoes;
+    const anos = ["valor_pago_2023", "valor_pago_2024", "valor_pago_2025", "valor_pago_2026"].filter((c) => existeCampo(rows, c));
+    if (anos.length) return anos;
+    return null; // nao existe coluna de pagamento: nao troca por executado
+  }
+  if (/\bsaldo/.test(n)) return ["saldo_devedor"];
+  if (/\b(executad|medid)/.test(n) && /\b(valor|quanto|total|r)\b/.test(n)) return ["valor_executado"];
+  if (/\b(invest|valor total|valor global|custo|orcamento|valor|mais car|caras|caro|r)\b/.test(n)) return ["valor_total"];
+  return null;
+}
+
+// ---------- Conversa ----------
+function ehSaudacao(n) {
+  if (!n) return false;
+  const temDado = /\b(obra|projeto|licita|bairro|engenheir|valor|quant|quais|status|empresa|lista)/.test(n);
+  return !temDado && n.split(" ").length <= 6 &&
+    /^(oi|ola|opa|bom dia|boa tarde|boa noite|e ai|eai|tudo bem|tudo bom|obrigad|valeu|ok|blz|beleza|hello|hi)\b/.test(n);
+}
+
+function ehFollowUp(n) {
+  if (/\b(dessas|desses|delas|deles|essas|esses|nelas|neles|dentre|destas|destes)\b/.test(n)) return true;
+  const palavras = n.split(" ").length;
+  if (palavras > 7) return false;
+  if (escopoDaPergunta(n)) return false; // novo universo explicito
+  return /^(e |quais|qual|mostra|mostre|liste|lista|listar|quem|quanto|quantos|quantas|onde|detalh)/.test(n);
+}
+
+const RESPOSTA_SAUDACAO =
+  "Olá! 👋 Posso consultar as obras, projetos e licitações da planilha. Exemplos: \"quantas obras em andamento?\", \"quem tem mais obras?\", \"qual o valor total investido?\".";
+
+// ---------- Corrige o plano da IA ----------
+function aplicarRegras(pergunta, planoIA, estado, rows) {
+  const n = normalizar(pergunta);
+  const p = { ...(planoIA || {}), args: { ...(planoIA?.args || {}) } };
+  const follow = !!estado && ehFollowUp(n);
+  p.inherit_scope = follow;
+
+  const esc = escopoDaPergunta(n);
+  if (esc) p.args.escopo = [esc];
+
+  // Status: SEMPRE deterministico. Remove qualquer filtro de status inventado pela IA.
+  const st = statusDaPergunta(n);
+  let filtros = (Array.isArray(p.args.filtros) ? p.args.filtros : [])
+    .filter((f) => !/status|situac/.test(normalizar(f?.campo || f?.field)));
+  if (st.length) filtros.push({ campo: "status_grupo", operador: "one_of", valor: st });
+  p.args.filtros = filtros;
+  p._statusExplicito = st.length > 0;
+
+  // Ignora termos que sao, na verdade, palavras de status/escopo.
+  if (Array.isArray(p.args.termos)) {
+    p.args.termos = p.args.termos.filter((t) => {
+      const tn = normalizar(t);
+      return tn && !statusDaPergunta(tn).length && !/^(obras?|projetos?|licitac\w*|pavimentac\w*)$/.test(tn);
+    });
+  }
+
+  const dim = dimensaoDaPergunta(n);
+  const fin = camposFinanceiros(n, rows);
+  const ranking = /\b(mais|maior|maiores|menor|menores|ranking|top|lidera|primeir)\b/.test(n);
+  const pedeSoma = /\b(quanto|total|soma|somar|montante)\b/.test(n);
+  const pedeQuantos = /\bquant[oa]s\b/.test(n);
+  const pedeLista = /\b(quais|liste|lista|listar|mostre|mostra|nomes?|quem sao)\b/.test(n);
+  const ehValorFollow = follow && /\bvalor|quanto custa|investimento/.test(n);
+
+  const label = texto(p.label) || "registros";
+
+  if (fin && (pedeSoma || ehValorFollow) && !(ranking && !dim)) {
+    p.tool = "somar";
+    p.args.campos = fin;
+    delete p.args.campo;
+    if (dim && (ranking || /\bpor\b/.test(n))) p.args.agrupar_por = dim; else delete p.args.agrupar_por;
+    p.args.direcao = /\bmenor/.test(n) ? "asc" : "desc";
+  } else if (fin && ranking) {
+    if (dim) {
+      p.tool = "somar";
+      p.args.campos = fin;
+      p.args.agrupar_por = dim;
+      p.args.direcao = /\bmenor/.test(n) ? "asc" : "desc";
+    } else {
+      p.tool = "buscar_obras";
+      p.args.ordenar_por = fin[0];
+      p.args.direcao = /\bmenor|baratas?\b/.test(n) ? "asc" : "desc";
+      p.args.campos = unico(["objeto", ...fin, "bairro_limpo", "status", "empresa"]);
+      p.args.filtros.push({ campo: fin[0], operador: "not_empty" });
+      p.args.limite = Number(n.match(/\b(\d{1,2})\b/)?.[1]) || 10;
+    }
+  } else if (ranking && /\bobras?|projetos?|licitac|registros?\b|quem\b/.test(n)) {
+    // "quem tem mais obras" -> responsavel, nunca bairro escolhido pela IA.
+    p.tool = "agrupar_por";
+    p.args.campo = dim || "engenheiro";
+    p.args.direcao = /\bmenos|menor/.test(n) ? "asc" : "desc";
+    p.args.ordenar_por = "quantidade";
+  } else if (dim && pedeQuantos && new RegExp(`quant[oa]s (${["engenheir", "responsav", "empresa", "construtora", "bairro", "fonte", "recurso"].join("|")})`).test(n)) {
+    p.tool = "contar_obras";
+    p.args.distinto_por = dim;
+  } else if (dim && (pedeLista || follow) && !fin) {
+    p.tool = "agrupar_por";
+    p.args.campo = dim;
+    p.args.ordenar_por = dim === "status" ? "quantidade" : "grupo";
+  } else if (pedeQuantos && !dim && p.tool !== "contar_obras" && p.tool !== "responder") {
+    p.tool = "contar_obras";
+  }
+
+  // Saneamento final
+  if (p.tool === "agrupar_por") {
+    if (/bairro|localidade/.test(normalizar(p.args.campo))) p.args.campo = "bairro_limpo";
+    p.args.normalizar_dimensao = false; // bairro_limpo ja e deterministico
+  }
+  if (p.tool === "somar" && fin) p.args.campos = fin;
+  if (p.tool === "somar" && p.args.agrupar_por && /bairro/.test(normalizar(p.args.agrupar_por))) p.args.agrupar_por = "bairro_limpo";
+  if (p.tool === "buscar_obras") {
+    const campos = Array.isArray(p.args.campos) && p.args.campos.length ? p.args.campos : ["objeto", "status", "bairro", "engenheiro", "empresa", "valor_total"];
+    p.args.campos = unico(["objeto", ...campos]);
+  }
+  if (!esc && !follow && !p.args.escopo) p.args.escopo = ["todas"];
+  p.label = label;
+  return p;
 }
 
 // ------------------------------------------------------------
@@ -609,9 +890,17 @@ function mergeArgsComEstado(args = {}, plano = {}, estado = null) {
   if ((!a.termos || !a.termos.length) && estado.termos?.length) a.termos = [...estado.termos];
   if ((!a.campos_busca || !a.campos_busca.length) && estado.campos_busca?.length) a.campos_busca = [...estado.campos_busca];
 
-  const anteriores = Array.isArray(estado.filtros) ? estado.filtros : [];
   const atuais = Array.isArray(a.filtros) ? a.filtros : [];
-  a.filtros = [...anteriores, ...atuais];
+  let anteriores = Array.isArray(estado.filtros) ? estado.filtros : [];
+  // Status novo explicito substitui o anterior (nao acumula).
+  if (plano._statusExplicito) anteriores = anteriores.filter((f) => f?.campo !== "status_grupo");
+  const vistos = new Set();
+  a.filtros = [...anteriores, ...atuais].filter((f) => {
+    const k = JSON.stringify(f);
+    if (vistos.has(k)) return false;
+    vistos.add(k);
+    return true;
+  });
 
   return a;
 }
@@ -720,6 +1009,11 @@ function rotuloCampo(campo) {
   const mapa = {
     objeto: "Obra/objeto",
     bairro: "Bairro",
+    bairro_limpo: "Bairro",
+    valor_pago_2023: "Valor pago 2023",
+    valor_pago_2024: "Valor pago 2024",
+    valor_pago_2025: "Valor pago 2025",
+    valor_pago_2026: "Valor pago 2026",
     status: "Status",
     engenheiro: "Responsável",
     empresa: "Empresa",
@@ -813,13 +1107,24 @@ export async function responderPergunta(pergunta, historico = []) {
 
   let rows;
   try {
-    rows = await getObras();
+    rows = corrigirCabecalhos(await getObras());
   } catch (e) {
     return {
       resposta: `Não consegui ler a planilha agora: ${e?.message || e}`,
       sql: "",
       linhas: 0,
       erro: e?.message || String(e),
+      estado: ultimoEstadoValido(historico),
+      modoAgente: "google_sheets_tools",
+    };
+  }
+
+  if (ehSaudacao(normalizar(q))) {
+    return {
+      resposta: RESPOSTA_SAUDACAO,
+      sql: "",
+      linhas: 0,
+      erro: "",
       estado: ultimoEstadoValido(historico),
       modoAgente: "google_sheets_tools",
     };
@@ -844,6 +1149,11 @@ export async function responderPergunta(pergunta, historico = []) {
         estado: estadoAtual,
         modoAgente: "google_sheets_tools",
       };
+    }
+
+    if (!plano || !plano.tool) plano = { tool: "buscar_obras", args: {}, label: "registros" };
+    if (plano.tool !== "responder" && plano.tool !== "listar_colunas") {
+      plano = aplicarRegras(q, plano, estadoAtual, rows);
     }
 
     if (!plano || !plano.tool) {
