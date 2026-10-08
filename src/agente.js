@@ -1062,13 +1062,22 @@ async function planejar(pergunta, historico, estado, dados, observacao = null) {
 const SYSTEM_RESPONDEDOR = `Você é o assistente de obras da prefeitura, respondendo pelo WhatsApp em português do Brasil.
 Você recebe a PERGUNTA e o RESULTADO já calculado pelo sistema a partir da planilha oficial.
 
-REGRAS:
+REGRAS DE CONTEÚDO:
 - Use SOMENTE os dados do resultado. Não calcule, não estime, não arredonde, não invente nomes ou valores.
 - Copie números e valores EXATAMENTE como estão nos campos "texto" (ex.: "R$ 1.234,56").
 - Se "truncado" for true, diga que está mostrando só parte e quantos existem no total.
-- Se houver "avisos", mencione-os de forma curta e natural.
+- Se houver "avisos", mencione-os numa linha curta no final, com ⚠️.
 - Se o resultado não cobre o que foi perguntado, diga isso com honestidade.
-- Formato WhatsApp: *negrito* com um asterisco, listas com "•", sem tabelas, sem markdown de título. Direto ao ponto, no máximo ~15 linhas.
+
+REGRAS DE FORMATO (WhatsApp):
+- Comece com UMA linha de resumo com emoji, já respondendo a pergunta. Ex.: "✅ Encontrei *20* obras em andamento."
+- Depois uma linha em branco e o detalhe. Nunca escreva parágrafos longos.
+- Negrito com UM asterisco (*texto*). Itálico com _texto_. Nada de ** , # , tabelas ou markdown de título.
+- Itens de lista: título em negrito numerado (*1. Nome da obra*) e, abaixo, uma linha por informação com emoji: 📌 status, 💰 valores, 📍 bairro, 👷 responsável, 🏢 empresa, 📅 datas, 📊 percentuais, 📝 observações.
+- Separe cada item por uma linha em branco. Rankings: 🥇 🥈 🥉 para os 3 primeiros e depois 4. 5. ...
+- Valores em dinheiro sempre em negrito.
+- No máximo ~15 linhas. Se houver mais itens, mostre os principais e diga quantos faltam.
+- Termine, só quando fizer sentido, com UMA linha curta oferecendo o próximo passo (ex.: "Quer ver só as do Ricardo?"). Sem saudações longas.
 - Não mencione "JSON", "ferramenta", "plano" ou "sistema". Pode citar de onde veio em linguagem natural (ex.: "nas obras em andamento").`;
 
 function paraIA(r) {
@@ -1103,39 +1112,82 @@ async function responderComIA(pergunta, resultados) {
 
 function descreverCriterios(r) {
   const c = [...r.filtros_aplicados, ...r.buscas_aplicadas.map((b) => `assunto: ${b}`)];
-  return c.length ? ` (critérios: ${c.join("; ")})` : "";
+  return c.length ? `\n_Critérios: ${c.join("; ")}_` : "";
+}
+
+const LIMITE_WHATS = 3400; // WhatsApp corta perto de 4096 caracteres
+const MEDALHAS = ["🥇", "🥈", "🥉"];
+
+function emojiCampo(label) {
+  const n = normalizar(label);
+  if (/quantidade|contagem/.test(n)) return "🔢";
+  if (/status|situacao/.test(n)) return "📌";
+  if (/%|percent/.test(n)) return "📊";
+  if (/valor|saldo|pago|contrapartida|aditivo|reajuste/.test(n)) return "💰";
+  if (/bairro|local/.test(n)) return "📍";
+  if (/engenheiro|responsavel|arquiteto/.test(n)) return "👷";
+  if (/empresa|contratada/.test(n)) return "🏢";
+  if (/data|prazo|termino|inicio|entrega|envio/.test(n)) return "📅";
+  if (/observac|pendencia/.test(n)) return "📝";
+  if (/recurso|fonte|convenio/.test(n)) return "🏛️";
+  if (/contrato/.test(n)) return "📄";
+  if (/area|comprimento|meio/.test(n)) return "📐";
+  return "▫️";
+}
+
+function negritoSeDinheiro(v) {
+  return /^R\$/.test(texto(v)) ? `*${v}*` : v;
+}
+
+function cortarBlocos(blocos, cabecalho, rodape = "") {
+  const sep = "\n\n";
+  let usados = [];
+  let tam = cabecalho.length + rodape.length;
+  for (const b of blocos) {
+    if (tam + b.length + sep.length > LIMITE_WHATS) break;
+    usados.push(b);
+    tam += b.length + sep.length;
+  }
+  const faltam = blocos.length - usados.length;
+  const nota = faltam > 0 ? `${sep}_… e mais ${faltam} (resposta cortada para caber no WhatsApp)._` : "";
+  return `${cabecalho}${sep}${usados.join(sep)}${nota}${rodape}`;
 }
 
 function formatarDeterministico(resultados) {
   return resultados.map((r) => {
     const rot = r.rotulo || "registros";
-    const aviso = r.avisos?.length ? `\n_${r.avisos.join(" ")}_` : "";
+    const aviso = r.avisos?.length ? `\n\n⚠️ _${r.avisos.join(" ")}_` : "";
 
     if (r.tipo === "agregado") {
+      if (r.registros_filtrados === 0) return `🔍 Não encontrei ${rot}.${descreverCriterios(r)}`;
       const vals = Object.entries(r.valores);
-      if (r.registros_filtrados === 0) return `Não encontrei ${rot}${descreverCriterios(r)}.`;
-      if (vals.length === 1 && vals[0][0] === "quantidade") return `Encontrei *${vals[0][1].texto}* ${rot}.${aviso}`;
-      return `📊 *${prettify(rot)}*\n${vals.map(([k, v]) => `• ${prettify(k)}: *${v.texto}*`).join("\n")}${aviso}`;
+      if (vals.length === 1 && vals[0][0] === "quantidade") return `✅ Encontrei *${vals[0][1].texto}* ${rot}.${aviso}`;
+      const linhas = vals.map(([k, v]) => `${emojiCampo(k)} ${prettify(k)}: *${v.texto}*`);
+      return `📊 *${prettify(rot)}*\n\n${linhas.join("\n")}\n\n_Base: ${r.registros_filtrados} registro(s)_${aviso}`;
     }
 
     if (r.tipo === "agrupado") {
-      if (!r.itens.length) return `Não encontrei ${rot}${descreverCriterios(r)}.`;
-      const linhas = r.itens.map((x, i) => {
-        const vs = Object.entries(x.valores).map(([k, v]) => (k === "quantidade" ? `${v.texto} ${v.valor === 1 ? "registro" : "registros"}` : `${prettify(k)}: ${v.texto}`));
-        return `${i + 1}. *${x.grupo}* — ${vs.join(" • ")}`;
+      if (!r.itens.length) return `🔍 Não encontrei ${rot}.${descreverCriterios(r)}`;
+      const blocos = r.itens.map((x, i) => {
+        const marca = i < 3 ? MEDALHAS[i] : `${i + 1}.`;
+        const vs = Object.entries(x.valores).map(([k, v]) => (k === "quantidade" ? `*${v.texto}* ${v.valor === 1 ? "registro" : "registros"}` : `${prettify(k)}: *${v.texto}*`));
+        return `${marca} *${x.grupo}*\n      ${vs.join("  •  ")}`;
       });
-      const extra = r.truncado ? `\n\n(Mostrando ${r.itens.length} de ${r.total_grupos}.)` : "";
-      return `📋 *${prettify(rot)}*\n\n${linhas.join("\n")}${extra}${aviso}`;
+      const cab = `📋 *${prettify(rot)}*${r.truncado ? ` (top ${r.itens.length} de ${r.total_grupos})` : ` — ${r.total_grupos} ${r.total_grupos === 1 ? "grupo" : "grupos"}`}`;
+      return cortarBlocos(blocos, cab, aviso).replace("\n\n", "\n\n");
     }
 
-    if (!r.total) return `Não encontrei ${rot}${descreverCriterios(r)}.`;
+    if (!r.total) return `🔍 Não encontrei ${rot}.${descreverCriterios(r)}`;
     const blocos = r.itens.map((it, i) => {
-      const det = Object.entries(it).filter(([k]) => !["aba", "objeto"].includes(k)).map(([k, v]) => `• *${k}:* ${v}`).join("\n");
+      const det = Object.entries(it)
+        .filter(([k]) => !["aba", "objeto"].includes(k))
+        .map(([k, v]) => `${emojiCampo(k)} ${k}: ${negritoSeDinheiro(v)}`)
+        .join("\n");
       return `*${i + 1}. ${it.objeto}*${det ? `\n${det}` : ""}`;
     });
-    const cab = r.truncado ? `📋 *${prettify(rot)}* (mostrando ${r.exibidos} de ${r.total})` : `Encontrei *${r.total}* ${rot}.`;
-    return `${cab}\n\n${blocos.join("\n\n")}${aviso}`;
-  }).join("\n\n");
+    const cab = r.truncado ? `📋 *${prettify(rot)}* (mostrando ${r.exibidos} de ${r.total})` : `✅ Encontrei *${r.total}* ${rot}:`;
+    return cortarBlocos(blocos, cab, aviso);
+  }).join("\n\n━━━━━━━━━━\n\n");
 }
 
 // ============================================================
