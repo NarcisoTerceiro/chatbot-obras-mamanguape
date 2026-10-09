@@ -859,7 +859,9 @@ function rotuloDef(def) {
 }
 
 function prettify(s) {
-  const t = texto(s).replace(/_/g, " ").toLowerCase().trim();
+  const t = texto(s).replace(/_/g, " ").toLowerCase().trim()
+    .replace(/\barea\b/g, "área").replace(/\bmedia\b/g, "média").replace(/\bpendencias?\b/g, (m) => m.replace("pendenc", "pendênc"))
+    .replace(/\bexecucao\b/g, "execução").replace(/\bpavimentacao\b/g, "pavimentação").replace(/\blicitacoes\b/g, "licitações");
   return t.charAt(0).toUpperCase() + t.slice(1);
 }
 
@@ -966,9 +968,10 @@ function historicoCompacto(historico = []) {
     .filter((m) => m.role && m.content);
 }
 
-function construirEstado(consultas, resultados) {
+function construirEstado(consultas, resultados, oferta = null) {
   return {
-    versao: 2,
+    versao: 3,
+    oferta: oferta ? { texto: oferta.texto, consulta: oferta.consulta } : null,
     fonte: "google_sheets_tools",
     consultas: consultas.map((c) => ({ rotulo: c.rotulo, abas: c.abas, filtros: c.filtros, buscas: c.buscas })),
     objetos_recentes: resultados.flatMap((r) => (r.tipo === "lista" ? r.itens.slice(0, 15).map((x) => x.objeto) : [])).slice(0, 20),
@@ -1018,6 +1021,7 @@ COMO ESCOLHER:
 - Nome de pessoa/empresa: filtro contains no campo certo.
 - herdar_contexto=true SOMENTE em follow-up claro ("dessas", "e os responsáveis?", "quais são?"). Nesse caso coloque apenas as restrições NOVAS; o sistema junta com a consulta anterior. Pergunta nova com assunto próprio = false.
 - Se a pergunta pede um dado que a planilha NÃO tem na aba (ex.: valor de projetos/licitações, bairro de licitação), use tipo conversa e explique em uma frase o que existe. Se o sistema devolver "erros_do_plano_anterior", corrija o plano usando só campos listados acima (ou explique com tipo conversa).
+- Resposta curta de confirmação ("sim", "pode", "isso", "ok") sem pergunta pendente do assistente no histórico = tipo esclarecer, perguntando o que a pessoa quer consultar. Nunca invente uma consulta a partir de um "sim".
 - Saudação/agradecimento = tipo conversa. Pergunta ambígua demais = tipo esclarecer (com UMA pergunta curta).
 
 EXEMPLOS:
@@ -1070,14 +1074,15 @@ REGRAS DE CONTEÚDO:
 - Se o resultado não cobre o que foi perguntado, diga isso com honestidade.
 
 REGRAS DE FORMATO (WhatsApp):
-- Comece com UMA linha de resumo com emoji, já respondendo a pergunta. Ex.: "✅ Encontrei *20* obras em andamento."
+- Comece com UMA linha de resumo que já responde a pergunta. Ex.: "Encontrei *20* obras em andamento."
 - Depois uma linha em branco e o detalhe. Nunca escreva parágrafos longos.
 - Negrito com UM asterisco (*texto*). Itálico com _texto_. Nada de ** , # , tabelas ou markdown de título.
-- Itens de lista: título em negrito numerado (*1. Nome da obra*) e, abaixo, uma linha por informação com emoji: 📌 status, 💰 valores, 📍 bairro, 👷 responsável, 🏢 empresa, 📅 datas, 📊 percentuais, 📝 observações.
-- Separe cada item por uma linha em branco. Rankings: 🥇 🥈 🥉 para os 3 primeiros e depois 4. 5. ...
+- NÃO use emojis (exceto ⚠️ numa linha de aviso, se houver aviso).
+- Itens de lista: título em negrito numerado (*1. Nome da obra*) e, abaixo, uma linha por informação no formato "• Rótulo: valor".
+- Separe cada item por uma linha em branco. Rankings: numere 1. 2. 3. ...
 - Valores em dinheiro sempre em negrito.
 - No máximo ~15 linhas. Se houver mais itens, mostre os principais e diga quantos faltam.
-- Termine, só quando fizer sentido, com UMA linha curta oferecendo o próximo passo (ex.: "Quer ver só as do Ricardo?"). Sem saudações longas.
+- NÃO termine com pergunta, convite ou oferta de próximo passo (nada de "Quer ver...?", "Posso detalhar?"). Termine no último dado.
 - Não mencione "JSON", "ferramenta", "plano" ou "sistema". Pode citar de onde veio em linguagem natural (ex.: "nas obras em andamento").`;
 
 function paraIA(r) {
@@ -1101,13 +1106,25 @@ function respostaConfere(resposta, resultados) {
   return textosObrigatorios(resultados).every((t) => alvo.includes(semEspaco(t)));
 }
 
+// Se a IA fechar com "Quer ver...?", remove: a resposta "sim" do usuário não teria contexto no planejador.
+function tirarPerguntaFinal(resp) {
+  const linhas = texto(resp).split("\n");
+  while (linhas.length > 1) {
+    const ult = linhas[linhas.length - 1].trim();
+    if (!ult) { linhas.pop(); continue; }
+    if (/\?\s*[_*]*$/.test(ult) && ult.length < 160) { linhas.pop(); continue; }
+    break;
+  }
+  return linhas.join("\n").trim();
+}
+
 async function responderComIA(pergunta, resultados) {
   const mensagens = [
     { role: "system", content: SYSTEM_RESPONDEDOR },
     { role: "user", content: limitarTexto({ pergunta, resultado: resultados.map(paraIA) }, 14000) },
   ];
   const resp = texto(await chamarIAbruta(mensagens, { max_tokens: 1200, temperature: 0.2, reasoning_effort: "low" }));
-  return resp;
+  return tirarPerguntaFinal(resp);
 }
 
 function descreverCriterios(r) {
@@ -1116,31 +1133,13 @@ function descreverCriterios(r) {
 }
 
 const LIMITE_WHATS = 3400; // WhatsApp corta perto de 4096 caracteres
-const MEDALHAS = ["🥇", "🥈", "🥉"];
-
-function emojiCampo(label) {
-  const n = normalizar(label);
-  if (/quantidade|contagem/.test(n)) return "🔢";
-  if (/status|situacao/.test(n)) return "📌";
-  if (/%|percent/.test(n)) return "📊";
-  if (/valor|saldo|pago|contrapartida|aditivo|reajuste/.test(n)) return "💰";
-  if (/bairro|local/.test(n)) return "📍";
-  if (/engenheiro|responsavel|arquiteto/.test(n)) return "👷";
-  if (/empresa|contratada/.test(n)) return "🏢";
-  if (/data|prazo|termino|inicio|entrega|envio/.test(n)) return "📅";
-  if (/observac|pendencia/.test(n)) return "📝";
-  if (/recurso|fonte|convenio/.test(n)) return "🏛️";
-  if (/contrato/.test(n)) return "📄";
-  if (/area|comprimento|meio/.test(n)) return "📐";
-  return "▫️";
-}
 
 function negritoSeDinheiro(v) {
   return /^R\$/.test(texto(v)) ? `*${v}*` : v;
 }
 
-function cortarBlocos(blocos, cabecalho, rodape = "") {
-  const sep = "\n\n";
+function cortarBlocos(blocos, cabecalho, rodape = "", sepItens = "\n\n") {
+  const sep = sepItens;
   let usados = [];
   let tam = cabecalho.length + rodape.length;
   for (const b of blocos) {
@@ -1149,8 +1148,8 @@ function cortarBlocos(blocos, cabecalho, rodape = "") {
     tam += b.length + sep.length;
   }
   const faltam = blocos.length - usados.length;
-  const nota = faltam > 0 ? `${sep}_… e mais ${faltam} (resposta cortada para caber no WhatsApp)._` : "";
-  return `${cabecalho}${sep}${usados.join(sep)}${nota}${rodape}`;
+  const nota = faltam > 0 ? `_… e mais ${faltam} (resposta cortada para caber no WhatsApp)._` : "";
+  return `${cabecalho}\n\n${usados.join(sep)}${nota ? `\n\n${nota.trim()}` : ""}${rodape}`;
 }
 
 function formatarDeterministico(resultados) {
@@ -1159,35 +1158,37 @@ function formatarDeterministico(resultados) {
     const aviso = r.avisos?.length ? `\n\n⚠️ _${r.avisos.join(" ")}_` : "";
 
     if (r.tipo === "agregado") {
-      if (r.registros_filtrados === 0) return `🔍 Não encontrei ${rot}.${descreverCriterios(r)}`;
+      if (r.registros_filtrados === 0) return `Não encontrei ${rot}.${descreverCriterios(r)}`;
       const vals = Object.entries(r.valores);
-      if (vals.length === 1 && vals[0][0] === "quantidade") return `✅ Encontrei *${vals[0][1].texto}* ${rot}.${aviso}`;
-      const linhas = vals.map(([k, v]) => `${emojiCampo(k)} ${prettify(k)}: *${v.texto}*`);
-      return `📊 *${prettify(rot)}*\n\n${linhas.join("\n")}\n\n_Base: ${r.registros_filtrados} registro(s)_${aviso}`;
+      if (vals.length === 1 && vals[0][0] === "quantidade") return `Encontrei *${vals[0][1].texto}* ${rot}.${aviso}`;
+      const linhas = vals.map(([k, v]) => `• ${prettify(k)}: *${v.texto}*`);
+      return `*${prettify(rot)}*\n\n${linhas.join("\n")}\n\n_Base: ${r.registros_filtrados} registro(s)_${aviso}`;
     }
 
     if (r.tipo === "agrupado") {
-      if (!r.itens.length) return `🔍 Não encontrei ${rot}.${descreverCriterios(r)}`;
+      if (!r.itens.length) return `Não encontrei ${rot}.${descreverCriterios(r)}`;
       const blocos = r.itens.map((x, i) => {
-        const marca = i < 3 ? MEDALHAS[i] : `${i + 1}.`;
+        const marca = `${i + 1}.`;
         const vs = Object.entries(x.valores).map(([k, v]) => (k === "quantidade" ? `*${v.texto}* ${v.valor === 1 ? "registro" : "registros"}` : `${prettify(k)}: *${v.texto}*`));
-        return `${marca} *${x.grupo}*\n      ${vs.join("  •  ")}`;
+        const soQtd = Object.keys(x.valores).length === 1 && "quantidade" in x.valores;
+        return soQtd ? `${marca} *${x.grupo}* — ${vs[0]}` : `${marca} *${x.grupo}*\n• ${vs.join("\n• ")}`;
       });
-      const cab = `📋 *${prettify(rot)}*${r.truncado ? ` (top ${r.itens.length} de ${r.total_grupos})` : ` — ${r.total_grupos} ${r.total_grupos === 1 ? "grupo" : "grupos"}`}`;
-      return cortarBlocos(blocos, cab, aviso).replace("\n\n", "\n\n");
+      const cab = `*${prettify(rot)}*${r.truncado ? ` (top ${r.itens.length} de ${r.total_grupos})` : ` — ${r.total_grupos} ${r.total_grupos === 1 ? "grupo" : "grupos"}`}`;
+      const compacto = r.itens.every((x) => Object.keys(x.valores).length === 1 && "quantidade" in x.valores);
+      return cortarBlocos(blocos, cab, aviso, compacto ? "\n" : "\n\n");
     }
 
-    if (!r.total) return `🔍 Não encontrei ${rot}.${descreverCriterios(r)}`;
+    if (!r.total) return `Não encontrei ${rot}.${descreverCriterios(r)}`;
     const blocos = r.itens.map((it, i) => {
       const det = Object.entries(it)
         .filter(([k]) => !["aba", "objeto"].includes(k))
-        .map(([k, v]) => `${emojiCampo(k)} ${k}: ${negritoSeDinheiro(v)}`)
+        .map(([k, v]) => `• ${k}: ${negritoSeDinheiro(v)}`)
         .join("\n");
       return `*${i + 1}. ${it.objeto}*${det ? `\n${det}` : ""}`;
     });
-    const cab = r.truncado ? `📋 *${prettify(rot)}* (mostrando ${r.exibidos} de ${r.total})` : `✅ Encontrei *${r.total}* ${rot}:`;
+    const cab = r.truncado ? `*${prettify(rot)}* (mostrando ${r.exibidos} de ${r.total})` : `Encontrei *${r.total}* ${rot}:`;
     return cortarBlocos(blocos, cab, aviso);
-  }).join("\n\n━━━━━━━━━━\n\n");
+  }).join("\n\n──────────\n\n");
 }
 
 // ============================================================
@@ -1201,7 +1202,57 @@ function ehSaudacao(n) {
 }
 
 const RESPOSTA_SAUDACAO =
-  "Olá! 👋 Posso consultar as obras, projetos, licitações e pendências da planilha. Exemplos: \"quantas obras em andamento?\", \"quem tem mais obras?\", \"qual o valor total investido?\".";
+  "Olá! Posso consultar as obras, projetos, licitações e pendências da planilha. Exemplos: \"quantas obras em andamento?\", \"quem tem mais obras?\", \"qual o valor total investido?\".";
+
+// ============================================================
+// Oferta de próximo passo ("Quer ver a lista?") + confirmação ("sim")
+// A oferta é gerada pelo CÓDIGO junto com o plano que ela executa, então
+// o texto perguntado e a consulta feita nunca divergem. Vale só para a
+// próxima mensagem: qualquer outra pergunta descarta a oferta.
+// ============================================================
+const PALAVRAS_SIM = new Set(["sim", "s", "pode", "podes", "quero", "manda", "mande", "isso", "ok", "okay", "claro", "bora", "vamos", "favor", "por", "uhum", "aham", "certo", "positivo", "exato", "show", "fechado", "beleza", "blz", "com", "certeza", "mesmo", "seria", "bom", "ver", "porfavor", "pf", "pfv"]);
+const FRASES_NAO = /^(nao|n|nao precisa|nao obrigad[oa]|nao quero|deixa|deixa pra la|dispenso|agora nao)$/;
+
+function ehConfirmacao(n) {
+  const t = n.split(" ").filter(Boolean);
+  return t.length > 0 && t.length <= 4 && t.every((x) => PALAVRAS_SIM.has(x));
+}
+
+function semOferta(estado) {
+  return estado ? { ...estado, oferta: null } : estado;
+}
+
+function proximaOferta(c, r, dados) {
+  if (!r) return null;
+  const { abas } = resolverAbas(c.abas, dados);
+  const tem = (campo) => abas.some((a) => resolver(dados.abas.get(a).esq, campo));
+  const base = { rotulo: c.rotulo, abas: c.abas, filtros: c.filtros, buscas: c.buscas, agrupar_por: [], metricas: [], campos: [], ordenar_por: null, direcao: "desc", limite: MAX_LISTA };
+
+  if (r.tipo === "agregado") {
+    if (!r.registros_filtrados) return null;
+    const soContagem = c.metricas.length === 1 && c.metricas[0].op === "contagem";
+    if (soContagem && r.registros_filtrados <= MAX_LISTA) return { texto: "Quer ver a lista?", consulta: base };
+    if (tem("engenheiro")) return { texto: "Quer ver por responsável?", consulta: { ...base, agrupar_por: ["engenheiro"], metricas: c.metricas, ordenar_por: aliasMetrica(c.metricas[0] || { op: "contagem" }) } };
+    return null;
+  }
+
+  if (r.tipo === "lista") {
+    if (!r.total) return null;
+    if (tem("valor_total")) return { texto: "Quer o valor total dessas?", consulta: { ...base, metricas: [{ op: "soma", campo: "valor_total", como: "total" }] } };
+    if (r.total > 1 && tem("engenheiro")) return { texto: "Quer ver por responsável?", consulta: { ...base, agrupar_por: ["engenheiro"], ordenar_por: "quantidade" } };
+    return null;
+  }
+
+  if (r.tipo === "agrupado" && c.agrupar_por.length === 1 && r.itens.length) {
+    const token = c.agrupar_por[0];
+    const topo = r.itens[0].grupo;
+    const def = defGlobal(token, abas, dados);
+    if (!/^(ano|mes)\(/i.test(token) && def?.tipo === "texto" && topo !== "(não informado)") {
+      return { texto: `Quer ver a lista de ${topo}?`, consulta: { ...base, filtros: [...c.filtros, { campo: token, op: "eq", valor: topo }] } };
+    }
+  }
+  return null;
+}
 
 // ============================================================
 // Entrada principal
@@ -1210,19 +1261,70 @@ function retorno(base) {
   return { resposta: "", sql: "", linhas: 0, erro: "", estado: null, modoAgente: "google_sheets_tools", ...base };
 }
 
+async function finalizar(q, consultas, resultados, dados) {
+  // ---- [3] responder ----
+  const vazio = resultados.every((r) => (r.tipo === "lista" ? r.total === 0 : r.tipo === "agrupado" ? r.itens.length === 0 : r.registros_filtrados === 0));
+  let resposta = "";
+  let origem = "deterministica";
+
+  if (RESPOSTA_IA && !vazio) {
+    try {
+      const r = await responderComIA(q, resultados);
+      if (r && respostaConfere(r, resultados)) { resposta = r; origem = "ia"; }
+      else console.log("AGENTE SHEETS - resposta da IA descartada (números não conferem).");
+    } catch (e) {
+      console.log("AGENTE SHEETS - falha na IA respondedora:", e?.message || e);
+    }
+  }
+  if (!resposta) resposta = formatarDeterministico(resultados);
+
+  // oferta de próximo passo (gerada pelo código, só quando há uma consulta)
+  const oferta = consultas.length === 1 && !vazio ? proximaOferta(consultas[0], resultados[0], dados) : null;
+  if (oferta) resposta = `${resposta}\n\n_${oferta.texto}_`;
+
+  console.log("AGENTE SHEETS - PLANO:", limitarTexto(consultas, 2500));
+  console.log("AGENTE SHEETS - RESULTADO:", limitarTexto(resultados, 2500));
+  console.log("AGENTE SHEETS - RESPOSTA VIA:", origem, oferta ? `| OFERTA: ${oferta.texto}` : "");
+
+  const linhas = resultados.reduce((s, r) => s + (r.registros_filtrados || 0), 0);
+  return retorno({
+    resposta,
+    linhas,
+    estado: construirEstado(consultas, resultados, oferta),
+    ferramenta: "consultar_planilha",
+    respostaVia: origem,
+    fonte: "Google Sheets",
+  });
+}
+
 export async function responderPergunta(pergunta, historico = []) {
   const q = texto(pergunta);
   const estadoAtual = ultimoEstadoValido(historico);
-  if (!q) return retorno({ resposta: "Digite uma pergunta sobre a planilha.", erro: "pergunta vazia", estado: estadoAtual });
+  if (!q) return retorno({ resposta: "Digite uma pergunta sobre a planilha.", erro: "pergunta vazia", estado: semOferta(estadoAtual) });
 
   let dados;
   try {
     dados = await carregarPlanilha();
   } catch (e) {
-    return retorno({ resposta: `Não consegui ler a planilha agora: ${e?.message || e}`, erro: e?.message || String(e), estado: estadoAtual });
+    return retorno({ resposta: `Não consegui ler a planilha agora: ${e?.message || e}`, erro: e?.message || String(e), estado: semOferta(estadoAtual) });
   }
 
-  if (ehSaudacao(normalizar(q))) return retorno({ resposta: RESPOSTA_SAUDACAO, estado: estadoAtual });
+  const nq = normalizar(q);
+
+  // "sim" / "não" para a oferta feita na resposta anterior (sem gastar token de IA)
+  if (estadoAtual?.oferta?.consulta) {
+    if (ehConfirmacao(nq)) {
+      const c = { rotulo: "registros", abas: [], filtros: [], buscas: [], agrupar_por: [], metricas: [], campos: [], ordenar_por: null, direcao: "desc", limite: MAX_LISTA, ...estadoAtual.oferta.consulta };
+      if (!validarConsulta(c, dados).erros.length) {
+        console.log("AGENTE SHEETS - CONFIRMAÇÃO da oferta:", estadoAtual.oferta.texto);
+        return finalizar(q, [c], [executarConsulta(c, dados)], dados);
+      }
+    } else if (FRASES_NAO.test(nq)) {
+      return retorno({ resposta: "Tudo bem. Pode perguntar o que precisar.", estado: semOferta(estadoAtual) });
+    }
+  }
+
+  if (ehSaudacao(nq)) return retorno({ resposta: RESPOSTA_SAUDACAO, estado: semOferta(estadoAtual) });
 
   // ---- [1] planejar + [2] validar/executar (com até MAX_PASSOS tentativas se o plano vier inválido) ----
   let consultas = [];
@@ -1235,14 +1337,14 @@ export async function responderPergunta(pergunta, historico = []) {
     try {
       plano = await planejar(q, historico, estadoAtual, dados, observacao);
     } catch (e) {
-      return retorno({ resposta: "Não consegui interpretar a pergunta agora. Tente novamente em alguns segundos.", erro: e?.message || String(e), estado: estadoAtual });
+      return retorno({ resposta: "Não consegui interpretar a pergunta agora. Tente novamente em alguns segundos.", erro: e?.message || String(e), estado: semOferta(estadoAtual) });
     }
     if (!plano) { observacao = ["Resposta não era um JSON válido."]; continue; }
 
     if (plano.tipo === "conversa" || plano.tipo === "esclarecer") {
       return retorno({
         resposta: texto(plano.mensagem) || "Pode perguntar sobre as obras, projetos, licitações e pendências da planilha.",
-        estado: estadoAtual,
+        estado: semOferta(estadoAtual),
       });
     }
 
@@ -1266,37 +1368,9 @@ export async function responderPergunta(pergunta, historico = []) {
     return retorno({
       resposta: "Não consegui montar essa consulta com segurança. Pode reformular a pergunta, dizendo se é sobre obras, projetos ou licitações?",
       erro: `plano inválido: ${limitarTexto(observacao, 500)}`,
-      estado: estadoAtual,
+      estado: semOferta(estadoAtual),
     });
   }
 
-  // ---- [3] responder ----
-  const vazio = resultados.every((r) => (r.tipo === "lista" ? r.total === 0 : r.tipo === "agrupado" ? r.itens.length === 0 : r.registros_filtrados === 0));
-  let resposta = "";
-  let origem = "deterministica";
-
-  if (RESPOSTA_IA && !vazio) {
-    try {
-      const r = await responderComIA(q, resultados);
-      if (r && respostaConfere(r, resultados)) { resposta = r; origem = "ia"; }
-      else console.log("AGENTE SHEETS - resposta da IA descartada (números não conferem).");
-    } catch (e) {
-      console.log("AGENTE SHEETS - falha na IA respondedora:", e?.message || e);
-    }
-  }
-  if (!resposta) resposta = formatarDeterministico(resultados);
-
-  console.log("AGENTE SHEETS - PLANO:", limitarTexto(consultas, 2500));
-  console.log("AGENTE SHEETS - RESULTADO:", limitarTexto(resultados, 2500));
-  console.log("AGENTE SHEETS - RESPOSTA VIA:", origem);
-
-  const linhas = resultados.reduce((s, r) => s + (r.registros_filtrados || 0), 0);
-  return retorno({
-    resposta,
-    linhas,
-    estado: construirEstado(consultas, resultados),
-    ferramenta: "consultar_planilha",
-    respostaVia: origem,
-    fonte: "Google Sheets",
-  });
+  return finalizar(q, consultas, resultados, dados);
 }
