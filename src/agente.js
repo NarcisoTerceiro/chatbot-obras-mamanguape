@@ -968,10 +968,9 @@ function historicoCompacto(historico = []) {
     .filter((m) => m.role && m.content);
 }
 
-function construirEstado(consultas, resultados, oferta = null) {
+function construirEstado(consultas, resultados) {
   return {
-    versao: 3,
-    oferta: oferta ? { texto: oferta.texto, consulta: oferta.consulta } : null,
+    versao: 2,
     fonte: "google_sheets_tools",
     consultas: consultas.map((c) => ({ rotulo: c.rotulo, abas: c.abas, filtros: c.filtros, buscas: c.buscas })),
     objetos_recentes: resultados.flatMap((r) => (r.tipo === "lista" ? r.itens.slice(0, 15).map((x) => x.objeto) : [])).slice(0, 20),
@@ -1205,56 +1204,6 @@ const RESPOSTA_SAUDACAO =
   "Olá! Posso consultar as obras, projetos, licitações e pendências da planilha. Exemplos: \"quantas obras em andamento?\", \"quem tem mais obras?\", \"qual o valor total investido?\".";
 
 // ============================================================
-// Oferta de próximo passo ("Quer ver a lista?") + confirmação ("sim")
-// A oferta é gerada pelo CÓDIGO junto com o plano que ela executa, então
-// o texto perguntado e a consulta feita nunca divergem. Vale só para a
-// próxima mensagem: qualquer outra pergunta descarta a oferta.
-// ============================================================
-const PALAVRAS_SIM = new Set(["sim", "s", "pode", "podes", "quero", "manda", "mande", "isso", "ok", "okay", "claro", "bora", "vamos", "favor", "por", "uhum", "aham", "certo", "positivo", "exato", "show", "fechado", "beleza", "blz", "com", "certeza", "mesmo", "seria", "bom", "ver", "porfavor", "pf", "pfv"]);
-const FRASES_NAO = /^(nao|n|nao precisa|nao obrigad[oa]|nao quero|deixa|deixa pra la|dispenso|agora nao)$/;
-
-function ehConfirmacao(n) {
-  const t = n.split(" ").filter(Boolean);
-  return t.length > 0 && t.length <= 4 && t.every((x) => PALAVRAS_SIM.has(x));
-}
-
-function semOferta(estado) {
-  return estado ? { ...estado, oferta: null } : estado;
-}
-
-function proximaOferta(c, r, dados) {
-  if (!r) return null;
-  const { abas } = resolverAbas(c.abas, dados);
-  const tem = (campo) => abas.some((a) => resolver(dados.abas.get(a).esq, campo));
-  const base = { rotulo: c.rotulo, abas: c.abas, filtros: c.filtros, buscas: c.buscas, agrupar_por: [], metricas: [], campos: [], ordenar_por: null, direcao: "desc", limite: MAX_LISTA };
-
-  if (r.tipo === "agregado") {
-    if (!r.registros_filtrados) return null;
-    const soContagem = c.metricas.length === 1 && c.metricas[0].op === "contagem";
-    if (soContagem && r.registros_filtrados <= MAX_LISTA) return { texto: "Quer ver a lista?", consulta: base };
-    if (tem("engenheiro")) return { texto: "Quer ver por responsável?", consulta: { ...base, agrupar_por: ["engenheiro"], metricas: c.metricas, ordenar_por: aliasMetrica(c.metricas[0] || { op: "contagem" }) } };
-    return null;
-  }
-
-  if (r.tipo === "lista") {
-    if (!r.total) return null;
-    if (tem("valor_total")) return { texto: "Quer o valor total dessas?", consulta: { ...base, metricas: [{ op: "soma", campo: "valor_total", como: "total" }] } };
-    if (r.total > 1 && tem("engenheiro")) return { texto: "Quer ver por responsável?", consulta: { ...base, agrupar_por: ["engenheiro"], ordenar_por: "quantidade" } };
-    return null;
-  }
-
-  if (r.tipo === "agrupado" && c.agrupar_por.length === 1 && r.itens.length) {
-    const token = c.agrupar_por[0];
-    const topo = r.itens[0].grupo;
-    const def = defGlobal(token, abas, dados);
-    if (!/^(ano|mes)\(/i.test(token) && def?.tipo === "texto" && topo !== "(não informado)") {
-      return { texto: `Quer ver a lista de ${topo}?`, consulta: { ...base, filtros: [...c.filtros, { campo: token, op: "eq", valor: topo }] } };
-    }
-  }
-  return null;
-}
-
-// ============================================================
 // Entrada principal
 // ============================================================
 function retorno(base) {
@@ -1278,19 +1227,15 @@ async function finalizar(q, consultas, resultados, dados) {
   }
   if (!resposta) resposta = formatarDeterministico(resultados);
 
-  // oferta de próximo passo (gerada pelo código, só quando há uma consulta)
-  const oferta = consultas.length === 1 && !vazio ? proximaOferta(consultas[0], resultados[0], dados) : null;
-  if (oferta) resposta = `${resposta}\n\n_${oferta.texto}_`;
-
   console.log("AGENTE SHEETS - PLANO:", limitarTexto(consultas, 2500));
   console.log("AGENTE SHEETS - RESULTADO:", limitarTexto(resultados, 2500));
-  console.log("AGENTE SHEETS - RESPOSTA VIA:", origem, oferta ? `| OFERTA: ${oferta.texto}` : "");
+  console.log("AGENTE SHEETS - RESPOSTA VIA:", origem);
 
   const linhas = resultados.reduce((s, r) => s + (r.registros_filtrados || 0), 0);
   return retorno({
     resposta,
     linhas,
-    estado: construirEstado(consultas, resultados, oferta),
+    estado: construirEstado(consultas, resultados),
     ferramenta: "consultar_planilha",
     respostaVia: origem,
     fonte: "Google Sheets",
@@ -1300,31 +1245,18 @@ async function finalizar(q, consultas, resultados, dados) {
 export async function responderPergunta(pergunta, historico = []) {
   const q = texto(pergunta);
   const estadoAtual = ultimoEstadoValido(historico);
-  if (!q) return retorno({ resposta: "Digite uma pergunta sobre a planilha.", erro: "pergunta vazia", estado: semOferta(estadoAtual) });
+  if (!q) return retorno({ resposta: "Digite uma pergunta sobre a planilha.", erro: "pergunta vazia", estado: estadoAtual });
 
   let dados;
   try {
     dados = await carregarPlanilha();
   } catch (e) {
-    return retorno({ resposta: `Não consegui ler a planilha agora: ${e?.message || e}`, erro: e?.message || String(e), estado: semOferta(estadoAtual) });
+    return retorno({ resposta: `Não consegui ler a planilha agora: ${e?.message || e}`, erro: e?.message || String(e), estado: estadoAtual });
   }
 
   const nq = normalizar(q);
 
-  // "sim" / "não" para a oferta feita na resposta anterior (sem gastar token de IA)
-  if (estadoAtual?.oferta?.consulta) {
-    if (ehConfirmacao(nq)) {
-      const c = { rotulo: "registros", abas: [], filtros: [], buscas: [], agrupar_por: [], metricas: [], campos: [], ordenar_por: null, direcao: "desc", limite: MAX_LISTA, ...estadoAtual.oferta.consulta };
-      if (!validarConsulta(c, dados).erros.length) {
-        console.log("AGENTE SHEETS - CONFIRMAÇÃO da oferta:", estadoAtual.oferta.texto);
-        return finalizar(q, [c], [executarConsulta(c, dados)], dados);
-      }
-    } else if (FRASES_NAO.test(nq)) {
-      return retorno({ resposta: "Tudo bem. Pode perguntar o que precisar.", estado: semOferta(estadoAtual) });
-    }
-  }
-
-  if (ehSaudacao(nq)) return retorno({ resposta: RESPOSTA_SAUDACAO, estado: semOferta(estadoAtual) });
+  if (ehSaudacao(nq)) return retorno({ resposta: RESPOSTA_SAUDACAO, estado: estadoAtual });
 
   // ---- [1] planejar + [2] validar/executar (com até MAX_PASSOS tentativas se o plano vier inválido) ----
   let consultas = [];
@@ -1337,14 +1269,14 @@ export async function responderPergunta(pergunta, historico = []) {
     try {
       plano = await planejar(q, historico, estadoAtual, dados, observacao);
     } catch (e) {
-      return retorno({ resposta: "Não consegui interpretar a pergunta agora. Tente novamente em alguns segundos.", erro: e?.message || String(e), estado: semOferta(estadoAtual) });
+      return retorno({ resposta: "Não consegui interpretar a pergunta agora. Tente novamente em alguns segundos.", erro: e?.message || String(e), estado: estadoAtual });
     }
     if (!plano) { observacao = ["Resposta não era um JSON válido."]; continue; }
 
     if (plano.tipo === "conversa" || plano.tipo === "esclarecer") {
       return retorno({
         resposta: texto(plano.mensagem) || "Pode perguntar sobre as obras, projetos, licitações e pendências da planilha.",
-        estado: semOferta(estadoAtual),
+        estado: estadoAtual,
       });
     }
 
@@ -1368,7 +1300,7 @@ export async function responderPergunta(pergunta, historico = []) {
     return retorno({
       resposta: "Não consegui montar essa consulta com segurança. Pode reformular a pergunta, dizendo se é sobre obras, projetos ou licitações?",
       erro: `plano inválido: ${limitarTexto(observacao, 500)}`,
-      estado: semOferta(estadoAtual),
+      estado: estadoAtual,
     });
   }
 
