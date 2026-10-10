@@ -17,6 +17,7 @@
     "dotenv": "^16.6.1",
     "express": "^4.19.2",
     "googleapis": "^140.0.1",
-    "pg": "^8.23.0"
+    "pg": "^8.23.0",
+    "quickjs-emscripten": "^0.32.0"
   }
 }
