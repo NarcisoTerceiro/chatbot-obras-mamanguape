@@ -1,60 +1,137 @@
-CORRECAO V2 - CHATBOT OBRAS MAMANGUAPE
-=======================================
+CHATBOT OBRAS: MÓDULOS ENVIADOS + PYTHON/PANDAS
 
-Substitua no projeto estes arquivos:
-- agente.js
-- groq.js
-- server.js
+O ZIP agora inclui agente.js, iaTools.js e sheets.js (baseado em sheets(8).js).
+As chaves continuam no seu .env: não é necessário cadastrar outra API.
 
-O que foi corrigido:
-1. Groq: o modelo llama-3.1-8b-instant estava retornando 404 na sua conta.
-   Agora o bot tenta modelos atuais do Groq e usa como principal:
-   openai/gpt-oss-20b
-   Se um modelo retornar model_not_found, ele troca automaticamente.
+FLUXO
+1. Pergunta do usuário.
+2. Python entrega colunas/tipos/amostras da estrutura em cache.
+3. Sua IA usa consultarComPandas para planejar filtros e operações.
+4. Python acha registros no snapshot da fonte; pandas calcula se necessário.
+5. IA valida a consulta/resultados: aprovar, corrigir ou esclarecer.
+6. Resposta redigida pela IA após a validação. Se pedir correção, nova consulta.
+Até 3 rodadas. As instruções de planejamento continuam curtas (4 linhas).
 
-2. Gemini: a chamada agora usa a API nativa do Gemini com o cabecalho
-   x-goog-api-key. Isso evita o erro de autenticacao que apareceu na camada
-   OpenAI-compatible. O modelo padrao e gemini-3.5-flash-lite.
+COMO INSTALAR
+1. Faça backup dos arquivos antigos.
+2. Copie TODOS os arquivos deste ZIP para a pasta do agente no projeto.
+   Substitua agente.js, sheets.js, iaTools.js e auxiliares pandas.
+   Preserve seu .env, package.json e os outros arquivos do backend/WhatsApp.
+   O sheets.js do ZIP substitui o arquivo de trabalho sheets.js, não deve ficar
+   com o nome sheets(8).js no projeto.
+3. Use Node.js 22+ com ES Modules e Python 3.11+ com launcher py.
+4. Abra instalar-pandas.bat ou rode:
+   py -3 -m pip install -r requirements-pandas.txt
+5. Seu projeto já usava googleapis. Se essa dependência não estiver instalada:
+   npm install googleapis
 
-3. Menos tokens:
-   - perguntas comuns viram SQL direto no Node, sem IA;
-   - SQL gerado por IA tem saida curta;
-   - historico enviado para IA e pequeno;
-   - respostas comuns sao formatadas pelo Node, sem segunda chamada de IA.
+Se os módulos ficam em src/, coloque os arquivos auxiliares Python, config,
+schema e os scripts de teste nessa pasta também. Não substitua package.json.
 
-4. Contexto corrigido:
-   Exemplo:
-   "Tem quantas obras concluidas?" -> COUNT das concluidas
-   "Quais sao?" -> lista as mesmas obras concluidas, sem IA
-   "Quais os engenheiros dessas obras?" -> lista obra + engenheiro, sem IA
+TESTE SEM CONSUMIR API
+Abra testar-pandas.bat. Ele executa:
+  node testar-pandas.mjs       (11 testes do fluxo/cache/validação)
+  node testar-integracao.mjs   (9 testes dos módulos reais com APIs simuladas)
+  py -3 testar-cache.py        (4 verificações de cache)
+As chaves e a conta Google não são usadas nesses testes; os dados são fictícios.
+Node/Python/pandas e os módulos do ZIP são reais; respostas das APIs simuladas.
 
-5. Local/bairro corrigido:
-   "Qual o valor investido no Centro?" -> soma somente Centro
-   "Quais obras no Centro?" -> lista somente Centro
-   "Quantas obras no Centro?" -> conta somente Centro
+TESTE REAL COM SEU .ENV
+Abra testar-agente.bat se os arquivos estão na raiz do projeto, ou rode:
+  node testar-agente.mjs
+Se estão em src/, execute da raiz onde fica seu .env:
+  node src/testar-agente.mjs
+Pergunte:
+  Quantas UBS existem entre as obras?
+  Qual engenheiro tem maior valor investido em obras?
+  Qual o valor total e o valor executado das obras?
+  Quais são as obras da educação?
+Digite atualizar para renovar os dados; sair para encerrar.
+O diagnóstico mostra filtro/plano, resultados, ausências, versão e decisão da IA.
+Mantenha o .env original. IA_PROVIDER/AI_PROVIDER e as chaves continuam iguais.
+Google usa GOOGLE_SHEETS_ID, GOOGLE_SERVICE_ACCOUNT_JSON ou suas credenciais
+padrão existentes. Compartilhe a planilha com a conta de serviço como leitor.
 
-VARIAVEIS RECOMENDADAS NO RENDER
----------------------------------
-GROQ_API_KEY=<sua chave Groq>
-GROQ_MODEL=openai/gpt-oss-20b
-GEMINI_API_KEY=<chave criada no Google AI Studio>
-GEMINI_MODEL=gemini-3.5-flash-lite
-USAR_AGENTE_SQL=true
+CORREÇÕES NO SHEETS.JS
+- Preserva números e booleanos; zero não é apagado como se fosse vazio.
+- Mantém _aba e _linha da origem para identificar registros.
+- Prefere linha com mais cabeçalhos reconhecidos, evitando escolher só o título.
+- Cabeçalhos duplicados são recusados, evitando sobrescrita silenciosa.
+- Mantém os exports getObras, limparCache, getDiagnostico,
+  acharLinhaCabecalho e rowsToObjects.
+- Nova opção getObras({force:true}) força a leitura em vez do cache antigo.
+- getVersaoCache permite ao agente detectar sincronizações externas.
+- Consulta somente leitura; preserva SHEETS_TABS e SHEETS_TABS_IGNORAR.
+- Nomes de abas são escapados no range; retorno incompleto cancela a leitura.
+- Leituras simultâneas compartilham uma chamada; falhas não substituem a
+  versão anterior nem são usadas silenciosamente como atualização bem-sucedida.
 
-IMPORTANTE:
-- Nao coloque aspas nas chaves no Render.
-- Nao coloque espacos antes/depois da chave.
-- Se GEMINI_API_KEY continuar retornando 401, gere uma chave nova no Google
-  AI Studio e substitua a variavel no Render. Depois faca redeploy.
-- O codigo tambem aceita GOOGLE_API_KEY ou GOOGLE_GENAI_API_KEY como alternativa.
+CACHE PYTHON E ATUALIZAÇÃO
+Python persistente guarda estrutura e DataFrame em memória. A leitura original
+continua sendo feita por sheets.js; buscas e cálculos usam o snapshot no Python.
+Não faz chamada seletiva nova ao Google para cada filtro.
+Validade padrão 60 segundos, renovando na próxima pergunta após esse prazo.
+No .env: PANDAS_CACHE_SECONDS=60 (>=1).
+Cada pergunta fixa sua versão até acabar, mesmo com atualização simultânea.
+Reinício do processo perde o cache; worker encerra após 5min de inatividade.
 
-TESTES DEPOIS DO DEPLOY
------------------------
-1. Oi
-2. Tem quantas obras concluida?
-3. Quais sao?
-4. Quais os engenheiros dessas obras?
-5. Qual o valor investido no Centro?
-6. Quais obras no Centro?
+Quando o cache do pandas precisa renovar, o agente chama getObras({force:true})
+para não ficar preso aos 3 minutos do cache antigo do Sheets.
+Atualização manual:
+  await responderPergunta.atualizarCache();
+Ou importe atualizarCachePandas de agente.js.
+Se a sincronização do seu backend chamar limparCache de sheets.js, o agente
+nota a mudança de versão e renova o cache Python na próxima pergunta.
+Não monitora edições da planilha continuamente; preserve seu webhook existente.
 
-Nos testes 2 a 6 acima, o caminho rapido evita IA na maior parte dos casos.
+IA TOOLS
+Mantido o adaptador enviado, com NVIDIA/Groq/Gemini, ordem/preferência e
+metadados nativos. O catálogo já é recebido como parâmetro e suporta as
+etapas consultarComPandas e validarResposta, sem chaves novas no código.
+Normalmente 2 chamadas de IA por pergunta; correções podem chegar a 6.
+O provedor fica fixo durante o ciclo para manter metadados compatíveis.
+Testes verificam HTTP 429/fallback inicial, ferramentas inválidas, saída
+truncada e preservação de metadados do Gemini. A disponibilidade real do
+modelo/chave/cota da sua conta só é confirmada pelo teste real no seu computador.
+
+TIPOS E CAPACIDADES
+Campos principais: objeto, bairro, rua, status, engenheiro, empresa, aba,
+tipo_registro, valor_total e valor_executado. Colunas da fonte também estão
+disponíveis com prefixo original:, preservando os cabeçalhos reais.
+Tipos adicionais são configurados em pandas-config.json. Exemplo:
+{
+ "columns": {
+   "original:DATA INICIO": {"type":"date", "format":"%d/%m/%Y"},
+   "original:VALOR PAGO 2026": {"type":"money", "locale":"pt_BR"}
+ },
+ "business_rules": []
+}
+Troque pelos seus cabeçalhos reais. Datas precisam de formato configurado.
+Dinheiro usa Decimal/centavos. Vazio não é zero. Duplicatas não são removidas
+sem definição. Percentuais precisam de escala explícita: multiplier 100 só
+se 0.7551 significa 75.51%; multiplier 1 se a fonte já contém 75.51.
+
+Consultas disponíveis: filtros AND/OR, listagem, contagem, agrupamento,
+ranking, soma, média, min/max, paginação e campos derivados/diferença de datas.
+Não executa código arbitrário gerado pela IA. Operação fora do executor
+precisa ser esclarecida ou implementada. Classificação obra/projeto/licitação
+continua baseada nas abas como no agente enviado, e precisa ser conferida na fonte.
+A IA validar não garante 100%: ela ainda pode entender ou aprovar um filtro errado.
+
+DEPLOY/ERROS
+Python precisa estar no MESMO ambiente que executa Node. Instalar no Windows
+não instala dentro de Docker/Render. Dockerfile.pandas é exemplo opcional
+(pressupõe package-lock.json/npm start); revise antes de alterar seu deploy.
+Se o Python não inicia, confira py -3 --version ou configure PYTHON_BIN no .env
+com o caminho real de python.exe; instale dependências nesse mesmo Python.
+Se houver erro de API, envie o diagnóstico sem chaves. Não há chaves no ZIP.
+
+VALIDAÇÃO REALIZADA
+20 testes Node (11 fluxo + 9 módulos) e 4 verificações Python passaram.
+As APIs remotas foram simuladas; nenhuma chave/conta/planilha real foi usada.
+Não foi enviado WhatsApp e não foram modificados dados ou serviços externos.
+Os testes reais incluídos usam o .env existente no seu computador.
+
+Referências oficiais usadas na revisão:
+https://developers.google.com/workspace/sheets/api/reference/rest/v4/ValueRenderOption
+https://ai.google.dev/gemini-api/docs/openai

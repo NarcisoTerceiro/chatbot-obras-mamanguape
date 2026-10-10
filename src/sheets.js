@@ -1,252 +1,124 @@
-// ============================================================
-//  sheets.js
-//  Le a planilha configurada em GOOGLE_SHEETS_ID usando uma
-//  Conta de Servico (Service Account) so de leitura.
-//
-//  MODO AUTOMATICO: por padrao, o bot detecta sozinho todas as
-//  abas da planilha. Para limitar, defina SHEETS_TABS no .env
-//  (nomes separados por virgula).
-//
-//  LEITURA ROBUSTA (importante):
-//  - O cabecalho NAO e necessariamente a primeira linha. Muitas
-//    planilhas tem titulo, subtitulo ou linhas em branco antes.
-//    O codigo procura a linha que realmente parece cabecalho.
-//  - Linhas totalmente vazias sao descartadas (senao a contagem
-//    de obras fica inflada).
-//  - Linhas sem nenhum conteudo util tambem sao descartadas.
-// ============================================================
-
-import { google } from "googleapis";
-
-const SHEET_ID = process.env.GOOGLE_SHEETS_ID;
-
-// Se SHEETS_TABS estiver definida, usa so essas abas.
-const TABS_MANUAIS = (process.env.SHEETS_TABS || "")
-  .split(",")
-  .map((t) => t.trim())
-  .filter(Boolean);
-
-// Abas que normalmente NAO sao lista de obras (ajuste se precisar).
-const ABAS_IGNORADAS = (process.env.SHEETS_TABS_IGNORAR || "")
-  .split(",")
-  .map((t) => t.trim().toLowerCase())
-  .filter(Boolean);
-
-function getAuth() {
-  const inlineJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  const scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"];
-
-  if (inlineJson && inlineJson.trim()) {
-    const credentials = JSON.parse(inlineJson);
-    return new google.auth.GoogleAuth({ credentials, scopes });
-  }
-  return new google.auth.GoogleAuth({ scopes });
+// Google Sheets read-only. Preserve numeric values/zero and original source row.
+const normaliza=s=>String(s??'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim();
+const filled=v=>v!==null&&v!==undefined&&(typeof v!=='string'||v.trim()!=='');
+const words=['objeto','obra','rua','situacao','status','contrato','empresa','recurso','engenheiro','arquiteto','valor','bairro','endereco','fonte','convenio','proposta','data','prazo','aditivo','logradouro'];
+function headerScore(row){
+ return (row||[]).reduce((score,cell)=>{
+  if(typeof cell!=='string')return score;
+  const label=normaliza(cell);if(label.length>90)return score;
+  return score+Number(words.some(word=>new RegExp(`\\b${word}\\b`).test(label)));
+ },0);
 }
-
-const sheetsApi = google.sheets({ version: "v4", auth: getAuth() });
-
-// --- Cache dos dados ---
-let cache = { data: null, time: 0 };
-const CACHE_MS = 3 * 60 * 1000; // 3 minutos
-
-// --- Cache da lista de abas ---
-let cacheAbas = { nomes: null, time: 0 };
-const CACHE_ABAS_MS = 5 * 60 * 1000;
-
-// --- Diagnostico da ultima leitura (usado pela rota /diagnostico) ---
-let ultimoDiagnostico = { abas: [], total: 0, quando: null };
-
-export function getDiagnostico() {
-  return ultimoDiagnostico;
+export function acharLinhaCabecalho(rows,maxLinhasAnalisadas=15){
+ if(!Array.isArray(rows)||!rows.length)return -1;
+ let best=-1,score=1;
+ for(let i=0;i<Math.min(rows.length,maxLinhasAnalisadas);i++){
+  const n=headerScore(rows[i]);
+  if(n>score){score=n;best=i;}
+ }
+ if(best!==-1)return best;
+ // Keep support for unknown tables, choosing the widest candidate when no strong header exists.
+ let width=1;
+ for(let i=0;i<Math.min(rows.length,maxLinhasAnalisadas);i++){
+  const n=(rows[i]||[]).filter(filled).length;if(n>width){width=n;best=i;}
+ }
+ return best;
 }
-
-// Limpa o cache, forcando a proxima leitura a buscar a planilha FRESCA.
-// A sincronizacao (via webhook ou manual) chama isto ANTES de ler, pra
-// garantir que uma edicao recente na planilha seja lida de verdade - e nao
-// devolvida do cache velho (que causava "editei mas o banco nao mudou").
-export function limparCache() {
-  cache = { data: null, time: 0 };
-  cacheAbas = { nomes: null, time: 0 };
-  console.log("SHEETS: cache limpo - proxima leitura sera da planilha fresca.");
-}
-
-async function listarAbasDaPlanilha() {
-  const agora = Date.now();
-  if (cacheAbas.nomes && agora - cacheAbas.time < CACHE_ABAS_MS) {
-    return cacheAbas.nomes;
-  }
-
-  const resp = await sheetsApi.spreadsheets.get({
-    spreadsheetId: SHEET_ID,
-    fields: "sheets.properties.title",
+export function rowsToObjects(rows,tabName){
+ const idx=acharLinhaCabecalho(rows);
+ if(idx<0)return {obras:[],cabecalho:[],ignoradas:0};
+ const header=(rows[idx]||[]).map(h=>String(h??'').trim());
+ const names=header.filter(Boolean);
+ if(new Set(names).size!==names.length)throw Error(`Aba ${tabName}: cabeçalhos duplicados. Corrija a fonte antes de consultar.`);
+ if(names.some(n=>['_aba','_linha'].includes(n)))throw Error(`Aba ${tabName}: cabeçalho reservado.`);
+ const obras=[];let ignoradas=0;
+ for(let i=idx+1;i<rows.length;i++){
+  const row=rows[i]||[];
+  if(!row.some(filled)){ignoradas++;continue;}
+  const obj={_aba:tabName,_linha:i+1};let count=0;
+  header.forEach((name,j)=>{
+   if(!name||!filled(row[j]))return;
+   const value=typeof row[j]==='string'?row[j].trim():row[j];
+   obj[name]=value;count++;
   });
-
-  const nomes = (resp.data.sheets || [])
-    .map((s) => s.properties.title)
-    .filter((t) => !ABAS_IGNORADAS.includes((t || "").toLowerCase()));
-
-  cacheAbas = { nomes, time: agora };
-  return nomes;
+  if(!count){ignoradas++;continue;}
+  // Repeated headers inside the same tab are not records.
+  const repeat=names.length>1&&header.every((name,j)=>!name||normaliza(row[j])===normaliza(name));
+  if(repeat){ignoradas++;continue;}
+  obras.push(obj);
+ }
+ return {obras,cabecalho:names,ignoradas};
 }
+const split=s=>String(s||'').split(',').map(t=>t.trim()).filter(Boolean);
+const duration=(s,fallback)=>{const n=Number(s);return Number.isFinite(n)&&n>=0&&s!==undefined&&s!==''?n:fallback;};
 
-// ------------------------------------------------------------
-//  Deteccao do cabecalho
-//  Nesta planilha o cabecalho NEM SEMPRE esta na linha 1 (em varias
-//  abas ele esta na linha 7 ou 8, com titulo antes). E linhas de dados
-//  podem ter tantas celulas quanto o cabecalho, entao "a linha com mais
-//  celulas" nao basta. Estrategia em duas etapas:
-//   1) procura a PRIMEIRA linha que contem palavras tipicas de cabecalho
-//      de obras (objeto, rua, situacao, status, contrato, empresa...);
-//   2) se nao achar por palavra, cai para a linha com mais celulas.
-// ------------------------------------------------------------
-
-// Palavras que so aparecem em CABECALHO de uma tabela de obras.
-const PALAVRAS_CABECALHO = [
-  "objeto", "obra", "rua", "situacao", "status", "contrato", "empresa",
-  "recurso", "engenheiro", "arquiteto", "valor", "bairro", "endereco",
-  "fonte", "convenio", "proposta", "data", "prazo", "aditivo", "logradouro",
-];
-
-function normaliza(s) {
-  return (s || "")
-    .toString()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
-}
-
-function contarPreenchidas(row) {
-  return (row || []).filter((c) => (c || "").toString().trim() !== "").length;
-}
-
-function pareceCabecalho(row) {
-  const texto = normaliza((row || []).join(" "));
-  return PALAVRAS_CABECALHO.some((p) => texto.includes(p));
-}
-
-export function acharLinhaCabecalho(rows, maxLinhasAnalisadas = 15) {
-  if (!rows || rows.length === 0) return -1;
-  const limite = Math.min(rows.length, maxLinhasAnalisadas);
-
-  // Etapa 1: primeira linha com >= 2 celulas E palavra tipica de cabecalho.
-  for (let i = 0; i < limite; i++) {
-    if (contarPreenchidas(rows[i]) >= 2 && pareceCabecalho(rows[i])) {
-      return i;
+export function criarLeitorSheets({api,env=process.env,now=()=>Date.now(),logger=console}={}){
+ let source=api;
+ let initializing=null;
+ let cache={data:null,time:0};let tabsCache={nomes:null,time:0};
+ let diagnostic={abas:[],total:0,quando:null};
+ let pending=null;let generation=0;let revision=0;
+ async function getApi(){
+  if(source)return source;
+  if(!initializing)initializing=(async()=>{
+   const {google}=await import('googleapis');
+   const inline=env.GOOGLE_SERVICE_ACCOUNT_JSON;
+   const scopes=['https://www.googleapis.com/auth/spreadsheets.readonly'];
+   const auth=new google.auth.GoogleAuth(inline?.trim()?{credentials:JSON.parse(inline),scopes}:{scopes});
+   source=google.sheets({version:'v4',auth});return source;
+  })().catch(e=>{initializing=null;throw e;});
+  return initializing;
+ }
+ function limparCache(){
+  generation++;revision++;pending=null;
+  cache={data:null,time:0};tabsCache={nomes:null,time:0};
+ }
+ async function getObras({force=false}={}){
+  const id=env.GOOGLE_SHEETS_ID;
+  if(!id)throw Error('Configure GOOGLE_SHEETS_ID no .env.');
+  const cacheMs=duration(env.SHEETS_CACHE_MS,180000);
+  if(!force&&cache.data!==null&&now()-cache.time<cacheMs)return cache.data;
+  if(pending)return pending;
+  const currentGeneration=generation;
+  const task=(async()=>{
+   const sheets=await getApi();
+   let tabs=split(env.SHEETS_TABS);
+   if(!tabs.length){
+    const cacheTabsMs=duration(env.SHEETS_CACHE_ABAS_MS,300000);
+    if(!force&&tabsCache.nomes&&now()-tabsCache.time<cacheTabsMs)tabs=tabsCache.nomes;
+    else{
+     const resp=await sheets.spreadsheets.get({spreadsheetId:id,fields:'sheets.properties.title'});
+     const ignored=split(env.SHEETS_TABS_IGNORAR).map(normaliza);
+     tabs=(resp.data.sheets||[]).map(s=>s.properties?.title).filter(t=>t&&!ignored.includes(normaliza(t)));
+     if(generation===currentGeneration)tabsCache={nomes:tabs,time:now()};
     }
-  }
-
-  // Etapa 2 (fallback): a linha com mais celulas preenchidas.
-  let melhorIndice = -1;
-  let melhorContagem = 0;
-  for (let i = 0; i < limite; i++) {
-    const preenchidas = contarPreenchidas(rows[i]);
-    if (preenchidas >= 2 && preenchidas > melhorContagem) {
-      melhorContagem = preenchidas;
-      melhorIndice = i;
-    }
-  }
-  return melhorIndice;
+   }
+   let values=[];
+   if(tabs.length){
+    const ranges=tabs.map(t=>"'"+t.replace(/'/g,"''")+"'");
+    const response=await sheets.spreadsheets.values.batchGet({spreadsheetId:id,ranges,
+     valueRenderOption:'UNFORMATTED_VALUE',dateTimeRenderOption:'FORMATTED_STRING'});
+    values=response.data.valueRanges||[];
+    if(values.length!==tabs.length)throw Error('O Google não retornou todas as abas solicitadas; leitura cancelada.');
+   }
+   const all=[];const report=[];
+   values.forEach((vr,i)=>{
+    const {obras,cabecalho,ignoradas}=rowsToObjects(vr.values||[],tabs[i]);all.push(...obras);
+    report.push({aba:tabs[i],linhas_lidas:(vr.values||[]).length,obras:obras.length,linhas_ignoradas:ignoradas,cabecalho});
+   });
+   if(generation!==currentGeneration)throw Error('Leitura invalidada por uma atualização. Tente novamente.');
+   cache={data:all,time:now()};revision++;
+   diagnostic={abas:report,total:all.length,quando:new Date(now()).toISOString()};
+   logger?.log?.(`SHEETS: ${all.length} registros lidos em ${report.length} abas.`);
+   return all;
+  })();
+  pending=task;
+  try{return await task;}finally{if(pending===task)pending=null;}
+ }
+ return {getObras,limparCache,getDiagnostico:()=>diagnostic,getVersaoCache:()=>revision};
 }
-
-// Converte uma aba em lista de objetos, ignorando lixo.
-export function rowsToObjects(rows, tabName) {
-  const idxCabecalho = acharLinhaCabecalho(rows);
-  if (idxCabecalho < 0) return { obras: [], cabecalho: [], ignoradas: 0 };
-
-  const header = (rows[idxCabecalho] || []).map((h) => (h || "").toString().trim());
-  const obras = [];
-  let ignoradas = 0;
-
-  for (let i = idxCabecalho + 1; i < rows.length; i++) {
-    const row = rows[i] || [];
-
-    // Linha totalmente vazia -> descarta (nao conta como obra).
-    const temAlgo = row.some((c) => (c || "").toString().trim() !== "");
-    if (!temAlgo) {
-      ignoradas += 1;
-      continue;
-    }
-
-    const obj = { _aba: tabName };
-    let campos = 0;
-    header.forEach((col, j) => {
-      if (!col) return;
-      const valor = (row[j] || "").toString().trim();
-      if (valor) {
-        obj[col] = valor;
-        campos += 1;
-      }
-    });
-
-    // Linha que nao produziu nenhum campo util -> descarta.
-    if (campos === 0) {
-      ignoradas += 1;
-      continue;
-    }
-
-    obras.push(obj);
-  }
-
-  return { obras, cabecalho: header.filter(Boolean), ignoradas };
-}
-
-// Retorna TODAS as obras de TODAS as abas.
-export async function getObras() {
-  const agora = Date.now();
-  if (cache.data && agora - cache.time < CACHE_MS) {
-    return cache.data;
-  }
-
-  const tabs = TABS_MANUAIS.length > 0 ? TABS_MANUAIS : await listarAbasDaPlanilha();
-
-  if (tabs.length === 0) {
-    cache = { data: [], time: agora };
-    ultimoDiagnostico = { abas: [], total: 0, quando: new Date().toISOString() };
-    return [];
-  }
-
-  const resp = await sheetsApi.spreadsheets.values.batchGet({
-    spreadsheetId: SHEET_ID,
-    ranges: tabs,
-    // Nao dependemos mais do formato visual/locale da planilha.
-    // Ex.: 3,020,000.00 e 3.020.000,00 passam a chegar como 3020000.
-    valueRenderOption: "UNFORMATTED_VALUE",
-    // Mantem datas como texto legivel em vez de numero serial do Sheets.
-    dateTimeRenderOption: "FORMATTED_STRING",
-  });
-
-  const todas = [];
-  const relatorio = [];
-
-  (resp.data.valueRanges || []).forEach((vr, idx) => {
-    const nomeAba = tabs[idx];
-    const { obras, cabecalho, ignoradas } = rowsToObjects(vr.values, nomeAba);
-    todas.push(...obras);
-    relatorio.push({
-      aba: nomeAba,
-      linhas_lidas: (vr.values || []).length,
-      obras: obras.length,
-      linhas_ignoradas: ignoradas,
-      cabecalho,
-    });
-  });
-
-  // Log de diagnostico: mostra o que foi lido de cada aba.
-  relatorio.forEach((r) => {
-    console.log(
-      `DIAGNOSTICO aba "${r.aba}": ${r.obras} obra(s), ` +
-        `${r.linhas_ignoradas} linha(s) ignorada(s). ` +
-        `Colunas: ${r.cabecalho.join(" | ") || "(nenhuma detectada)"}`
-    );
-  });
-  console.log(`DIAGNOSTICO total de obras carregadas: ${todas.length}`);
-
-  ultimoDiagnostico = {
-    abas: relatorio,
-    total: todas.length,
-    quando: new Date().toISOString(),
-  };
-
-  cache = { data: todas, time: agora };
-  return todas;
-}
+const defaultReader=criarLeitorSheets();
+export const getObras=options=>defaultReader.getObras(options);
+export const limparCache=()=>defaultReader.limparCache();
+export const getDiagnostico=()=>defaultReader.getDiagnostico();
+export const getVersaoCache=()=>defaultReader.getVersaoCache();

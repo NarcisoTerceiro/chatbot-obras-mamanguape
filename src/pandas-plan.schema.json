@@ -1,0 +1,249 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "clarification": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "filters": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "eq",
+              "ne",
+              "contains",
+              "in",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "is_null",
+              "not_null"
+            ],
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "column",
+          "op"
+        ],
+        "type": "object"
+      },
+      "maxItems": 30,
+      "type": "array"
+    },
+    "any_filters": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "eq",
+              "ne",
+              "contains",
+              "in",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "is_null",
+              "not_null"
+            ],
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "column",
+          "op"
+        ],
+        "type": "object"
+      },
+      "maxItems": 30,
+      "type": "array"
+    },
+    "derived": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "pattern": "^[a-zA-Z_][a-zA-Z0-9_]{0,50}$",
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "subtract",
+              "add",
+              "ratio",
+              "days_between"
+            ],
+            "type": "string"
+          },
+          "left": {
+            "type": "string"
+          },
+          "right": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "op",
+          "left",
+          "right"
+        ],
+        "type": "object"
+      },
+      "maxItems": 10,
+      "type": "array"
+    },
+    "group_by": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 5,
+      "type": "array"
+    },
+    "metrics": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "pattern": "^[a-zA-Z_][a-zA-Z0-9_]{0,50}$",
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "rows",
+              "count",
+              "nunique",
+              "sum",
+              "mean",
+              "min",
+              "max"
+            ],
+            "type": "string"
+          },
+          "column": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "name",
+          "op"
+        ],
+        "type": "object"
+      },
+      "maxItems": 10,
+      "type": "array"
+    },
+    "select": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 20,
+      "type": "array"
+    },
+    "sort": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "descending": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "column"
+        ],
+        "type": "object"
+      },
+      "maxItems": 5,
+      "type": "array"
+    },
+    "limit": {
+      "default": 50,
+      "maximum": 200,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "offset": {
+      "default": 0,
+      "maximum": 1000000,
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "type": "object"
+}
