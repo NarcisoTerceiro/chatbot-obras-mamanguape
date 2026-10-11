@@ -88,7 +88,6 @@ function build(data,override){
     const r=Object.fromEntries(Object.entries(record).filter(([k])=>!['avisos_fonte','dados_originais','valor_total_centavos','valor_total_formatado','valor_executado_centavos'].includes(k)));
     for(const [c,v] of Object.entries(record.dados_originais||{})){
       const name='original:'+c;r[name]=v;
-      if(typeof v==='number'&&!Object.hasOwn(config.columns,name))config.columns[name]={type:'number'};
     }
     for(const name of ['valor_total','valor_executado']){
       const cents=record[name+'_centavos'];r[name]=cents==null?null:new Decimal(cents).div(100);
@@ -97,21 +96,48 @@ function build(data,override){
     return r;
   });
   const columns=[...new Set(records.flatMap(r=>Object.keys(r)))];
+  // Não inferir o tipo da coluna inteira a partir de uma única célula numérica.
+  // Códigos/documentos e colunas de números misturados com texto permanecem texto.
+  for(const name of columns.filter(c=>c.startsWith('original:'))){
+    if(Object.hasOwn(config.columns,name))continue;
+    const values=records.map(r=>r[name]).filter(v=>!empty(v));
+    const identifier=/\b(?:cnpj|cpf|cep)\b/.test(norm(name.slice(9)));
+    if(!identifier&&values.length&&values.every(v=>typeof v==='number'&&Number.isFinite(v)))
+      config.columns[name]={type:'number'};
+  }
   const names=columns.map(c=>config.rename?.[c]??c.trim());
   if(new Set(names).size!==names.length)throw Error('Mapeamento de colunas duplicado.');
   const types=Object.fromEntries(names.map(c=>[c,config.columns[c]?.type||'text']));
+  const issues=new Map(),multipliers=new Map();
+  for(const name of names){
+    const spec=config.columns[name]||{type:'text'};
+    if(!['text','bool','date',...numericTypes].includes(spec.type))throw Error(`Tipo desconhecido em ${name}.`);
+    if(numericTypes.has(spec.type))multipliers.set(name,number(spec.multiplier??1));
+  }
+  const rawRecords=records;
   records=records.map(r=>Object.fromEntries(columns.map((c,i)=>{
     const name=names[i],spec=config.columns[name]||{type:'text'};let v=empty(r[c])?null:r[c];
+    try{
     if(numericTypes.has(spec.type)){
-      v=number(v,spec.locale||'en_US');if(v!==null)v=v.mul(number(spec.multiplier??1));
+      v=number(v,spec.locale||'en_US');if(v!==null)v=v.mul(multipliers.get(name));
       if(spec.type==='percent'&&v!==null&&(v.lt(0)||v.gt(100)))warnings.add(`${name}: percentual fora de 0–100; confira a escala na fonte.`);
     }else if(spec.type==='date')v=date(v,spec.format);
     else if(spec.type==='bool'&&v!==null){
       const b={true:true,false:false,sim:true,nao:false,'1':true,'0':false};
       if(!Object.hasOwn(b,norm(v)))throw Error(`${name}: booleano inválido.`);v=b[norm(v)];
-    }else if(spec.type!=='text'&&spec.type!=='bool')throw Error(`Tipo desconhecido em ${name}.`);
+    }
+    }catch(e){
+      // Uma célula malformada não impede consultar as demais linhas/abas.
+      // Mantém o valor bruto internamente e reporta amostras e referências.
+      if(!issues.has(name))issues.set(name,{column:name,count:0,examples:[]});
+      const issue=issues.get(name);issue.count++;
+      if(issue.examples.length<3)issue.examples.push({id_registro:r.id_registro,aba:r.aba,
+        value:String(r[c]).slice(0,160),reason:String(e.message).slice(0,200)});
+      v=null;
+    }
     return [name,v];
   })));
+  for(const issue of issues.values())warnings.add(`${issue.column}: ${issue.count} valor(es) inválido(s) não foram convertidos; cálculos/filtros nessa coluna podem ficar incompletos. Não foram tratados como zero.`);
   const seen=new Set();
   for(const r of records){const k=JSON.stringify(r);if(seen.has(k))warnings.add('Há linhas duplicadas; contagem usa registros, sem excluir duplicatas automaticamente.');seen.add(k);}
   const profile=Object.fromEntries(names.map(c=>{
@@ -131,7 +157,7 @@ function build(data,override){
     tipos_registro:[...t.tipos_registro].filter(Boolean),
     colunas:[...t.headers].map(header=>{const key='original:'+header;const queryName=config.rename?.[key]??key.trim();
       return {cabecalho:header,coluna_consulta:queryName,tipo:types[queryName]};})}));
-  return {records,types,metadata:{columns:profile,abas,rows:records.length,warnings:[...warnings],business_rules:config.business_rules||[]}};
+  return {records,rawRecords,types,metadata:{columns:profile,abas,rows:records.length,warnings:[...warnings],conversion_issues:[...issues.values()],business_rules:config.business_rules||[]}};
 }
 const compare=(a,b)=>a instanceof Decimal?a.comparedTo(b):a instanceof Date?Math.sign(a.getTime()-b.getTime()):a===b?0:a>b?1:-1;
 
