@@ -161,7 +161,7 @@ function build(data,override){
 }
 const compare=(a,b)=>a instanceof Decimal?a.comparedTo(b):a instanceof Date?Math.sign(a.getTime()-b.getTime()):a===b?0:a>b?1:-1;
 
-function query(entry,input){
+function query(entry,input,includeRecords=false){
   const p=plan(input);
   if(p.clarification)return {status:'clarification',resposta:p.clarification,plan:p};
   const types={...entry.types};let work=entry.records.map(r=>({...r}));
@@ -258,7 +258,8 @@ function query(entry,input){
     source_samples_complete:matched<=20,
     selected_columns:outputCols,filters:p.filters,any_filters:p.any_filters,
     group_by:p.group_by,metrics:p.metrics,derived:p.derived};
-  return {status:'ok',matched_rows:matched,total_result_rows:total,rows,missing,warnings,plan:p,evidence};
+  return {status:'ok',matched_rows:matched,total_result_rows:total,rows,missing,warnings,plan:p,evidence,
+    ...(includeRecords?{_matched_records:work.map(r=>Object.fromEntries(Object.keys(entry.types).map(c=>[c,r[c]])))}:{})};
 }
 
 function inspect(entry,input){
@@ -285,6 +286,22 @@ export function criarMotor({now=()=>performance.now(),config}={}){
       const entry={...build(payload.dados,configuration()),created:now(),loaded_at:new Date().toISOString(),version:randomUUID()};
       const id=randomUUID();snapshots.set(id,entry);
       result={status:'ok',...entry.metadata,snapshot_id:id,version:entry.version,loaded_at:entry.loaded_at,cache_age_seconds:0};
+    }else if(payload.acao==='recortar'){
+      const entry=snapshots.get(payload.snapshot_id);if(!entry)throw Error('Snapshot indisponível.');
+      const selected=query(entry,payload.plano,true)._matched_records;
+      if(!selected?.length)throw Error('Não há linhas para manter no contexto.');
+      if(snapshots.size>=128)throw Error('Muitas análises simultâneas; tente novamente.');
+      const ids=new Set(selected.map(r=>r.id_registro));
+      const columns=Object.fromEntries(Object.keys(entry.types).map(c=>{
+        const vals=selected.map(r=>r[c]),unique=[...new Map(vals.filter(v=>v!=null).map(v=>[key(v),v])).values()];
+        return [c,{type:entry.types[c],missing:vals.filter(v=>v==null).length,distinct:unique.length,
+          examples:unique.slice(0,8).map(v=>String(serial(v)).slice(0,140)),examples_complete:unique.length<=8}];
+      }));
+      const abas=entry.metadata.abas.map(tab=>({...tab,rows:selected.filter(r=>r.aba===tab.aba).length})).filter(tab=>tab.rows);
+      const e={...entry,records:selected,rawRecords:entry.rawRecords.filter(r=>ids.has(r.id_registro)),
+        metadata:{...entry.metadata,columns,abas,rows:selected.length}};
+      const id=randomUUID();snapshots.set(id,e);
+      result={status:'ok',...e.metadata,snapshot_id:id,version:e.version,loaded_at:e.loaded_at,cache_age_seconds:(now()-e.created)/1000};
     }else if(payload.acao==='carregar'){
       const built=build(payload.dados,configuration());
       const entry={...built,created:now(),loaded_at:new Date().toISOString(),version:randomUUID()};

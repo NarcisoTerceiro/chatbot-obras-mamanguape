@@ -1,0 +1,1465 @@
+// ============================================================
+//  server.js  -  ponto de entrada do chatbot
+//
+//  Fluxo padrao:
+//  Google Sheets --(conta de servico/sincronizacao)--> Supabase
+//  WhatsApp -> Webhook validado -> agente SQL -> Supabase -> WhatsApp.
+//
+//  O motor antigo que consulta a planilha diretamente permanece somente como
+//  retorno de emergencia quando USAR_AGENTE_SQL=false.
+// ============================================================
+
+import "dotenv/config";
+import crypto from "crypto";
+import express from "express";
+
+import { getObras, getDiagnostico } from "./sheets.js";
+import { sincronizar } from "./ingestao.js";
+import { responderPergunta } from "./agente.js";
+import { buscarObrasPorTermos, buscarObras, buscarPorEngenheiro } from "./search.js";
+import { interpretarPergunta, redigirResposta, calcularComCodeExecution, gerarCodigoPython } from "./groq.js";
+import { executarAgregacao, executarReceita } from "./agregacao.js";
+import { sandboxDisponivel, executarNoSandbox } from "./sandboxClient.js";
+import { enviarTexto } from "./whatsapp.js";
+import { queryReadOnly } from "./db.js";
+
+const app = express();
+// Guarda os bytes originais para validar a assinatura HMAC enviada pela Meta.
+app.use(express.json({
+  verify: (req, _res, buffer) => {
+    req.rawBody = Buffer.from(buffer);
+  },
+}));
+
+const PORT = process.env.PORT || 3000;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const META_APP_SECRET = process.env.META_APP_SECRET;
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || VERIFY_TOKEN;
+// Banco/Supabase e o caminho normal. O motor antigo so e ativado quando a
+// variavel for explicitamente "false", como retorno de emergencia.
+const USAR_AGENTE_SQL = process.env.USAR_AGENTE_SQL !== "false";
+const PERMITIR_TOKEN_QUERY = process.env.PERMITIR_TOKEN_QUERY === "true";
+const PERMITIR_SYNC_GET_LEGADO = process.env.PERMITIR_SYNC_GET_LEGADO === "true";
+
+if (!VERIFY_TOKEN) {
+  throw new Error("VERIFY_TOKEN e obrigatorio; o servidor nao inicia sem ele.");
+}
+if (!META_APP_SECRET) {
+  throw new Error("META_APP_SECRET e obrigatorio para validar o webhook da Meta.");
+}
+if (!ADMIN_TOKEN) {
+  throw new Error("ADMIN_TOKEN e obrigatorio para as rotas administrativas.");
+}
+if (USAR_AGENTE_SQL && !process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL read-only e obrigatoria para o agente SQL.");
+}
+
+function compararSegredo(a, b) {
+  const ba = Buffer.from((a || "").toString());
+  const bb = Buffer.from((b || "").toString());
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+}
+
+function adminAutorizado(req) {
+  const cabecalho = req.get("authorization") || "";
+  const bearer = cabecalho.match(/^Bearer\s+(.+)$/i)?.[1] || "";
+  if (compararSegredo(bearer, ADMIN_TOKEN)) return true;
+  // Compatibilidade temporaria, desligada por padrao. Tokens na URL podem
+  // aparecer em historico, proxy e logs; migre o chamador para Authorization.
+  return PERMITIR_TOKEN_QUERY && compararSegredo(req.query.token, ADMIN_TOKEN);
+}
+
+function exigirAdmin(req, res) {
+  if (adminAutorizado(req)) return true;
+  res.sendStatus(403);
+  return false;
+}
+
+function assinaturaMetaValida(req) {
+  const recebida = req.get("x-hub-signature-256") || "";
+  if (!recebida.startsWith("sha256=") || !req.rawBody) return false;
+  const esperada = "sha256=" + crypto
+    .createHmac("sha256", META_APP_SECRET)
+    .update(req.rawBody)
+    .digest("hex");
+  return compararSegredo(recebida, esperada);
+}
+
+// Contato humano para escalar quando o bot nao resolve (opcional, via .env).
+const CONTATO_SECRETARIA = process.env.CONTATO_SECRETARIA || "";
+
+// Quantas obras mostrar no maximo numa resposta DETALHADA (cada uma ocupa
+// bastante espaco). Numa resposta RESUMIDA (so nomes), cabe bem mais.
+const LIMITE_RESULTADOS = 3;
+const LIMITE_RESUMIDO = 15;
+
+// --- Memoria de conversa por cidadao (numero de WhatsApp) ---
+// MELHORIA 5: alem do historico e das obras, guardamos os ULTIMOS TERMOS de
+// busca e o TIPO da ultima interacao. Isso permite refinar perguntas do tipo
+// "e tem mais alguma por la?", que dependem do recorte anterior.
+const memoriaPorUsuario = new Map();
+const MEMORIA_VALIDADE_MS = 30 * 60 * 1000; // 30 minutos; o agente envia so contexto curto
+const MAX_HISTORICO = 10; // somente RAM: guarda os 10 turnos/mensagens mais recentes por ate 30 minutos
+
+// Evita responder duas vezes ao mesmo evento da Meta. E uma protecao local;
+// para varias instancias, substitua por Redis/PostgreSQL com chave unica.
+const mensagensEmProcessamento = new Set();
+const mensagensProcessadas = new Map();
+const DEDUP_VALIDADE_MS = 24 * 60 * 60 * 1000;
+
+function limparDeduplicacao(agora = Date.now()) {
+  for (const [id, quando] of mensagensProcessadas) {
+    if (agora - quando > DEDUP_VALIDADE_MS) mensagensProcessadas.delete(id);
+  }
+}
+
+function mascararTelefone(numero) {
+  const s = (numero || "").toString();
+  return s.length <= 4 ? "****" : `***${s.slice(-4)}`;
+}
+
+
+function memoriaVazia() {
+  return { historico: [], obras: [], termos: [], tipo: "", falhas: 0, mostradas: 0 };
+}
+
+function lerMemoria(de) {
+  const m = memoriaPorUsuario.get(de);
+  if (!m) return memoriaVazia();
+  if (Date.now() - m.time > MEMORIA_VALIDADE_MS) {
+    memoriaPorUsuario.delete(de);
+    return memoriaVazia();
+  }
+  return {
+    historico: m.historico || [],
+    obras: m.obras || [],
+    termos: m.termos || [],
+    tipo: m.tipo || "",
+    falhas: m.falhas || 0,
+    mostradas: m.mostradas || 0,
+  };
+}
+
+function salvarMemoria(de, dados) {
+  memoriaPorUsuario.set(de, {
+    historico: (dados.historico || []).slice(-MAX_HISTORICO),
+    obras: dados.obras || [],
+    termos: dados.termos || [],
+    tipo: dados.tipo || "",
+    falhas: dados.falhas || 0,
+    mostradas: dados.mostradas || 0,
+    // O relogio reinicia a cada nova mensagem. A sessao expira apos
+    // 30 minutos sem atividade e nada e gravado no PostgreSQL.
+    time: Date.now(),
+  });
+}
+
+// MELHORIA 6: log estruturado das perguntas que o bot nao conseguiu responder.
+// Nao guarda o numero de telefone (privacidade). Serve para quem administra o
+// bot revisar depois e ajustar sinonimos no prompt ou completar a planilha.
+function logPerguntaSemResultado(pergunta, termos, motivo) {
+  const texto = (pergunta || "").toString().trim().toLowerCase();
+  console.log(
+    "LOG_SEM_RESULTADO " +
+      JSON.stringify({
+        data: new Date().toISOString(),
+        pergunta_hash: crypto.createHash("sha256").update(texto).digest("hex").slice(0, 16),
+        caracteres: texto.length,
+        termos,
+        motivo,
+      })
+  );
+}
+
+// Rota de saude (util pra manter o servico "acordado" e testar no navegador).
+app.get("/", (_req, res) => res.send("Chatbot de Obras de Mamanguape no ar."));
+
+// ------------------------------------------------------------
+//  Rota administrativa de diagnostico. Use:
+//    Authorization: Bearer SEU_ADMIN_TOKEN
+//  Quando o agente SQL esta ativo, o diagnostico consulta o MESMO banco usado
+//  pelo WhatsApp, e nao a planilha.
+// ------------------------------------------------------------
+app.get("/diagnostico", async (req, res) => {
+  if (!exigirAdmin(req, res)) return;
+  try {
+    if (USAR_AGENTE_SQL) {
+      const [total, status, exemplo] = await Promise.all([
+        queryReadOnly("SELECT COUNT(*)::int AS total FROM obras"),
+        queryReadOnly(
+          "SELECT COALESCE(status, 'Não informado') AS status, COUNT(*)::int AS total " +
+          "FROM obras GROUP BY status ORDER BY total DESC LIMIT 20"
+        ),
+        queryReadOnly(
+          "SELECT id, objeto, bairro, status, categoria, aba_origem FROM obras ORDER BY id LIMIT 1"
+        ),
+      ]);
+      return res.json({
+        fonte_do_atendimento: "PostgreSQL/Supabase",
+        total_de_obras: total.rows[0]?.total || 0,
+        contagem_por_status: status.rows,
+        exemplo_de_obra: exemplo.rows[0] || null,
+      });
+    }
+
+    const obras = await getObras();
+    const diag = getDiagnostico();
+    return res.json({
+      fonte_do_atendimento: "Google Sheets (modo legado)",
+      total_de_obras: obras.length,
+      abas: diag.abas,
+      exemplo_de_obra: obras[0] || null,
+      lido_em: diag.quando,
+    });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// ------------------------------------------------------------
+//  SINCRONIZAR: a conta de servico LE o Google Sheets e esta rota popula o
+//  Supabase. O WhatsApp continua consultando somente o banco.
+//  Chame com POST + Authorization: Bearer SEU_ADMIN_TOKEN.
+// ------------------------------------------------------------
+async function executarRotaSincronizacao(req, res) {
+  if (!exigirAdmin(req, res)) return;
+  try {
+    const resultado = await sincronizar();
+    res.json({
+      ok: true,
+      obras_inseridas: resultado.inseridas,
+      quando: new Date().toISOString(),
+    });
+  } catch (e) {
+    // Mostra o erro completo para diagnostico (mensagem + tipo + detalhe).
+    const detalhe = e && (e.message || e.toString());
+    const codigo = e && (e.code || "");
+    console.error("ERRO na sincronizacao:", detalhe, codigo, e && e.stack);
+    res.status(500).json({
+      ok: false,
+      erro: detalhe || "erro desconhecido",
+      codigo: codigo || undefined,
+      dica: "Verifique DATABASE_ADMIN_URL no Render e as credenciais do Google.",
+    });
+  }
+}
+
+app.post("/sincronizar", executarRotaSincronizacao);
+
+app.get("/sincronizar", (req, res) => {
+  if (!PERMITIR_SYNC_GET_LEGADO) {
+    res.set("Allow", "POST");
+    return res.status(405).json({
+      erro: "Use POST /sincronizar com Authorization: Bearer <ADMIN_TOKEN>.",
+    });
+  }
+  console.warn("AVISO: sincronizacao por GET legado habilitada; migre o chamador para POST.");
+  return executarRotaSincronizacao(req, res);
+});
+
+// ------------------------------------------------------------
+//  TESTAR-AGENTE: testa o agente SQL sem WhatsApp.
+//  Chame GET /testar-agente?q=quantas obras concluidas com o cabecalho:
+//    Authorization: Bearer SEU_ADMIN_TOKEN
+//  Mostra o SQL gerado, quantas linhas voltaram, e a resposta.
+//  So para TESTE - nao mexe no bot do WhatsApp.
+// ------------------------------------------------------------
+app.get("/testar-agente", async (req, res) => {
+  if (!exigirAdmin(req, res)) return;
+  const pergunta = req.query.q;
+  if (!pergunta) return res.json({ erro: "passe a pergunta em ?q=..." });
+
+  // Memoria somente em RAM. Use ?sessao=nome para separar conversas de teste.
+  // A sessao expira apos 30 minutos sem atividade e nao grava nada no banco.
+  const sessao = String(req.query.sessao || req.get("x-test-session") || "padrao")
+    .replace(/[^a-zA-Z0-9_.-]/g, "_")
+    .slice(0, 80);
+  const chaveTeste = `__teste_sql_agent__:${sessao}`;
+  const memoriaTeste = lerMemoria(chaveTeste);
+  const historicoTeste = memoriaTeste.historico || [];
+
+  try {
+    const r = await responderPergunta(pergunta, historicoTeste);
+    const novasMensagens = [
+      { role: "user", content: pergunta },
+      {
+        role: "assistant",
+        content: r.resposta,
+        sql: r.sql || null,
+        linhas: r.linhas ?? null,
+        estado: r.estado || null,
+      },
+    ];
+    salvarMemoria(chaveTeste, {
+      ...memoriaTeste,
+      historico: [...historicoTeste, ...novasMensagens],
+    });
+
+    res.json({
+      pergunta,
+      sessao,
+      sql_gerada: r.sql || r.sqlBloqueada || null,
+      linhas_retornadas: r.linhas ?? null,
+      resposta: r.resposta,
+      reparos: r.reparos ?? null,
+      early_accept: r.earlyAccept ?? null,
+      tentativas: r.tentativas || null,
+      modo_agente: r.modoAgente || null,
+      erro: r.erro || null,
+    });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// ------------------------------------------------------------
+//  1) VERIFICACAO DO WEBHOOK (a Meta chama isso 1 vez, via GET)
+// ------------------------------------------------------------
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && compararSegredo(token, VERIFY_TOKEN)) {
+    console.log("Webhook verificado com sucesso.");
+    return res.status(200).send(challenge);
+  }
+  return res.sendStatus(403);
+});
+
+// ------------------------------------------------------------
+//  2) RECEBIMENTO DE MENSAGENS (a Meta manda cada msg via POST)
+// ------------------------------------------------------------
+app.post("/webhook", (req, res) => {
+  if (!assinaturaMetaValida(req)) {
+    console.warn("Webhook rejeitado: assinatura da Meta invalida ou ausente.");
+    return res.sendStatus(401);
+  }
+  res.sendStatus(200);
+  processarWebhook(req.body).catch((e) =>
+    console.error("Erro ao processar webhook:", e)
+  );
+});
+
+// ------------------------------------------------------------
+//  Formatacao de RESPALDO (fallback): usada so quando a IA de
+//  redacao falha. O SISTEMA monta o texto com as colunas que
+//  existirem na planilha, sem depender da IA.
+// ------------------------------------------------------------
+
+function campoNome(obra) {
+  // Nomes comuns em varias abas (obras) e tambem "RUA" (aba de pavimentacao).
+  const candidatos = [
+    "OBJETO DA OBRA", "OBJETO", "NOME DA OBRA", "NOME", "OBRA",
+    "RUA", "LOGRADOURO", "ENDEREÇO", "ENDERECO",
+  ];
+  for (const c of candidatos) {
+    if (obra[c]) return obra[c];
+  }
+  // Fallback: procura qualquer coluna cujo nome contenha objeto/obra/rua/nome.
+  for (const [k, v] of Object.entries(obra)) {
+    if (k === "_aba" || !v) continue;
+    const n = k.toLowerCase();
+    if (n.includes("objeto") || n.includes("obra") || n.includes("rua") || n.includes("nome")) {
+      return v;
+    }
+  }
+  const primeiro = Object.entries(obra).find(([k, v]) => k !== "_aba" && v);
+  return primeiro ? primeiro[1] : "Obra sem nome cadastrado";
+}
+
+function campoStatus(obra) {
+  // "STATUS" (maioria das abas) ou "SITUAÇÃO" (aba de pavimentacao).
+  if (obra["STATUS"]) return obra["STATUS"];
+  if (obra["Status"]) return obra["Status"];
+  if (obra["SITUAÇÃO"]) return obra["SITUAÇÃO"];
+  if (obra["SITUACAO"]) return obra["SITUACAO"];
+  for (const [k, v] of Object.entries(obra)) {
+    if (k === "_aba" || !v) continue;
+    const n = k.toLowerCase();
+    if (n.includes("status") || n.includes("situa")) return v;
+  }
+  return "";
+}
+
+// MELHORIA 4: emoji conforme o status, para leitura visual rapida.
+function emojiStatus(status) {
+  const s = (status || "")
+    .toString()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+  if (!s) return "";
+  if (s.includes("conclu") || s.includes("finaliz") || s.includes("entregue")) return "✅";
+  if (s.includes("andamento") || s.includes("execu") || s.includes("obra em")) return "🚧";
+  if (s.includes("paralis") || s.includes("parada") || s.includes("suspens")) return "⏸️";
+  if (s.includes("licita") || s.includes("projeto") || s.includes("planej")) return "📋";
+  return "";
+}
+
+function formatarResumido(obra) {
+  const status = campoStatus(obra);
+  const emoji = emojiStatus(status);
+  const prefixo = emoji ? `${emoji} ` : "• ";
+  return status ? `${prefixo}${campoNome(obra)} (${status})` : `${prefixo}${campoNome(obra)}`;
+}
+
+function formatarListaResumida(obras) {
+  return obras.map((o) => formatarResumido(o)).join("\n");
+}
+
+function formatarObra(obra) {
+  const emoji = emojiStatus(campoStatus(obra));
+  const linhas = [];
+  if (emoji) linhas.push(`${emoji} *${campoNome(obra)}*`);
+  for (const [chave, valor] of Object.entries(obra)) {
+    if (chave === "_aba" || !valor) continue;
+    const texto = valor.toString();
+    const valorCurto = texto.length > 200 ? texto.slice(0, 200) + "…" : texto;
+    linhas.push(`• *${chave}*: ${valorCurto}`);
+  }
+  return linhas.join("\n");
+}
+
+function formatarLista(obras) {
+  return obras.map((o, i) => `${i + 1}) ${formatarObra(o)}`).join("\n\n");
+}
+
+// Quantas opcoes mostrar por vez quando ha varias obras parecidas.
+const PAGINA_ESCOLHA = 5;
+
+// Monta uma "pagina" da lista de opcoes, comecando de 'jaMostradas'. Mantem a
+// numeracao global (se ja mostrou 3, a proxima comeca no 4). Retorna o texto e
+// quantas opcoes ficam mostradas no total ate aqui.
+function montarPerguntaDeEscolha(lista, jaMostradas = 0, cabecalhoCustom = null) {
+  const fim = Math.min(jaMostradas + PAGINA_ESCOLHA, lista.length);
+  const slice = lista.slice(jaMostradas, fim);
+
+  const linhas = slice.map((o, k) => {
+    const i = jaMostradas + k; // indice global (0-based)
+    const status = campoStatus(o);
+    const emoji = emojiStatus(status);
+    const sufixo = status ? ` — ${status}` : "";
+    return `${i + 1}. ${emoji ? emoji + " " : ""}${campoNome(o)}${sufixo}`;
+  });
+
+  const restante = lista.length - fim;
+  const cabecalho =
+    jaMostradas > 0
+      ? `Mais ${slice.length} obra(s):`
+      : cabecalhoCustom
+      ? cabecalhoCustom // usa o cabecalho que veio de fora (evita duplicar)
+      : `Encontrei ${lista.length} obras relacionadas. Sobre qual você quer saber?`;
+
+  const rodape =
+    restante > 0
+      ? `\n\nResponda o número (ex.: "${jaMostradas + 1}") ou o nome. Digite ` +
+        `*MAIS* para ver as próximas ${Math.min(PAGINA_ESCOLHA, restante)} ou *TODAS* para a lista completa.`
+      : `\n\nÉ só responder o número para ver os detalhes de uma delas.`;
+
+  return { texto: cabecalho + "\n\n" + linhas.join("\n") + rodape, mostradas: fim };
+}
+
+// Detecta o pedido de ver TODAS as opcoes de uma vez ("todas", "lista todas").
+function ehVerTodas(msg) {
+  const t = (msg || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  return /\b(todas|todos|tudo|completa|completo|lista tudo|liste todas|me da todas|mostra todas)\b/.test(t);
+}
+
+// Detecta o pedido de "ver mais" opcoes durante a escolha.
+function ehVerMais(msg) {
+  return /^\s*(mais|ver mais|mais obras|mostra mais|proxim[oa]|próxim[oa]|continuar|continua|segue|\+)\s*[.!]*\s*$/i.test(
+    msg || ""
+  );
+}
+
+// Detecta se a mensagem atual e a ESCOLHA de uma das obras que o bot acabou
+// de listar. Retorna a obra escolhida, ou null se nao for uma escolha clara.
+// Cobre: "2", "a 2", "a segunda", "a de pavimentacao", "a primeira".
+function detectarEscolha(pergunta, obrasContexto) {
+  if (!obrasContexto || obrasContexto.length < 2) return null;
+
+  const bruto = (pergunta || "").toLowerCase().trim();
+
+  // RELEITURA DE SEGURANCA: antes de tratar um numero como "escolheu o item
+  // N", confere se a frase não está falando de VARIAS obras ao mesmo tempo
+  // (ex.: "essas 5 obras", "todas as 5", "as 5 de cima"). Nesses casos, a
+  // pessoa esta se referindo ao GRUPO INTEIRO, nao escolhendo uma so - isso
+  // evita o bug de "quero os engenheiros dessas 5 obras" virar "obra numero 5".
+  const falaDoGrupoTodo =
+    /\b(essas|dessas|todas|essas\s+\d|as\s+\d+\s+(obras|de cima)|cada\s+uma|cada\s+obra)\b/.test(
+      bruto
+    );
+  if (falaDoGrupoTodo) return null;
+
+  // 1) Numero: SO quando a mensagem inteira e (praticamente) so o numero -
+  // "2", "a 2", "opcao 3", "numero 1". Antes o regex pegava QUALQUER numero
+  // de 1-2 digitos em qualquer lugar da frase, entao "moro na rua 4" ou
+  // "prazo de 6 meses" eram lidos como "escolheu a obra 4/6" por engano.
+  // Ancorando no inicio/fim da mensagem, so uma resposta que E a escolha
+  // (sem mais nada de conteudo) casa aqui.
+  const mNum = bruto.match(
+    /^\s*(?:a\s+|op(?:c|ç)[aã]o\s+|op\s+|numero\s+|número\s+)?(\d{1,2})\s*[.!]*\s*$/
+  );
+  if (mNum) {
+    const idx = parseInt(mNum[1], 10) - 1;
+    if (idx >= 0 && idx < obrasContexto.length) return obrasContexto[idx];
+  }
+
+  // 2) Ordinais por extenso.
+  const ordinais = {
+    primeira: 0, primeiro: 0,
+    segunda: 1, segundo: 1,
+    terceira: 2, terceiro: 2,
+    quarta: 3, quarto: 3,
+    quinta: 4, quinto: 4,
+    ultima: obrasContexto.length - 1, ultimo: obrasContexto.length - 1,
+  };
+  for (const [palavra, idx] of Object.entries(ordinais)) {
+    if (new RegExp(`\\b${palavra}\\b`).test(bruto) && idx >= 0 && idx < obrasContexto.length) {
+      return obrasContexto[idx];
+    }
+  }
+
+  // 3) Trecho do nome: "a de pavimentacao", "a rua do jacare".
+  const semAcento = (s) =>
+    (s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const palavrasMsg = semAcento(bruto)
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 4);
+  if (palavrasMsg.length > 0) {
+    let melhor = null;
+    let melhorPontos = 0;
+    for (const obra of obrasContexto) {
+      const nome = semAcento(campoNome(obra));
+      const pontos = palavrasMsg.filter((w) => nome.includes(w)).length;
+      if (pontos > melhorPontos) {
+        melhorPontos = pontos;
+        melhor = obra;
+      }
+    }
+    if (melhorPontos > 0) return melhor;
+  }
+
+  return null;
+}
+
+// Detecta o comando de SAIR da obra em foco: "x", "sair", "voltar", "menu".
+// Verifica se a receita (DSL) tem conteudo util: pelo menos um filtro ou uma
+// agregacao que nao seja apenas "listar" sem campo (que e a listagem geral).
+function temReceitaUtil(receita) {
+  if (!receita || typeof receita !== "object") return false;
+  const temFiltro = Array.isArray(receita.filtros) && receita.filtros.length > 0;
+  const ag = receita.agregacao || {};
+  const tipoAg = (ag.tipo || "").toLowerCase();
+  const agUtil =
+    (tipoAg && tipoAg !== "listar") || // somar, media, contar, maior, menor
+    (tipoAg === "listar" && ag.campo); // listar um campo especifico
+  return temFiltro || agUtil;
+}
+
+// Calculo AVANCADO para perguntas que o DSL nao cobriu. Tenta, em ordem:
+//  1) o SANDBOX PROPRIO (IA gera codigo Python -> executa isolado no sandbox);
+//  2) o Code Execution do Gemini (sandbox do Google) como reserva.
+// Retorna um texto pronto, ou null se nada funcionou.
+async function tentarCalculoAvancado(pergunta, obras) {
+  // ORDEM: o DSL ja foi tentado antes de chamar esta funcao. Aqui:
+  //   1) Code Execution do Gemini (sandbox do Google, sem manutencao);
+  //   2) Sandbox proprio (Render) como ULTIMO recurso.
+
+  // 1) Code Execution do Gemini.
+  try {
+    const resp = await calcularComCodeExecution(pergunta, obras);
+    if (resp) {
+      console.log("DEBUG code_execution (Gemini): resultado obtido");
+      return resp;
+    }
+  } catch (e) {
+    console.error("Code Execution (Gemini) falhou:", e.message);
+  }
+
+  // 2) Sandbox proprio (ultimo recurso), se estiver configurado.
+  if (sandboxDisponivel() && obras.length > 0) {
+    try {
+      const colunas = Object.keys(obras[0]).filter((k) => k !== "_aba");
+      const codigo = await gerarCodigoPython(pergunta, colunas);
+      const resultado = await executarNoSandbox(codigo, obras);
+
+      if (resultado != null && resultado !== "NAO_TEM_DADO") {
+        console.log("DEBUG sandbox proprio: resultado obtido");
+        const fatos =
+          "Resultado ja calculado pelo sistema: " + JSON.stringify(resultado);
+        try {
+          return await redigirResposta(pergunta, [], "resumido", [], fatos);
+        } catch {
+          return `Resultado: ${JSON.stringify(resultado)}`;
+        }
+      }
+      console.log("DEBUG sandbox proprio: sem dado para a pergunta");
+    } catch (e) {
+      console.error("Sandbox proprio falhou:", e.message);
+    }
+  }
+
+  return null;
+}
+
+function ehSaidaFoco(msg) {
+  return /^\s*(x|sair|voltar|menu|inicio|in[ií]cio|outra|outras|outra obra)\s*[.!]*\s*$/i.test(
+    msg || ""
+  );
+}
+
+// Estando dentro de uma obra (modo foco), verifica se a mensagem aponta
+// claramente para OUTRA obra da base - ou seja, a pessoa quer trocar de obra
+// sem precisar digitar "X". So retorna true quando a busca acha uma obra que
+// NAO e a focada e o match e razoavelmente forte (>= 2 palavras uteis), para
+// nao confundir perguntas sobre a propria obra ("qual o valor?") com troca.
+function mensagemApontaOutraObra(pergunta, obraFocada, obras) {
+  const palavras = (pergunta || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 4);
+  // Precisa de conteudo suficiente para parecer o nome de uma obra.
+  if (palavras.length < 2) return false;
+
+  const achadas = buscarObras(pergunta, obras, 3);
+  if (achadas.length === 0) return false;
+
+  const nomeFocada = campoNome(obraFocada);
+  // Se a melhor obra encontrada e diferente da que esta em foco, e troca.
+  return campoNome(achadas[0]) !== nomeFocada;
+}
+
+function montarRespostaLocal(encontradas, detalhe) {
+  if (detalhe === "resumido" && encontradas.length > 1) {
+    return `Encontrei ${encontradas.length} obra(s):\n\n` + formatarListaResumida(encontradas);
+  }
+  if (encontradas.length === 1) {
+    return formatarObra(encontradas[0]);
+  }
+  return `Encontrei ${encontradas.length} obra(s):\n\n` + formatarLista(encontradas);
+}
+
+// MELHORIA 4: saudacao fixa (nao gasta Groq), com pequenas variacoes para
+// nao soar sempre identica.
+const SAUDACOES = [
+  "Olá! Eu sou o assistente de obras públicas da Prefeitura de Mamanguape. " +
+    "Pode perguntar sobre qualquer obra — por bairro, rua, tipo de obra ou nome.",
+  "Oi! Aqui é o assistente de obras públicas da Prefeitura de Mamanguape. " +
+    "Me diga o bairro, a rua ou o nome da obra que você quer acompanhar.",
+  "Olá, tudo bem? Sou o assistente de obras públicas da Prefeitura de Mamanguape. " +
+    "Posso informar situação, valor, prazo e empresa responsável das obras. É só perguntar.",
+];
+
+// Fechos para quando a pessoa AGRADECE ou se DESPEDE (nao é entrada).
+const DESPEDIDAS = [
+  "De nada! Precisando de mais alguma informação sobre as obras, é só chamar. 👍",
+  "Por nada! Estou por aqui sempre que quiser acompanhar as obras da cidade.",
+  "Imagina! Qualquer dúvida sobre as obras públicas, é só mandar mensagem.",
+];
+
+function saudacaoAleatoria() {
+  return SAUDACOES[Math.floor(Math.random() * SAUDACOES.length)];
+}
+
+function despedidaAleatoria() {
+  return DESPEDIDAS[Math.floor(Math.random() * DESPEDIDAS.length)];
+}
+
+// Detecta se a saudacao e, na verdade, um AGRADECIMENTO ou DESPEDIDA
+// ("obrigado", "valeu", "tchau", "ate mais") em vez de uma entrada ("oi").
+function ehDespedida(msg) {
+  const t = (msg || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+  // Radicais sem \b no fim, para casar "obrigado", "obrigada", "agradeço" etc.
+  return /(\bobrigad|\bobg\b|\bvlw\b|\bvaleu\b|agradec|\bgrato\b|\bgrata\b|\btchau|\bate mais\b|\bate logo\b|\bate breve\b|\bfalou\b|\bflw\b|nada mais|so isso|era so isso|encerrar)/.test(
+    t
+  );
+}
+
+// Frase de escalada, usada quando o bot nao consegue ajudar repetidamente.
+function textoEscalada() {
+  return CONTATO_SECRETARIA
+    ? `\n\nSe preferir falar com um atendente, procure a Secretaria de Obras: ${CONTATO_SECRETARIA}`
+    : "\n\nSe preferir, a Secretaria de Obras também pode te atender diretamente.";
+}
+
+// ------------------------------------------------------------
+//  Orquestracao principal
+//  Cada ramo apenas DEFINE o "texto" e o que guardar na memoria.
+//  O envio e o salvamento acontecem uma unica vez, no fim.
+// ------------------------------------------------------------
+async function processarWebhook(payload) {
+  const mensagens = (payload?.entry || []).flatMap((entry) =>
+    (entry?.changes || []).flatMap((change) => change?.value?.messages || [])
+  );
+
+  limparDeduplicacao();
+  for (const mensagem of mensagens) {
+    if (!mensagem || mensagem.type !== "text") continue;
+    const id = (mensagem.id || "").toString();
+    if (id && (mensagensProcessadas.has(id) || mensagensEmProcessamento.has(id))) {
+      console.log("Webhook duplicado ignorado:", id);
+      continue;
+    }
+
+    if (id) mensagensEmProcessamento.add(id);
+    try {
+      await processarMensagem(mensagem);
+      if (id) mensagensProcessadas.set(id, Date.now());
+    } catch (e) {
+      console.error("Erro ao processar mensagem do webhook:", e.message);
+    } finally {
+      if (id) mensagensEmProcessamento.delete(id);
+    }
+  }
+}
+
+async function processarMensagem(mensagem) {
+  if (!mensagem || mensagem.type !== "text") return;
+
+  const de = mensagem.from;
+  const pergunta = mensagem.text.body;
+  console.log("Mensagem recebida:", {
+    id: mensagem.id || null,
+    de: mascararTelefone(de),
+    caracteres: (pergunta || "").length,
+  });
+
+  // ============================================================
+  //  SISTEMA NOVO (agente SQL + banco). So e usado se a variavel
+  //  de ambiente USAR_AGENTE_SQL NAO estiver explicitamente "false".
+  //  Assim o banco e a fonte padrao; false ativa o retorno de emergencia.
+  //
+  //  Mantem a memoria de conversa (historico) para perguntas de
+  //  acompanhamento ("e o valor dessas?").
+  // ============================================================
+  if (USAR_AGENTE_SQL) {
+    const memoriaAg = lerMemoria(de);
+    const historicoAg = memoriaAg.historico || [];
+
+    let respostaAg;
+    let resultadoAg = null;
+    try {
+      resultadoAg = await responderPergunta(pergunta, historicoAg);
+      respostaAg = resultadoAg.resposta;
+    } catch (e) {
+      console.error("AGENTE SQL falhou:", e.message);
+      respostaAg = "Desculpe, tive um problema para responder agora. Pode tentar de novo?";
+    }
+
+    const novasMensagens = [
+      { role: "user", content: pergunta },
+      {
+        role: "assistant",
+        content: respostaAg,
+        sql: resultadoAg?.sql || null,
+        linhas: resultadoAg?.linhas ?? null,
+        estado: resultadoAg?.estado || null,
+      },
+    ];
+
+    salvarMemoria(de, {
+      ...memoriaAg,
+      historico: [...historicoAg, ...novasMensagens].slice(-MAX_HISTORICO),
+    });
+
+    // Nao persiste conversa no PostgreSQL. O contexto existe apenas em RAM
+    // por ate 30 minutos sem atividade.
+    await enviarTexto(de, respostaAg);
+    return; // nao executa o sistema antigo
+  }
+
+  const memoria = lerMemoria(de);
+  const { historico, obras: obrasContexto, termos: termosAnteriores } = memoria;
+
+  let texto = "";                        // resposta final que sera enviada
+  let obrasParaGuardar = obrasContexto;  // obras a manter no contexto
+  let termosParaGuardar = termosAnteriores;
+  let tipoParaGuardar = memoria.tipo;
+  let falhasParaGuardar = memoria.falhas;
+  let mostradasParaGuardar = memoria.mostradas;
+
+  try {
+    // Passo A: le a planilha (com cache).
+    const obras = await getObras();
+
+    const focadaAtual =
+      memoria.tipo === "obra_focada" && obrasContexto.length >= 1 ? obrasContexto[0] : null;
+
+    // Passo B: a IA interpreta a pergunta usando o historico da conversa.
+    // IMPORTANTE: isso roda SEMPRE, mesmo com uma obra em foco. Antes, essa
+    // chamada so acontecia fora do modo foco, e o bot ficava "preso"
+    // respondendo qualquer coisa como se fosse sobre a obra em pauta - por
+    // exemplo, se o cidadao perguntasse "quantas obras estao paralisadas?"
+    // enquanto via os detalhes de uma obra especifica, o bot tentava
+    // responder isso usando SO os dados daquela obra, e claro que nao
+    // encontrava a informacao. Rodando a interpretacao sempre, a IA consegue
+    // reconhecer quando o pedido e outra coisa (lista, conta, engenheiro,
+    // outra obra) e o sistema sai do foco automaticamente.
+    let interpretacao;
+    try {
+      interpretacao = await interpretarPergunta(pergunta, historico);
+    } catch (e) {
+      console.error("IA de interpretacao falhou, usando busca direta:", e.message);
+      interpretacao = {
+        tipo: "busca",
+        termos: [],
+        detalhe: "completo",
+        operacao: "",
+        filtro_status: "",
+        pista_valor: "",
+        receita: null,
+        usar_contexto: false,
+        falhou: true,
+      };
+    }
+
+    // LOG TEMPORARIO DE DEBUG - remover depois de confirmar que esta ok
+    console.log("DEBUG interpretacao:", JSON.stringify(interpretacao));
+
+    // Estamos no modo obra focada? Sim, EXCETO quando:
+    //  a) a pessoa escreve algo que bate claramente com OUTRA obra da base, ou
+    //  b) a propria IA classificou o pedido como algo que NAO e sobre a obra
+    //     atual: uma lista geral, uma conta/agregacao, obras de um
+    //     engenheiro, ou uma busca nova que ela mesma marcou como
+    //     "usar_contexto:false" (ou seja, nao e continuacao do assunto).
+    // Em qualquer um desses casos, saimos do foco e tratamos como pedido novo.
+    const pedidoForaDoFoco =
+      focadaAtual != null &&
+      (interpretacao.tipo === "agregacao" ||
+        interpretacao.tipo === "listagem" ||
+        interpretacao.tipo === "engenheiro" ||
+        (interpretacao.tipo === "busca" &&
+          interpretacao.usar_contexto === false &&
+          interpretacao.termos.length > 0));
+
+    const trocarDeObra =
+      focadaAtual &&
+      !ehSaidaFoco(pergunta) &&
+      (pedidoForaDoFoco || mensagemApontaOutraObra(pergunta, focadaAtual, obras));
+    const emFoco = !!focadaAtual && !trocarDeObra;
+
+    if (trocarDeObra) {
+      console.log(
+        pedidoForaDoFoco
+          ? "DEBUG saida automatica do foco: pedido claramente fora do escopo da obra"
+          : "DEBUG saida automatica do foco: a mensagem aponta outra obra"
+      );
+      // Zera o foco; o fluxo normal abaixo trata esta mensagem como pedido novo.
+      tipoParaGuardar = "";
+      termosParaGuardar = [];
+    }
+
+    if (obras.length === 0) {
+      texto =
+        "No momento não encontrei nenhuma obra cadastrada na base. Tente novamente mais tarde.";
+    }
+
+    // ------------------------------------------------------
+    //  MODO OBRA FOCADA: depois que a pessoa escolheu uma obra da lista,
+    //  ela fica "dentro" dessa obra. QUALQUER pergunta e respondida sobre
+    //  essa obra pela IA (linguagem livre, sem padrao fixo), ate a pessoa
+    //  enviar "X" para sair. Isso evita reabrir listas ou interpretar errado.
+    // ------------------------------------------------------
+    else if (emFoco) {
+      const obraFocada = obrasContexto[0];
+
+      // A pessoa quer sair explicitamente ("x", "sair", "menu").
+      if (ehSaidaFoco(pergunta)) {
+        console.log("DEBUG saindo do modo obra focada");
+        texto =
+          "Certo, saí dessa obra. 👍 Pode perguntar sobre qualquer outra — por bairro, " +
+          "rua, tipo de obra ou nome.";
+        tipoParaGuardar = "";
+        obrasParaGuardar = [];
+        termosParaGuardar = [];
+        falhasParaGuardar = 0;
+      }
+
+      // A pergunta e so uma saudacao/agradecimento/despedida (ex.: "obrigado",
+      // "tchau", "bom dia"): responde de forma fixa e cordial, sem gastar a
+      // IA de redacao (que so tem os dados desta obra e nao saberia o que
+      // fazer com um simples "obrigado"). Continua na mesma obra, caso a
+      // pessoa queira seguir perguntando.
+      else if (interpretacao.tipo === "saudacao") {
+        console.log("DEBUG saudacao/despedida dentro da obra focada");
+        texto = ehDespedida(pergunta) ? despedidaAleatoria() : saudacaoAleatoria();
+        obrasParaGuardar = [obraFocada];
+        tipoParaGuardar = "obra_focada";
+        falhasParaGuardar = 0;
+      }
+
+      else {
+        // Qualquer pergunta sobre a obra em foco: a IA responde livremente,
+        // usando so os dados dessa obra + o historico da conversa.
+        console.log("DEBUG pergunta dentro da obra focada:", campoNome(obraFocada));
+        obrasParaGuardar = [obraFocada];
+        tipoParaGuardar = "obra_focada";
+        falhasParaGuardar = 0;
+
+        // Se a pessoa apenas CONFIRMOU ("sim", "pode", "quero") logo apos o bot
+        // ter oferecido algo ("quer saber o prazo ou a empresa?"), damos uma
+        // dica para a IA RESPONDER o que foi oferecido, sem repetir a ficha.
+        const ehConfirmacaoCurta = /^\s*(sim|isso|pode|pode ser|claro|quero|queria|manda|mostra|aham|ok|blz|beleza|por favor|pf|quero sim|pode sim)\s*[.!]*\s*$/i.test(
+          pergunta || ""
+        );
+        let dica = "";
+        if (ehConfirmacaoCurta) {
+          dica =
+            "A pessoa respondeu 'sim' confirmando a oferta que voce fez na sua ultima " +
+            "mensagem. Responda AGORA o que voce ofereceu (por exemplo, o prazo e/ou a " +
+            "empresa responsavel), de forma direta e curta. NAO repita a ficha inteira da " +
+            "obra e NAO ofereca a mesma coisa de novo.";
+        }
+
+        try {
+          texto = await redigirResposta(pergunta, [obraFocada], "completo", historico, "", dica);
+        } catch (e) {
+          console.error("IA de redacao (obra focada) falhou, usando local:", e.message);
+          texto = formatarObra(obraFocada);
+        }
+        // Lembrete discreto de como sair (so de vez em quando, pra nao poluir).
+        if (Math.random() < 0.34) {
+          texto += "\n\n_(envie *X* para sair desta obra)_";
+        }
+      }
+    }
+
+    else {
+      // A interpretacao (Passo B) ja foi calculada mais acima - inclusive
+      // quando havia obra em foco, para decidir se saiamos dele. Aqui so
+      // usamos o resultado.
+      tipoParaGuardar = interpretacao.tipo;
+      if (interpretacao.termos.length > 0) termosParaGuardar = interpretacao.termos;
+
+      // ------------------------------------------------------
+      //  SELECAO DE OBRA: se na mensagem anterior o bot listou varias
+      //  opcoes e pediu para escolher, e agora a pessoa respondeu "2",
+      //  "a segunda" ou "a de pavimentacao", detalhamos SO aquela obra.
+      //  Se respondeu algo que NAO e uma escolha clara, repetimos a lista.
+      // ------------------------------------------------------
+      const aguardandoEscolha = memoria.tipo === "aguardando_escolha";
+      const escolha = aguardandoEscolha ? detectarEscolha(pergunta, obrasContexto) : null;
+      const pediuMais = aguardandoEscolha && !escolha && ehVerMais(pergunta);
+      const pediuTodas = aguardandoEscolha && !escolha && ehVerTodas(pergunta);
+
+      // Se, no meio da escolha, a pessoa faz uma PERGUNTA NOVA de verdade
+      // (frase com conteudo, ou com "?"), nao repetimos a lista - deixamos a
+      // pergunta seguir o fluxo normal (interpretacao/busca/agregacao).
+      const palavrasUteis = (pergunta || "")
+        .split(/\s+/)
+        .filter((w) => w.replace(/[^a-z\u00e0-\u00fc0-9]/gi, "").length >= 3).length;
+      const pareceNovaPergunta = /\?/.test(pergunta || "") || palavrasUteis >= 3;
+
+      // Mensagens curtas de confirmacao/continuacao ("sim", "isso", "pode",
+      // "aham", "quero", "manda") NAO sao busca nova - a pessoa esta seguindo
+      // com a obra que ja estava em pauta.
+      const ehConfirmacao = /^\s*(sim|isso|isso mesmo|pode|pode ser|claro|quero|queria|manda|mostra|aham|ok|blz|beleza|por favor|pf|s)\s*[.!]*\s*$/i.test(
+        pergunta || ""
+      );
+
+      if (pediuTodas && obrasContexto.length >= 2) {
+        // "TODAS": mostra a lista completa de uma vez (resumida e numerada).
+        console.log(`DEBUG listar todas: ${obrasContexto.length} obra(s)`);
+        const linhas = obrasContexto.map((o, i) => {
+          const st = campoStatus(o);
+          const em = emojiStatus(st);
+          return `${i + 1}. ${em ? em + " " : ""}${campoNome(o)}${st ? ` — ${st}` : ""}`;
+        });
+        texto =
+          `Aqui estão todas as ${obrasContexto.length} obra(s):\n\n` +
+          linhas.join("\n") +
+          `\n\nResponda o número para ver os detalhes de uma delas.`;
+        obrasParaGuardar = obrasContexto;
+        tipoParaGuardar = "aguardando_escolha";
+        mostradasParaGuardar = obrasContexto.length;
+      }
+
+      else if (pediuMais && memoria.mostradas < obrasContexto.length) {
+        // "MAIS": mostra a proxima pagina de opcoes, mantendo a numeracao.
+        console.log(
+          `DEBUG ver mais opcoes: ${memoria.mostradas}/${obrasContexto.length} ja mostradas`
+        );
+        const pagina = montarPerguntaDeEscolha(obrasContexto, memoria.mostradas);
+        texto = pagina.texto;
+        obrasParaGuardar = obrasContexto;
+        tipoParaGuardar = "aguardando_escolha";
+        mostradasParaGuardar = pagina.mostradas;
+      }
+
+      else if (aguardandoEscolha && !escolha && !pareceNovaPergunta && obrasContexto.length >= 2) {
+        // Estava esperando um numero e a pessoa respondeu algo vago e CURTO ->
+        // repete a mesma pagina de opcoes. (Perguntas novas de verdade seguem
+        // o fluxo normal em vez de ficarem presas aqui.)
+        console.log("DEBUG resposta vaga durante escolha - repetindo a pagina");
+        const jaMostradas = Math.max(0, memoria.mostradas - PAGINA_ESCOLHA);
+        const pagina = montarPerguntaDeEscolha(obrasContexto, jaMostradas);
+        texto = "Só pra confirmar qual das obras. " + pagina.texto;
+        obrasParaGuardar = obrasContexto;
+        tipoParaGuardar = "aguardando_escolha";
+        mostradasParaGuardar = memoria.mostradas;
+      }
+
+      else if (escolha) {
+        console.log("DEBUG selecao de obra pelo contexto:", campoNome(escolha));
+        obrasParaGuardar = [escolha];
+        tipoParaGuardar = "obra_focada"; // entra no modo obra focada
+        falhasParaGuardar = 0;
+        try {
+          texto = await redigirResposta(pergunta, [escolha], "completo", historico);
+        } catch (e) {
+          console.error("IA de redacao (selecao) falhou, usando local:", e.message);
+          texto = formatarObra(escolha);
+        }
+        texto +=
+          "\n\n_Você está vendo esta obra. Pergunte o que quiser sobre ela; " +
+          "envie *X* para ver outras._";
+      }
+
+      // Confirmacao curta ("sim") logo apos detalhar UMA obra: segue NAQUELA
+      // obra (mostra o que foi oferecido: prazo, empresa...), sem reabrir lista.
+      else if (ehConfirmacao && !aguardandoEscolha && obrasContexto.length >= 1) {
+        const obraAtual = obrasContexto[0];
+        console.log("DEBUG confirmacao - seguindo na obra atual:", campoNome(obraAtual));
+        obrasParaGuardar = [obraAtual];
+        tipoParaGuardar = "busca";
+        falhasParaGuardar = 0;
+        try {
+          texto = await redigirResposta(pergunta, [obraAtual], "completo", historico);
+        } catch (e) {
+          console.error("IA de redacao (confirmacao) falhou, usando local:", e.message);
+          texto = formatarObra(obraAtual);
+        }
+      }
+
+      // ------------------------------------------------------
+      //  Passo C: SAUDACAO - resposta fixa do sistema (sem Groq).
+      // ------------------------------------------------------
+      else if (interpretacao.tipo === "saudacao") {
+        // Distingue despedida/agradecimento ("obrigado", "tchau") de entrada
+        // ("oi", "bom dia"): cada um recebe um fecho adequado.
+        texto = ehDespedida(pergunta) ? despedidaAleatoria() : saudacaoAleatoria();
+        falhasParaGuardar = 0;
+      }
+
+      // ------------------------------------------------------
+      //  RECEITA (DSL): se a IA montou uma receita valida, o sistema a executa
+      //  AQUI, independente do "tipo" que ela classificou. Isso conserta o caso
+      //  em que a IA gera a receita certa mas rotula o tipo como "busca".
+      // ------------------------------------------------------
+      else if (interpretacao.receita && temReceitaUtil(interpretacao.receita)) {
+        console.log("DEBUG executando receita DSL (rapido, exato)");
+
+        // ACOMPANHAMENTO: a IA ja decide isso lendo o historico (campo
+        // "usar_contexto"), o que e mais confiavel do que uma lista fixa de
+        // palavras. O regex de pronomes so entra como rede de seguranca, caso
+        // a IA nao tenha marcado o campo (ou tenha falhado a interpretacao).
+        const refereAnteriorRegex = /\b(essas|dessas|delas|desses|deles|as de cima|as que voce|as listadas|acima|cada uma|cada um)\b/i.test(
+          pergunta || ""
+        );
+        const refereAnterior = interpretacao.usar_contexto === true || refereAnteriorRegex;
+        const baseCalc =
+          refereAnterior && obrasContexto.length > 1 ? obrasContexto : obras;
+        if (baseCalc !== obras) {
+          console.log(`DEBUG acompanhamento: aplicando sobre ${baseCalc.length} obras do contexto`);
+        }
+
+        // ORDEM CERTA: o DSL primeiro - resolve a maioria (soma, contagem,
+        // media, filtros) na hora, de graca e exato. O sandbox so entra se o
+        // DSL nao conseguir E estiver ativado (SANDBOX_URL) - ex.: "segunda
+        // maior", "top 3". Assim perguntas simples nao esperam o sandbox.
+        let resultado = executarReceita(interpretacao.receita, baseCalc);
+
+        if (!resultado) {
+          // DSL nao resolveu: SO agora tentamos o calculo avancado, se ativo.
+          let avancado = null;
+          avancado = await tentarCalculoAvancado(pergunta, baseCalc);
+          if (avancado) {
+            texto = avancado;
+            falhasParaGuardar = 0;
+          } else {
+            texto =
+              "Não consegui montar esse cálculo com os dados da base. Pode tentar " +
+              "reformular, ou perguntar por bairro, status, empresa ou tipo de obra.";
+            falhasParaGuardar = memoria.falhas + 1;
+          }
+        } else if (resultado.listaCampo && resultado.listaCampo.length > 0) {
+            const BLOCO = 20;
+            const primeiras = resultado.listaCampo.slice(0, BLOCO);
+            const resto = resultado.listaCampo.length - primeiras.length;
+            texto = `${resultado.fatos}\n\n` + primeiras.join("\n");
+            if (resto > 0) {
+              texto += `\n\n...e mais ${resto}. Refine por bairro, status ou tipo para ver menos de cada vez.`;
+            }
+            obrasParaGuardar = resultado.obras.slice(0, 10);
+            falhasParaGuardar = 0;
+          } else if (resultado.obras && resultado.obras.length > 1) {
+            obrasParaGuardar = resultado.obras;
+            tipoParaGuardar = "aguardando_escolha";
+            falhasParaGuardar = 0;
+            // Cabecalho unico: usa o fato do filtro (ex.: "Encontrei 5 obras com
+            // esse criterio.") em vez de duplicar com "obras relacionadas".
+            const cab = `${resultado.fatos} Veja a lista:`;
+            const pagina = montarPerguntaDeEscolha(resultado.obras, 0, cab);
+            mostradasParaGuardar = pagina.mostradas;
+            texto = pagina.texto;
+          } else {
+            obrasParaGuardar = resultado.obras || [];
+            falhasParaGuardar = 0;
+            try {
+              texto = await redigirResposta(
+                pergunta, resultado.obras || [], "resumido", historico, resultado.fatos
+              );
+            } catch (e) {
+              texto = resultado.fatos;
+            }
+          }
+      }
+
+      // ------------------------------------------------------
+      //  Passo D0: OBRAS DE UM ENGENHEIRO
+      //  Busca o nome SO na coluna de engenheiro. Lista paginavel.
+      // ------------------------------------------------------
+      else if (interpretacao.tipo === "engenheiro") {
+        const nomeEng = interpretacao.termos.join(" ").trim();
+        const doEng = buscarPorEngenheiro(nomeEng, obras, 30);
+        console.log(`DEBUG busca por engenheiro "${nomeEng}": ${doEng.length} obra(s)`);
+
+        if (doEng.length === 0) {
+          falhasParaGuardar = memoria.falhas + 1;
+          logPerguntaSemResultado(pergunta, interpretacao.termos, "engenheiro_sem_obras");
+          texto =
+            `Não encontrei obras com um engenheiro chamado "${nomeEng}". ` +
+            `Confira o nome, ou pergunte por bairro, tipo de obra ou nome da obra.`;
+        } else if (doEng.length === 1) {
+          obrasParaGuardar = doEng;
+          tipoParaGuardar = "obra_focada";
+          falhasParaGuardar = 0;
+          try {
+            texto = await redigirResposta(pergunta, doEng, "completo", historico);
+          } catch (e) {
+            texto = formatarObra(doEng[0]);
+          }
+          texto += "\n\n_Você está vendo esta obra. Pergunte o que quiser; envie *X* para ver outras._";
+        } else {
+          obrasParaGuardar = doEng;
+          tipoParaGuardar = "aguardando_escolha";
+          falhasParaGuardar = 0;
+          const pagina = montarPerguntaDeEscolha(doEng, 0);
+          mostradasParaGuardar = pagina.mostradas;
+          texto = `Encontrei ${doEng.length} obra(s) do engenheiro ${nomeEng}:\n\n${pagina.texto}`;
+        }
+      }
+
+      // ------------------------------------------------------
+      //  Passo D: AGREGACAO (MELHORIA 2)
+      //  O SISTEMA faz a conta em JavaScript; a IA so redige o
+      //  resultado ja calculado, sem refazer nenhum calculo.
+      // ------------------------------------------------------
+      else if (interpretacao.tipo === "agregacao") {
+        // Se a pergunta tem recorte (ex.: "mais cara do Centro"), filtra antes.
+        let base = obras;
+
+        // CONTEXTO: se a pessoa disse "dessas/nessas" (usar_contexto:true) e a
+        // gente mostrou uma lista antes, a conta deve incidir SO nessas obras -
+        // nao na base inteira. Sem isso, "valor dessas" somava as 66 (bug).
+        const refereAnteriorRegex = /\b(essas|dessas|nessas|delas|desses|nesses|deles|as de cima|as que voce|as listadas|acima|cada uma|cada um)\b/i.test(
+          pergunta || ""
+        );
+        const usarContexto =
+          (interpretacao.usar_contexto === true || refereAnteriorRegex) &&
+          Array.isArray(obrasContexto) && obrasContexto.length > 1;
+        if (usarContexto) {
+          base = obrasContexto;
+          console.log(`DEBUG agregacao usando contexto: ${base.length} obra(s)`);
+        } else if (interpretacao.termos.length > 0) {
+          const filtradas = buscarObrasPorTermos(interpretacao.termos, obras, obras.length);
+          if (filtradas.length > 0) base = filtradas;
+        }
+
+        // Se a IA montou uma RECEITA (DSL generico), o sistema a executa sobre a
+        // planilha inteira (a receita ja carrega seus proprios filtros). Senao,
+        // usa as operacoes fixas de sempre.
+        let resultado;
+        if (interpretacao.receita) {
+          resultado = executarReceita(interpretacao.receita, obras);
+          console.log(
+            `DEBUG receita DSL: ${resultado ? resultado.obras.length + " obra(s)" : "nao calculado"}`
+          );
+          // Se a receita nao deu certo, tenta as operacoes fixas como reserva.
+          if (!resultado && interpretacao.operacao) {
+            resultado = executarAgregacao(interpretacao.operacao, base, {
+              filtro_status: interpretacao.filtro_status,
+              pista_valor: interpretacao.pista_valor || "",
+            });
+          }
+        } else {
+          resultado = executarAgregacao(interpretacao.operacao, base, {
+            filtro_status: interpretacao.filtro_status,
+            pista_valor: interpretacao.pista_valor || "",
+          });
+        }
+
+        console.log(
+          `DEBUG agregacao: operacao=${interpretacao.operacao} base=${base.length} ` +
+            `resultado=${resultado ? "ok" : "nao calculado"}`
+        );
+
+        if (!resultado) {
+          // PLANO B: o DSL nao deu conta. Tenta o calculo avancado
+          // (sandbox proprio -> Code Execution do Gemini) sobre as obras da base.
+          const avancado = await tentarCalculoAvancado(pergunta, base);
+
+          if (avancado) {
+            texto = avancado;
+            obrasParaGuardar = base.slice(0, 10);
+            falhasParaGuardar = 0;
+          } else {
+            logPerguntaSemResultado(pergunta, interpretacao.termos, "agregacao_sem_dados");
+            texto =
+              "Não consegui fazer esse cálculo porque a base não tem esse dado preenchido " +
+              "para as obras. Posso te informar a situação, o valor ou o prazo de uma obra " +
+              "específica — é só dizer o bairro ou o nome.";
+            falhasParaGuardar = memoria.falhas + 1;
+          }
+        } else if (resultado.listaCampo && resultado.listaCampo.length > 0) {
+          const BLOCO = 20;
+          const primeiras = resultado.listaCampo.slice(0, BLOCO);
+          const resto = resultado.listaCampo.length - primeiras.length;
+          texto = `${resultado.fatos}\n\n` + primeiras.join("\n");
+          if (resto > 0) {
+            texto += `\n\n_...e mais ${resto}. Se quiser, refine por bairro, status ou tipo._`;
+          }
+          obrasParaGuardar = resultado.obras.slice(0, 10);
+          falhasParaGuardar = 0;
+        } else if (resultado.listaCompleta && resultado.obras.length > 0) {
+          const ehSomaOuMedia = /^(o valor total|a média)/i.test(resultado.fatos || "");
+
+          if (ehSomaOuMedia) {
+            // Soma/media: o SISTEMA ja calculou o valor exato (em resultado.fatos).
+            // A IA agora REDIGE esse resultado de forma natural, humana - em vez
+            // do texto fixo de sistema que soava robotico. O numero vem do
+            // calculo (exato), so a forma de dizer e da IA. Passamos as obras
+            // consideradas para a IA poder cita-las se fizer sentido.
+            obrasParaGuardar = resultado.obras.slice(0, 10);
+            falhasParaGuardar = 0;
+            try {
+              texto = await redigirResposta(
+                pergunta,
+                resultado.obras,
+                interpretacao.detalhe,
+                historico,
+                resultado.fatos // valor JA calculado - a IA nao refaz a conta
+              );
+            } catch (e) {
+              // Se a IA falhar, cai no texto do sistema (melhor que nada).
+              console.error("IA de redacao (soma) falhou, usando local:", e.message);
+              const BLOCO = 15;
+              const nomes = resultado.obras.slice(0, BLOCO).map((o) => `• ${campoNome(o)}`);
+              const resto = resultado.obras.length - nomes.length;
+              texto = `${resultado.fatos}\n\nObras consideradas:\n${nomes.join("\n")}`;
+              if (resto > 0) texto += `\n_...e mais ${resto}._`;
+            }
+          } else {
+            // Contagem por status com a lista COMPLETA em maos. Guardamos todas as
+            // obras como opcoes paginaveis: o cidadao pode ver todas (MAIS),
+            // escolher um numero, ou pedir uma obra especifica.
+            obrasParaGuardar = resultado.obras;
+            tipoParaGuardar = "aguardando_escolha";
+            falhasParaGuardar = 0;
+
+            const cab = `${resultado.fatos} Veja a lista:`;
+            const pagina = montarPerguntaDeEscolha(resultado.obras, 0, cab);
+            mostradasParaGuardar = pagina.mostradas;
+            texto = pagina.texto;
+          }
+        } else {
+          // Agregacao normal (obra mais cara, soma, contagem geral): a IA redige
+          // o resultado JA calculado pelo sistema, sem refazer conta.
+          obrasParaGuardar = resultado.obras;
+          falhasParaGuardar = 0;
+          try {
+            texto = await redigirResposta(
+              pergunta,
+              resultado.obras,
+              interpretacao.detalhe,
+              historico,
+              resultado.fatos // fatos JA calculados pelo sistema
+            );
+          } catch (e) {
+            console.error("IA de redacao (agregacao) falhou, usando local:", e.message);
+            texto =
+              resultado.fatos +
+              (resultado.obras.length > 0
+                ? `\n\n${formatarListaResumida(resultado.obras)}`
+                : "");
+          }
+        }
+      }
+
+      // ------------------------------------------------------
+      //  Passo E: LISTAGEM geral
+      //  O SISTEMA monta a lista (formatacao deterministica, sem IA - evita
+      //  repeticao/eco do modelo) e ela e PAGINAVEL: MAIS mostra as proximas,
+      //  o numero escolhe uma obra para ver os detalhes.
+      // ------------------------------------------------------
+      else if (interpretacao.tipo === "listagem") {
+        obrasParaGuardar = obras;
+        tipoParaGuardar = "aguardando_escolha";
+        falhasParaGuardar = 0;
+
+        const pagina = montarPerguntaDeEscolha(obras, 0);
+        mostradasParaGuardar = pagina.mostradas;
+        texto = `Temos ${obras.length} obra(s) cadastrada(s).\n\n${pagina.texto}`;
+      }
+
+      // ------------------------------------------------------
+      //  Passo F: BUSCA especifica
+      // ------------------------------------------------------
+      else {
+        // ACOMPANHAMENTO: se a pergunta claramente se refere ao grupo de obras
+        // que ja estava na tela ("usar_contexto" da IA, ou palavras como
+        // "dessas", "cada uma"), usamos ESSAS obras direto - sem rodar busca
+        // por palavra-chave, que pode "achar" obras aleatorias da base inteira
+        // so porque uma palavra generica (ex.: "status") bate em varias linhas.
+        const refereAnteriorBusca =
+          interpretacao.usar_contexto === true ||
+          /\b(essas|dessas|delas|desses|deles|as de cima|as que voce|as listadas|acima|cada uma|cada um)\b/i.test(
+            pergunta || ""
+          );
+
+        // Busca TODAS as candidatas relevantes (nao so 3), para poder paginar
+        // com "MAIS". O filtro de relevancia do search.js ja faz o nome exato
+        // vencer sozinho; aqui so ampliamos o teto para casos com muitas obras.
+        const TETO_CANDIDATAS = 30;
+
+        let encontradas;
+        if (refereAnteriorBusca && obrasContexto.length > 0) {
+          console.log(`DEBUG acompanhamento (busca): usando ${obrasContexto.length} obra(s) do contexto`);
+          encontradas = obrasContexto;
+        } else {
+          encontradas = buscarObrasPorTermos(interpretacao.termos, obras, TETO_CANDIDATAS);
+          console.log(`DEBUG busca por termos da IA: ${encontradas.length} resultado(s)`);
+
+          if (encontradas.length === 0) {
+            encontradas = buscarObras(pergunta, obras, TETO_CANDIDATAS);
+            console.log(`DEBUG busca direta pelo texto: ${encontradas.length} resultado(s)`);
+          }
+        }
+
+        // MELHORIA 5: refinamento - combina os termos anteriores com os novos.
+        if (encontradas.length === 0 && termosAnteriores.length > 0) {
+          const combinados = [...new Set([...termosAnteriores, ...interpretacao.termos])];
+          encontradas = buscarObrasPorTermos(combinados, obras, TETO_CANDIDATAS);
+          console.log(
+            `DEBUG busca combinada com termos anteriores [${combinados.join(", ")}]: ` +
+              `${encontradas.length} resultado(s)`
+          );
+          if (encontradas.length > 0) termosParaGuardar = combinados;
+        }
+
+        // Ultimo recurso: reusa a obra que ja estava em pauta (acompanhamento).
+        if (encontradas.length === 0 && obrasContexto.length > 0) {
+          console.log("DEBUG reusando obra(s) do contexto da conversa");
+          encontradas = obrasContexto;
+        }
+
+        if (encontradas.length === 0) {
+          // MELHORIA 3: em vez de despejar a listagem geral, o bot pede a
+          // pista que falta. Listagem geral so quando o pedido FOI de listagem.
+          falhasParaGuardar = memoria.falhas + 1;
+          // So tratamos como pergunta vaga quando a IA REALMENTE entendeu e nao
+          // achou pista. Se a IA falhou (erro na API), a pergunta pode ter sido
+          // clara - nesse caso nao devolvemos "nao entendi", que soa errado.
+          const semPista = interpretacao.termos.length === 0 && !interpretacao.falhou;
+
+          logPerguntaSemResultado(
+            pergunta,
+            interpretacao.termos,
+            interpretacao.falhou
+              ? "ia_indisponivel"
+              : semPista
+              ? "pergunta_ambigua"
+              : "termos_sem_correspondencia"
+          );
+
+          if (semPista) {
+            texto =
+              "Não entendi bem qual obra você quer saber. Pode me dizer o bairro, a rua " +
+              "ou o nome da obra?";
+          } else if (interpretacao.falhou) {
+            texto =
+              `Não encontrei nenhuma obra com esses termos. Temos ${obras.length} obra(s) ` +
+              `cadastradas — tente pelo bairro, pela rua, pelo tipo (pavimentação, escola, ` +
+              `UBS, praça) ou pela situação (em andamento, concluída, paralisada).`;
+          } else {
+            texto =
+              `Não encontrei nenhuma obra relacionada a "${interpretacao.termos.join(", ")}" ` +
+              `na base. Temos ${obras.length} obra(s) cadastradas — tente pelo bairro, pela ` +
+              `rua ou pelo tipo de obra (pavimentação, escola, UBS, praça).`;
+          }
+
+          // Se a pessoa ja tentou algumas vezes sem sucesso, oferece o caminho humano.
+          if (falhasParaGuardar >= 2) {
+            texto += textoEscalada();
+            falhasParaGuardar = 0;
+          }
+        } else if (encontradas.length === 1) {
+          // Uma unica obra: detalha direto.
+          obrasParaGuardar = encontradas;
+          falhasParaGuardar = 0;
+          try {
+            texto = await redigirResposta(pergunta, encontradas, interpretacao.detalhe, historico);
+          } catch (e) {
+            console.error("IA de redacao falhou, usando formatador local:", e.message);
+            texto = montarRespostaLocal(encontradas, interpretacao.detalhe);
+          }
+        } else {
+          // Varias obras casaram: mostra a PRIMEIRA pagina de opcoes e guarda a
+          // lista completa. "MAIS" mostra as proximas; o numero escolhe a obra.
+          obrasParaGuardar = encontradas;
+          tipoParaGuardar = "aguardando_escolha";
+          falhasParaGuardar = 0;
+          const pagina = montarPerguntaDeEscolha(encontradas, 0);
+          texto = pagina.texto;
+          mostradasParaGuardar = pagina.mostradas;
+        }
+      }
+    }
+  } catch (e) {
+    console.error("Falha no processamento:", e);
+    texto =
+      "Tivemos um problema momentâneo ao consultar as obras. Tente novamente em instantes.";
+  }
+
+  if (!texto) return; // seguranca: nada a enviar
+
+  // Atualiza a memoria: historico da conversa + recorte atual (obras e termos).
+  const novoHistorico = [
+    ...historico,
+    { role: "user", content: pergunta },
+    { role: "assistant", content: texto },
+  ];
+  salvarMemoria(de, {
+    historico: novoHistorico,
+    obras: obrasParaGuardar,
+    termos: termosParaGuardar,
+    tipo: tipoParaGuardar,
+    falhas: falhasParaGuardar,
+    mostradas: mostradasParaGuardar,
+  });
+
+  await enviarTexto(de, texto);
+}
+
+app.listen(PORT, () => {
+  console.log(`Servidor rodando na porta ${PORT}`);
+});

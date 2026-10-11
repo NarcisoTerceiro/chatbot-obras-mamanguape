@@ -279,7 +279,7 @@ app.get("/testar-agente", async (req, res) => {
   const historicoTeste = memoriaTeste.historico || [];
 
   try {
-    const r = await responderPergunta(pergunta, historicoTeste);
+    const r = await responderPergunta(pergunta, historicoTeste, { conversationId: chaveTeste });
     const novasMensagens = [
       { role: "user", content: pergunta },
       {
@@ -748,7 +748,7 @@ async function processarMensagem(mensagem) {
     let respostaAg;
     let resultadoAg = null;
     try {
-      resultadoAg = await responderPergunta(pergunta, historicoAg);
+      resultadoAg = await responderPergunta(pergunta, historicoAg, { conversationId: de });
       respostaAg = resultadoAg.resposta;
     } catch (e) {
       console.error("AGENTE SQL falhou:", e.message);
