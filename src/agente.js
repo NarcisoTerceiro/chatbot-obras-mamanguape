@@ -68,6 +68,7 @@ export function prepararDados(dados) {
       status: texto(campo(row, 'status').valor), engenheiro: texto(campo(row, 'engenheiro').valor),
       empresa: texto(campo(row, 'empresa').valor), valor_total_centavos: cents?.toString() ?? null,
       valor_total_formatado: cents === null ? null : moeda(cents),
+      avisos_fonte:Array.isArray(row._avisos)?row._avisos:[],
       dados_originais: Object.fromEntries(Object.entries(row).filter(([k]) => !k.startsWith('_'))) };
   });
 }
@@ -142,6 +143,7 @@ OBJETO DA OBRA descreve a obra; RUA identifica a pavimentação. Recurso pode es
 STATUS e SITUAÇÃO descrevem situação; ENGENHEIRO, ENGENHEIRO RESPONSÁVEL e ENGENHEIRO/ARQUITETO RESPONSÁVEL identificam o responsável.
 VALOR TOTAL DA OBRA, VALOR EXECUTADO e VALOR (R$) são informações diferentes; executado não significa concluído.
 Esses nomes são orientação do domínio, não garantia de existência. A estrutura vigente informa exatamente as abas/colunas lidas; use apenas os nomes de consulta disponíveis. Não invente CATEGORIA ou classificação de saúde/educação.
+Nomes de abas por extenso podem variar (ex.: SITUAÇÃO DAS OBRAS EM FASE DE PROJETOS). Use os nomes vigentes no catálogo. Colunas repetidas ganham sufixo [coluna X]; esse sufixo identifica a posição física, não o significado. Investigue antes de escolher uma coluna ambígua; peça esclarecimento quando não houver evidência.
 `;
 const PLANEJAR=`Use o mapa de abas e colunas já fornecido para escolher onde buscar. Quando o pedido e os valores do filtro forem claros, chame consultarPlanilha diretamente.
 Use inspecionarPlanilha quando precisar conhecer valores, resolver ambiguidade ou interpretar uma categoria como saúde/educação; depois escolha os filtros e chame consultarPlanilha para buscar ou calcular.

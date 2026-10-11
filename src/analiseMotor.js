@@ -84,7 +84,8 @@ function build(data,override){
   const config={...BASE,...override,columns:{...BASE.columns,...override.columns}};
   const warnings=new Set();
   let records=data.map(record=>{
-    const r=Object.fromEntries(Object.entries(record).filter(([k])=>!['dados_originais','valor_total_centavos','valor_total_formatado','valor_executado_centavos'].includes(k)));
+    for(const warning of record.avisos_fonte||[])warnings.add(String(warning));
+    const r=Object.fromEntries(Object.entries(record).filter(([k])=>!['avisos_fonte','dados_originais','valor_total_centavos','valor_total_formatado','valor_executado_centavos'].includes(k)));
     for(const [c,v] of Object.entries(record.dados_originais||{})){
       const name='original:'+c;r[name]=v;
       if(typeof v==='number'&&!Object.hasOwn(config.columns,name))config.columns[name]={type:'number'};

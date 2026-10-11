@@ -3,9 +3,11 @@ const normaliza=s=>String(s??'').normalize('NFD').replace(/[\u0300-\u036f]/g,'')
 const filled=v=>v!==null&&v!==undefined&&(typeof v!=='string'||v.trim()!=='');
 const words=['objeto','obra','rua','situacao','status','contrato','empresa','recurso','engenheiro','arquiteto','valor','bairro','endereco','fonte','convenio','proposta','data','prazo','aditivo','logradouro'];
 function headerScore(row){
+ const seen=new Set();
  return (row||[]).reduce((score,cell)=>{
   if(typeof cell!=='string')return score;
-  const label=normaliza(cell);if(label.length>90)return score;
+  const label=normaliza(cell);if(label.length>90||seen.has(label))return score;
+  seen.add(label);
   return score+Number(words.some(word=>new RegExp(`\\b${word}\\b`).test(label)));
  },0);
 }
@@ -27,27 +29,37 @@ export function acharLinhaCabecalho(rows,maxLinhasAnalisadas=15){
 export function rowsToObjects(rows,tabName){
  const idx=acharLinhaCabecalho(rows);
  if(idx<0)return {obras:[],cabecalho:[],ignoradas:0};
- const header=(rows[idx]||[]).map(h=>String(h??'').trim());
+ const original=(rows[idx]||[]).map(h=>String(h??'').trim());
+ const counts=new Map();for(const name of original.filter(Boolean))counts.set(name,(counts.get(name)||0)+1);
+ const letter=index=>{let out='';for(let n=index+1;n>0;n=Math.floor((n-1)/26))out=String.fromCharCode(65+(n-1)%26)+out;return out;};
+ const used=new Set(original.filter(Boolean));const avisos=[];
+ const header=original.map((name,j)=>{
+  if(!name)return '';
+  if(counts.get(name)===1&&!['_aba','_linha','_avisos'].includes(name))return name;
+  const base=`${name} [coluna ${letter(j)}]`;let key=base,n=2;
+  while(used.has(key))key=`${base} (${n++})`;
+  used.add(key);avisos.push(`Aba ${tabName}: cabeçalho ${name} na coluna ${letter(j)} identificado como ${key}; confira o significado antes de usar.`);
+  return key;
+ });
  const names=header.filter(Boolean);
- if(new Set(names).size!==names.length)throw Error(`Aba ${tabName}: cabeçalhos duplicados. Corrija a fonte antes de consultar.`);
- if(names.some(n=>['_aba','_linha'].includes(n)))throw Error(`Aba ${tabName}: cabeçalho reservado.`);
  const obras=[];let ignoradas=0;
  for(let i=idx+1;i<rows.length;i++){
   const row=rows[i]||[];
   if(!row.some(filled)){ignoradas++;continue;}
-  const obj={_aba:tabName,_linha:i+1};let count=0;
+  const obj={_aba:tabName,_linha:i+1,...(avisos.length?{_avisos:avisos}:{})};let count=0;
   header.forEach((name,j)=>{
    if(!name||!filled(row[j]))return;
    const value=typeof row[j]==='string'?row[j].trim():row[j];
-   obj[name]=value;count++;
+   // Propriedade de dados, inclusive para um cabeçalho chamado __proto__.
+   Object.defineProperty(obj,name,{value,writable:true,enumerable:true,configurable:true});count++;
   });
   if(!count){ignoradas++;continue;}
   // Repeated headers inside the same tab are not records.
-  const repeat=names.length>1&&header.every((name,j)=>!name||normaliza(row[j])===normaliza(name));
+  const repeat=names.length>1&&original.every((name,j)=>!name||normaliza(row[j])===normaliza(name));
   if(repeat){ignoradas++;continue;}
   obras.push(obj);
  }
- return {obras,cabecalho:names,ignoradas};
+ return {obras,cabecalho:names,ignoradas,avisos};
 }
 const split=s=>String(s||'').split(',').map(t=>t.trim()).filter(Boolean);
 const duration=(s,fallback)=>{const n=Number(s);return Number.isFinite(n)&&n>=0&&s!==undefined&&s!==''?n:fallback;};
@@ -103,8 +115,8 @@ export function criarLeitorSheets({api,env=process.env,now=()=>Date.now(),logger
    }
    const all=[];const report=[];
    values.forEach((vr,i)=>{
-    const {obras,cabecalho,ignoradas}=rowsToObjects(vr.values||[],tabs[i]);all.push(...obras);
-    report.push({aba:tabs[i],linhas_lidas:(vr.values||[]).length,obras:obras.length,linhas_ignoradas:ignoradas,cabecalho});
+    const {obras,cabecalho,ignoradas,avisos=[]}=rowsToObjects(vr.values||[],tabs[i]);all.push(...obras);
+    report.push({aba:tabs[i],linhas_lidas:(vr.values||[]).length,obras:obras.length,linhas_ignoradas:ignoradas,cabecalho,avisos});
    });
    if(generation!==currentGeneration)throw Error('Leitura invalidada por uma atualização. Tente novamente.');
    cache={data:all,time:now()};revision++;
