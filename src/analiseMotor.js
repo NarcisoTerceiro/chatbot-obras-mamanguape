@@ -4,6 +4,12 @@ import {randomUUID} from 'node:crypto';
 
 const Decimal=DecimalBase.clone({precision:40,rounding:DecimalBase.ROUND_HALF_UP});
 export const schemaPlano=JSON.parse(readFileSync(new URL('./analise-plan.schema.json',import.meta.url),'utf8'));
+export const schemaInspecao={type:'object',additionalProperties:false,properties:{
+  columns:{type:'array',items:{type:'string'},minItems:1,maxItems:6},
+  filters:schemaPlano.properties.filters,any_filters:schemaPlano.properties.any_filters,
+  limit:{type:'integer',minimum:1,maximum:50,default:30},
+  offset:{type:'integer',minimum:0,maximum:1000000,default:0}
+},required:['columns']};
 const norm=v=>String(v).normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ').trim().toLowerCase();
 const empty=v=>v==null||(typeof v==='string'&&!v.trim());
 const numericTypes=new Set(['money','number','percent']);
@@ -25,6 +31,7 @@ function validate(value,schema,path='plano') {
   if(schema.minimum!=null&&value<schema.minimum||schema.maximum!=null&&value>schema.maximum)
     throw Error(`${path}: valor fora dos limites.`);
   if(kind==='array'){
+    if(schema.minItems!=null&&value.length<schema.minItems)throw Error(`${path}: lista vazia ou pequena demais.`);
     if(schema.maxItems!=null&&value.length>schema.maxItems)throw Error(`${path}: lista muito grande.`);
     value.forEach((v,i)=>validate(v,schema.items,`${path}[${i}]`));
   }
@@ -110,7 +117,20 @@ function build(data,override){
     const values=records.map(r=>r[c]),unique=[...new Map(values.filter(v=>v!==null).map(v=>[key(v),v])).values()];
     return [c,{type:types[c],missing:values.filter(v=>v===null).length,distinct:unique.length,examples:unique.slice(0,8).map(v=>String(serial(v)).slice(0,140)),examples_complete:unique.length<=8}];
   }));
-  return {records,types,metadata:{columns:profile,rows:records.length,warnings:[...warnings],business_rules:config.business_rules||[]}};
+  // Mapa por aba construído da fonte, sem replicar todas as linhas no contexto.
+  // As chaves de consulta respeitam inclusive renames declarados na configuração.
+  const tabs=new Map();
+  for(const record of data){
+    const tab=String(record.aba||'Não informada');
+    if(!tabs.has(tab))tabs.set(tab,{aba:tab,rows:0,tipos_registro:new Set(),headers:new Set()});
+    const entry=tabs.get(tab);entry.rows++;entry.tipos_registro.add(record.tipo_registro);
+    for(const header of Object.keys(record.dados_originais||{}))entry.headers.add(header);
+  }
+  const abas=[...tabs.values()].map(t=>({aba:t.aba,rows:t.rows,
+    tipos_registro:[...t.tipos_registro].filter(Boolean),
+    colunas:[...t.headers].map(header=>{const key='original:'+header;const queryName=config.rename?.[key]??key.trim();
+      return {cabecalho:header,coluna_consulta:queryName,tipo:types[queryName]};})}));
+  return {records,types,metadata:{columns:profile,abas,rows:records.length,warnings:[...warnings],business_rules:config.business_rules||[]}};
 }
 const compare=(a,b)=>a instanceof Decimal?a.comparedTo(b):a instanceof Date?Math.sign(a.getTime()-b.getTime()):a===b?0:a>b?1:-1;
 
@@ -206,7 +226,26 @@ function query(entry,input){
   if(!matched)warnings.push('Nenhum registro corresponde aos filtros. Isso não confirma que a obra não exista fora desta fonte.');
   if(Object.keys(missing).length)warnings.push('Há dados ausentes; cálculos ignoram campos vazios e não os tratam como zero.');
   if(total>p.offset+p.limit)warnings.push('Resultado parcial: há mais linhas. Use offset para continuar.');
-  return {status:'ok',matched_rows:matched,total_result_rows:total,rows,missing,warnings,plan:p};
+  const evidence={matched_source_rows:matched,
+    source_samples:work.slice(0,20).map(r=>({id_registro:serial(r.id_registro),aba:serial(r.aba)})),
+    source_samples_complete:matched<=20,
+    selected_columns:outputCols,filters:p.filters,any_filters:p.any_filters,
+    group_by:p.group_by,metrics:p.metrics,derived:p.derived};
+  return {status:'ok',matched_rows:matched,total_result_rows:total,rows,missing,warnings,plan:p,evidence};
+}
+
+function inspect(entry,input){
+  validate(input,schemaInspecao,'inspecao');
+  if(new Set(input.columns).size!==input.columns.length)throw Error('Selecione colunas diferentes para inspecionar.');
+  let name='_registros';while(Object.hasOwn(entry.types,name))name+='_' ;
+  const result=query(entry,{filters:input.filters||[],any_filters:input.any_filters||[],
+    group_by:input.columns,metrics:[{name,op:'rows'}],limit:input.limit??30,offset:input.offset??0});
+  const offset=input.offset??0,hasMore=offset+result.rows.length<result.total_result_rows;
+  return {...result,stage:'inspection',columns:input.columns,count_column:name,
+    total_combinations:result.total_result_rows,has_more:hasMore,
+    next_offset:hasMore?offset+result.rows.length:null,
+    complete_view:offset===0&&!hasMore,
+    column_types:Object.fromEntries(input.columns.map(c=>[c,entry.types[c]]))};
 }
 
 export function criarMotor({now=()=>performance.now(),config}={}){
@@ -214,7 +253,12 @@ export function criarMotor({now=()=>performance.now(),config}={}){
   const configuration=()=>config??JSON.parse(readFileSync(new URL('./analise-config.json',import.meta.url),'utf8'));
   return async function executar(payload){
     const namespace=payload.cache_key||'default';let result;
-    if(payload.acao==='carregar'){
+    if(payload.acao==='abrir'){
+      if(snapshots.size>=128)throw Error('Muitas análises simultâneas; tente novamente.');
+      const entry={...build(payload.dados,configuration()),created:now(),loaded_at:new Date().toISOString(),version:randomUUID()};
+      const id=randomUUID();snapshots.set(id,entry);
+      result={status:'ok',...entry.metadata,snapshot_id:id,version:entry.version,loaded_at:entry.loaded_at,cache_age_seconds:0};
+    }else if(payload.acao==='carregar'){
       const built=build(payload.dados,configuration());
       const entry={...built,created:now(),loaded_at:new Date().toISOString(),version:randomUUID()};
       cache.set(namespace,entry);
@@ -229,9 +273,10 @@ export function criarMotor({now=()=>performance.now(),config}={}){
       const id=randomUUID();snapshots.set(id,e);
       result={status:'ok',...e.metadata,snapshot_id:id,version:e.version,loaded_at:e.loaded_at,cache_age_seconds:(now()-e.created)/1000};
     }else if(payload.acao==='liberar'){snapshots.delete(payload.snapshot_id);result={status:'released'};}
-    else if(payload.acao==='executar'){
+    else if(['executar','inspecionar'].includes(payload.acao)){
       const e=snapshots.get(payload.snapshot_id);if(!e)throw Error('Snapshot indisponível. Refaça a pergunta.');
-      result=query(e,payload.plano);result.warnings=[...new Set([...(result.warnings||[]),...e.metadata.warnings])];
+      result=payload.acao==='inspecionar'?inspect(e,payload.inspecao):query(e,payload.plano);
+      result.warnings=[...new Set([...(result.warnings||[]),...e.metadata.warnings])];
       result.version=e.version;result.loaded_at=e.loaded_at;
     }else throw Error('Ação inválida.');
     if(Buffer.byteLength(JSON.stringify(result))>8*1024*1024)throw Error('Resultado maior que 8 MB. Reduza a consulta.');
