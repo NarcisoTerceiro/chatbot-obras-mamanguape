@@ -20,6 +20,34 @@ function visit(node, fn) {
   fn(node);
   for(const value of Object.values(node))if(Array.isArray(value))value.forEach(v=>visit(v,fn));else visit(value,fn);
 }
+function colunasDeIdentificacao(pergunta,catalogo) {
+  const normalized=norm(pergunta).replace(/\bnomes? (?:dos?|das?|de)\b/g,'nomes');
+  const match=normalized.match(/\b(?:quais|quem|liste|listar|nomes?|relacione|mostre)\b(.*)/);
+  if(!match)return [];
+  const head=match[1].split(/\b(?:dessas|destas|desses|destes|do|da|dos|das|de|no|na|nos|nas|em|com|para|tem|possuem|possui|apresentam|apresenta)\b/)[0];
+  const tokens=new Set(head.match(/[a-z]+/g)?.map(t=>t.replace(/s$/,''))||[]);
+  const result=new Set();
+  for(const c of catalogo){
+    if(!c.column_name||!/(text|char)/.test(c.data_type||''))continue;
+    if(!labels[c.column_name])continue;
+    const words=norm(c.column_name+' '+labels[c.column_name]).match(/[a-z]+/g)||[];
+    if(words.some(w=>tokens.has(w.replace(/s$/,''))))result.add(c.column_name);
+  }
+  return [...result];
+}
+function identificacoesProjetadas(ast) {
+  const allowed=new Set(),aliases=new Map();
+  const selectors=ast[0].type==='with'?ast[0].in:ast[0];
+  function names(expr){
+    if(!expr||typeof expr!=='object')return [];
+    if(expr.type==='ref')return [expr.name,...(aliases.get(expr.name)||[])];
+    if(expr.type==='call'&&['count','sum','avg','min','max'].includes(expr.function?.name?.toLowerCase()))return [];
+    return Object.values(expr).flatMap(v=>Array.isArray(v)?v.flatMap(names):names(v));
+  }
+  visit(ast,n=>{if(n.type==='select')for(const c of n.columns||[])if(c.alias)aliases.set(c.alias.name,names(c.expr));});
+  for(const c of selectors?.columns||[])names(c.expr).forEach(n=>allowed.add(n));
+  return allowed;
+}
 // Conferência da consulta antes da execução; nunca troca filtros silenciosamente.
 export function conferirConsulta(sql, pergunta, catalogo=[]) {
   const q=norm(pergunta), ast=parse(sql), calls=[], refs=[], tables=[];
@@ -40,6 +68,11 @@ export function conferirConsulta(sql, pergunta, catalogo=[]) {
   const works=/\bobras?\b/.test(q)||(/engenheiro|responsavel/.test(q)&&/mais|menos|maior|menor/.test(q));
   const explicitOther=/\bprojetos?\b|licitac|todos os registros|todas as abas|inclu.*projeto/.test(q);
   const available=catalogo.some(c=>['tipo_negocio','tipo_registro'].includes(c.column_name));
+  if(known){
+    const requested=colunasDeIdentificacao(pergunta,catalogo),selected=identificacoesProjetadas(ast);
+    const missing=requested.filter(c=>!selected.has(c)&&!selected.has('*'));
+    if(missing.length)throw Error('A pergunta pede identificar/listar, mas a consulta não retorna os nomes pedidos: '+missing.join(', ')+'. Retorne essas identificações (DISTINCT se forem nomes únicos), preservando o universo e os filtros. COUNT(*) ou COUNT(coluna) isolados não respondem quais/quem.');
+  }
   if(known&&works&&!explicitOther&&available&&!physical)throw Error("A pergunta pede obras físicas. Inclua tipo_negocio = 'obra' na view (ou os tipos físicos na tabela base), preservando os demais filtros; projetos e licitações não são obras. Se o catálogo não permitir isso, peça esclarecimento.");
   if(/engenheiro|responsavel/.test(q)&&/mais|menos|maior|menor/.test(q)&&/\bLIMIT\s+\d+/i.test(sql))throw Error('Ranking deve incluir todos os empatados. Use CTE para agrupar e filtre a métrica igual a MAX/MIN; não limite o ranking antes de conferir empates.');
   const sums=calls.filter(c=>c.function?.name?.toLowerCase()==='sum');
@@ -168,6 +201,7 @@ export const FERRAMENTAS_INSPECAO = FERRAMENTAS.filter(t=>!['consultarBanco','pe
 const pagamentoExplicito = q => /\b(pago|pagos|paga|pagas|pagamento|pagamentos)\b/.test(norm(q));
 const alegacaoDeFalha = s => /limitacao|temporari|acesso aos dados|indisponiv|tente.*(?:novamente|minutos)|tentar.*(?:novamente|minutos)|abordagem diferente|nao (?:foi possivel|consegui) (?:obter|consultar|acessar)/.test(norm(s));
 const PROMPT = `Você é o agente de dados das obras de Mamanguape. Entenda a pergunta em português, decida os filtros e cálculos, use ferramentas e responda com evidências do banco.
+INTENÇÃO: "quais"/"quem"/"nomes" pede identificações, não apenas contagem. Consulte os nomes na coluna real do catálogo e use DISTINCT quando o usuário quiser a lista de responsáveis únicos. "Quais os engenheiros dessas obras" exige engenheiro, mantendo os filtros das obras referidas (por exemplo, bairro Centro), sem impor status que não foi pedido. Para "quantos engenheiros", conte os responsáveis distintos, não as obras. Se o cidadão questionar uma resposta inadequada ("como assim 21?"), retome a pergunta que ela deveria responder e corrija a consulta; não repita a contagem errada. Uma consulta executável que responde outra pergunta precisa ser corrigida antes da redação.
 REDAÇÃO LIVRE: formule uma resposta natural adaptada ao pedido, sem respostas prontas por assunto. Preserve todos os nomes e valores relevantes do resultado: uma contagem agrupada exige o nome do grupo e sua quantidade, seja bairro, responsável, empresa, categoria, recurso ou qualquer outro agrupamento. Não responda só o número. Novos cálculos devem ser consultados antes de redigir. Não invente números, exemplos ou entidades. Quando houver empate, preserve todos os empatados. As instruções de apresentação não limitam quais perguntas ou colunas podem ser consultadas.
 PAGAMENTOS: quando o usuário escolher pago/pagamentos, a métrica já está definida. Consulte os dados; não repita a pergunta entre contratado/executado/pago. Para "dessas obras", mantenha os filtros da última consulta de obras mesmo após um esclarecimento intermediário. valor_pago existe em public.obras; a view obras_chatbot pode não expor esse campo. Confira o catálogo. Quando necessário, use JOIN por id entre public.obras o e public.obras_chatbot v para manter os filtros da view e somar o.valor_pago, com COUNT(*) e COUNT(o.valor_pago). As representações correspondem por id; não faça UNION nem some duas vezes. Valores ausentes são informados como ausentes; nunca use valor_executado ou valor_total como substituto de pagamento. Se todos estiverem ausentes, explique que não há valores pagos informados. Não alegue limitação temporária/acesso indisponível sem erro real da ferramenta. pedirEsclarecimento serve apenas para uma dúvida específica sobre o pedido, nunca para disfarçar uma consulta não feita.
 REGRAS DE CONFERÊNCIA: perguntas sobre obras, inclusive ranking geral de engenheiros, usam apenas obras físicas (tipo_negocio='obra'), salvo pedido explícito de projetos, licitações ou todos os registros. Ranking de maior/menor deve retornar TODOS os empatados: use CTE com GROUP BY e selecione a métrica igual a MAX/MIN, nunca LIMIT 1. SUM(campo) exige COUNT(*) e COUNT(campo) separados; COUNT(*) não comprova preenchimento. Saúde inclui UBS, hospital, CAPS e unidades de saúde pelo objeto e recurso FNS/Ministério da Saúde; FNDE, escola e creche são educação. Inspecione os nomes reais para definir a área. Investido é ambíguo: se não houver definição no contexto, pergunte se deseja contratado, executado ou pago; nunca escolha executado silenciosamente.
