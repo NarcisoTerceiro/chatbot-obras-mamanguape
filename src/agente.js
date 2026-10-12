@@ -64,15 +64,9 @@ export function respostaConferida(result, pergunta='') {
   const rows=result.rows||[];
   if(!rows.length)return 'Não encontrei resultados para o que você pediu.';
   const ag=aggregates(result.sql||'SELECT 1'),q=norm(pergunta);
-  const ranking=rows.every(r=>r.engenheiro!=null)&&ag.some(a=>a.fn==='count')&&!rows.some(r=>r.objeto);
-  if(ranking){
-    const metric=ag.find(a=>a.fn==='count')?.key;
-    if(!metric||!rows.every(r=>r[metric]!=null))return null;
-    const tied=rows.length>1&&rows.every(r=>String(r[metric])===String(rows[0][metric]));
-    const heading=tied?`*Empate*: ${rows.length} responsáveis têm *${rows[0][metric]} ${/registro|projeto|licitac/.test(q)?'registros':'obras'}* cada.`:'*Responsáveis e quantidade de obras:*';
-    return [heading,...rows.map(r=>`• ${safeValue(r.engenheiro)} — ${r[metric]}`)].join('\n');
-  }
-  if(rows.length===1&&ag.some(a=>a.fn)){
+  const aggregateKeys=new Set(ag.filter(a=>a.fn).map(a=>a.key));
+  const dimensions=Object.keys(rows[0]).filter(k=>!aggregateKeys.has(k)&&k!=='id');
+  if(rows.length===1&&ag.some(a=>a.fn)&&!dimensions.length){
     const row=rows[0],lines=[];
     const total=ag.find(a=>a.fn==='count'&&a.arg?.name==='*');
     const sums=ag.filter(a=>a.fn==='sum');
@@ -91,12 +85,17 @@ export function respostaConferida(result, pergunta='') {
     }
     if(lines.length)return lines.join('\n');
   }
-  const fields=Object.keys(rows[0]).filter(k=>labels[k]);
+  const hidden=/^(?:id|__.*|dados_extras|dados_originais|avisos_fonte|sql|tipo_negocio|subtipo_negocio|aba_origem|linha_origem)$/;
+  const fields=[...new Set(rows.flatMap(r=>Object.keys(r)))].filter(k=>!hidden.test(k));
   if(!fields.length)return null;
   const works=fields.includes('objeto'),chunks=[];
   let shown=0;
   for(const row of rows){
-    const lines=fields.filter(k=>row[k]!==undefined).map(k=>`${labels[k]}: ${k.startsWith('valor_')||k==='quanto_falta'?row[k]==null?'não informado':money(row[k]):safeValue(row[k])}`);
+    const lines=fields.filter(k=>row[k]!==undefined).map(k=>{
+      const a=ag.find(a=>a.key===k&&a.fn),base=labels[k]||(a?.fn==='count'?'Quantidade':labels[a?.arg?.name])||k.replace(/_/g,' ');
+      const financial=k.startsWith('valor_')||k==='quanto_falta'||a?.arg?.name?.startsWith('valor_');
+      return `${base}: ${financial?row[k]==null?'não informado':money(row[k]):safeValue(row[k])}`;
+    });
     const block='• '+lines.join('\n');
     if(chunks.join('\n\n').length+block.length>3100&&shown)break;
     chunks.push(block);shown++;
@@ -105,6 +104,53 @@ export function respostaConferida(result, pergunta='') {
   const heading=works?(!limited?`Encontrei *${rows.length} obras*.`:'*Obras encontradas:*'):'*Informações encontradas:*';
   if(shown<rows.length||limited)chunks.push(limited?`Mostrando ${shown} resultados. A lista é parcial; peça para continuar.`:`Mostrando ${shown} das ${rows.length} obras. Peça para continuar.`);
   return [heading,...chunks].join('\n\n');
+}
+
+// A IA redige livremente; a conferência compara evidências, sem escolher uma resposta por assunto.
+const numericToken=s=>{
+  let v=String(s).replace(/\s/g,'');
+  if(v.includes(','))v=v.replace(/\./g,'').replace(',','.');
+  else if(/^[-+]?\d{1,3}(?:\.\d{3})+$/.test(v))v=v.replace(/\./g,'');
+  const n=Number(v);return Number.isFinite(n)?n.toFixed(6):null;
+};
+const numberTokens=s=>String(s||'').match(/[-+]?\d+(?:[.,]\d+)*/g)||[];
+export function conferirRedacao(content,result,pergunta='') {
+  const s=String(content||'').trim(),issues=[];
+  if(!s)return ['Resposta vazia.'];
+  if(privateText.test(s))issues.push('Retire SQL, nomes internos e explicações técnicas.');
+  if(alegacaoDeFalha(s))issues.push('Há resultado válido. Não invente falha de acesso.');
+  const rows=result.rows||[],available=new Set([numericToken(rows.length)]);
+  for(const row of rows)for(const [key,val] of Object.entries(row)){
+    if(val==null||typeof val==='object')continue;
+    numberTokens(val).forEach(t=>available.add(numericToken(t)));
+    if(/percent/i.test(key)&&Number.isFinite(Number(val)))available.add(numericToken(Number(val)*100));
+  }
+  const ag=aggregates(result.sql||'SELECT 1'),sums=ag.filter(a=>a.fn==='sum');
+  if(/quant|total|valor|maior|mais|menos|menor|soma|media|medio|percent/.test(norm(pergunta))){
+    const answerNumbers=new Set(numberTokens(s).map(numericToken));
+    const metrics=ag.filter(a=>a.fn&&(sums.length?a.fn==='sum':true));
+    for(const row of rows)for(const a of metrics){
+      const val=row[a.key];
+      if(val!=null&&Number.isFinite(Number(val))&&!answerNumbers.has(numericToken(val)))issues.push('Inclua o valor consultado de '+a.key+': '+val+'.');
+    }
+  }
+  for(const row of rows)for(const sum of sums){
+    const total=ag.find(a=>a.fn==='count'&&a.arg?.name==='*');
+    const known=ag.find(a=>a.fn==='count'&&JSON.stringify(a.arg)===JSON.stringify(sum.arg));
+    if(total&&known&&row[total.key]!=null&&row[known.key]!=null){
+      const missing=Number(row[total.key])-Number(row[known.key]);available.add(numericToken(missing));
+      if(missing>0&&!/nao informad|sem (?:esse |o |os )?valor|ausent|disponive|parcial|falt|sem pagamento/.test(norm(s)))issues.push('Explique a cobertura da soma: há valores ausentes; não apresente o total como completo.');
+    }
+  }
+  const unsupported=[...new Set(numberTokens(s).filter(t=>!available.has(numericToken(t))))];
+  if(unsupported.length)issues.push('Números sem evidência no resultado: '+unsupported.join(', ')+'. Use os números consultados; novos cálculos exigem nova consulta.');
+  const aggregateKeys=new Set(ag.filter(a=>a.fn).map(a=>a.key));
+  if(ag.some(a=>a.fn)&&rows.length<=20&&!/parcial|continu|primeir|alguns|exemplo/.test(norm(s))){
+    const dimensions=[...new Set(rows.flatMap(row=>Object.entries(row).filter(([k,v])=>!aggregateKeys.has(k)&&typeof v==='string'&&!/^[-+]?\d+(?:\.\d+)?$/.test(v)&&!/^(__|dados_|sql$)/.test(k)).map(([,v])=>v.trim()).filter(Boolean)))];
+    const missing=dimensions.filter(v=>!norm(s).includes(norm(v)));
+    if(missing.length)issues.push('Não omita os nomes associados aos valores: '+missing.join('; ')+'.');
+  }
+  return issues;
 }
 
 const texto = v => v == null ? '' : String(v).trim();
@@ -122,6 +168,7 @@ export const FERRAMENTAS_INSPECAO = FERRAMENTAS.filter(t=>!['consultarBanco','pe
 const pagamentoExplicito = q => /\b(pago|pagos|paga|pagas|pagamento|pagamentos)\b/.test(norm(q));
 const alegacaoDeFalha = s => /limitacao|temporari|acesso aos dados|indisponiv|tente.*(?:novamente|minutos)|tentar.*(?:novamente|minutos)|abordagem diferente|nao (?:foi possivel|consegui) (?:obter|consultar|acessar)/.test(norm(s));
 const PROMPT = `Você é o agente de dados das obras de Mamanguape. Entenda a pergunta em português, decida os filtros e cálculos, use ferramentas e responda com evidências do banco.
+REDAÇÃO LIVRE: formule uma resposta natural adaptada ao pedido, sem respostas prontas por assunto. Preserve todos os nomes e valores relevantes do resultado: uma contagem agrupada exige o nome do grupo e sua quantidade, seja bairro, responsável, empresa, categoria, recurso ou qualquer outro agrupamento. Não responda só o número. Novos cálculos devem ser consultados antes de redigir. Não invente números, exemplos ou entidades. Quando houver empate, preserve todos os empatados. As instruções de apresentação não limitam quais perguntas ou colunas podem ser consultadas.
 PAGAMENTOS: quando o usuário escolher pago/pagamentos, a métrica já está definida. Consulte os dados; não repita a pergunta entre contratado/executado/pago. Para "dessas obras", mantenha os filtros da última consulta de obras mesmo após um esclarecimento intermediário. valor_pago existe em public.obras; a view obras_chatbot pode não expor esse campo. Confira o catálogo. Quando necessário, use JOIN por id entre public.obras o e public.obras_chatbot v para manter os filtros da view e somar o.valor_pago, com COUNT(*) e COUNT(o.valor_pago). As representações correspondem por id; não faça UNION nem some duas vezes. Valores ausentes são informados como ausentes; nunca use valor_executado ou valor_total como substituto de pagamento. Se todos estiverem ausentes, explique que não há valores pagos informados. Não alegue limitação temporária/acesso indisponível sem erro real da ferramenta. pedirEsclarecimento serve apenas para uma dúvida específica sobre o pedido, nunca para disfarçar uma consulta não feita.
 REGRAS DE CONFERÊNCIA: perguntas sobre obras, inclusive ranking geral de engenheiros, usam apenas obras físicas (tipo_negocio='obra'), salvo pedido explícito de projetos, licitações ou todos os registros. Ranking de maior/menor deve retornar TODOS os empatados: use CTE com GROUP BY e selecione a métrica igual a MAX/MIN, nunca LIMIT 1. SUM(campo) exige COUNT(*) e COUNT(campo) separados; COUNT(*) não comprova preenchimento. Saúde inclui UBS, hospital, CAPS e unidades de saúde pelo objeto e recurso FNS/Ministério da Saúde; FNDE, escola e creche são educação. Inspecione os nomes reais para definir a área. Investido é ambíguo: se não houver definição no contexto, pergunte se deseja contratado, executado ou pago; nunca escolha executado silenciosamente.
 RESPOSTA AO CIDADÃO: nunca cite banco, planilha, SQL, SELECT, view, tabela, coluna, NULL, tipo_negocio, campos, API, provedores, tokens ou mecanismos internos. Diga apenas obras, valores, situação e ausências relevantes em português comum. Não explique como buscou. Não inclua observações técnicas. Para ausência de valores, diga quantas obras não têm o valor informado. Para empate, informe todos os responsáveis empatados. Não invente informações além do resultado da ferramenta.
@@ -188,7 +235,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
         const pagoDefinido=pagamentoExplicito(q)&&!referenciaSemContexto;
         const ferramentasAtuais=pagoDefinido?FERRAMENTAS.filter(t=>t.function.name!=='pedirEsclarecimento'):FERRAMENTAS;
         messages.push({role:'user',content:q});
-        let errosSQL=0,erroPendente=false,semConsulta=0;
+        let errosSQL=0,erroPendente=false,semConsulta=0,reparosRedacao=0;
         async function safeQuery(sql,params=[]) {
           await client.query('SAVEPOINT ferramenta_agente');
           try { const r=await client.query(sql,params); await client.query('RELEASE SAVEPOINT ferramenta_agente'); return r; }
@@ -207,8 +254,17 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
               }
               throw Error('A IA não concluiu uma consulta válida para esta pergunta.');
             }
-            const resposta=respostaConferida(ultimoResultado,q) || textoPublico(msg?.content);
-            if(!resposta) throw Error('Resposta da IA vazia.');
+            const issues=conferirRedacao(msg?.content,ultimoResultado,q);
+            if(issues.length){
+              trace.push({rodada,ferramenta:'conferirRedacao',sucesso:false,problemas:issues});
+              if(reparosRedacao++<1){
+                if(msg)messages.push(msg);
+                messages.push({role:'system',content:'Confira e reescreva sua resposta, mantendo o pedido. Problemas encontrados: '+issues.join(' ')+' O resultado original da ferramenta continua sendo a evidência. Pode fazer outra consulta se precisar de mais dados; não troque filtros para contornar a conferência.'});
+                continue;
+              }
+              throw Error('A redação não correspondeu ao resultado consultado: '+issues.join(' '));
+            }
+            const resposta=texto(msg?.content).replace(/\*\*([^*]+)\*\*/g,'*$1*');
             if(id) {
               if(sessions.size>=200 && !sessions.has(id)) sessions.delete(sessions.keys().next().value);
               sessions.set(id,{last:now(),contexto:{pergunta:q,sql:ultimoSQL,criterio:ultimoResultado.criterio}});
