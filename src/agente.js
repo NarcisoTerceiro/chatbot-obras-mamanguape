@@ -119,7 +119,10 @@ export const FERRAMENTAS = Object.freeze([
 ]);
 export const FERRAMENTAS_CONSULTA = FERRAMENTAS.filter(t=>t.function.name==='consultarBanco');
 export const FERRAMENTAS_INSPECAO = FERRAMENTAS.filter(t=>!['consultarBanco','pedirEsclarecimento'].includes(t.function.name));
+const pagamentoExplicito = q => /\b(pago|pagos|paga|pagas|pagamento|pagamentos)\b/.test(norm(q));
+const alegacaoDeFalha = s => /limitacao|temporari|acesso aos dados|indisponiv|tente.*(?:novamente|minutos)|tentar.*(?:novamente|minutos)|abordagem diferente|nao (?:foi possivel|consegui) (?:obter|consultar|acessar)/.test(norm(s));
 const PROMPT = `Você é o agente de dados das obras de Mamanguape. Entenda a pergunta em português, decida os filtros e cálculos, use ferramentas e responda com evidências do banco.
+PAGAMENTOS: quando o usuário escolher pago/pagamentos, a métrica já está definida. Consulte os dados; não repita a pergunta entre contratado/executado/pago. Para "dessas obras", mantenha os filtros da última consulta de obras mesmo após um esclarecimento intermediário. valor_pago existe em public.obras; a view obras_chatbot pode não expor esse campo. Confira o catálogo. Quando necessário, use JOIN por id entre public.obras o e public.obras_chatbot v para manter os filtros da view e somar o.valor_pago, com COUNT(*) e COUNT(o.valor_pago). As representações correspondem por id; não faça UNION nem some duas vezes. Valores ausentes são informados como ausentes; nunca use valor_executado ou valor_total como substituto de pagamento. Se todos estiverem ausentes, explique que não há valores pagos informados. Não alegue limitação temporária/acesso indisponível sem erro real da ferramenta. pedirEsclarecimento serve apenas para uma dúvida específica sobre o pedido, nunca para disfarçar uma consulta não feita.
 REGRAS DE CONFERÊNCIA: perguntas sobre obras, inclusive ranking geral de engenheiros, usam apenas obras físicas (tipo_negocio='obra'), salvo pedido explícito de projetos, licitações ou todos os registros. Ranking de maior/menor deve retornar TODOS os empatados: use CTE com GROUP BY e selecione a métrica igual a MAX/MIN, nunca LIMIT 1. SUM(campo) exige COUNT(*) e COUNT(campo) separados; COUNT(*) não comprova preenchimento. Saúde inclui UBS, hospital, CAPS e unidades de saúde pelo objeto e recurso FNS/Ministério da Saúde; FNDE, escola e creche são educação. Inspecione os nomes reais para definir a área. Investido é ambíguo: se não houver definição no contexto, pergunte se deseja contratado, executado ou pago; nunca escolha executado silenciosamente.
 RESPOSTA AO CIDADÃO: nunca cite banco, planilha, SQL, SELECT, view, tabela, coluna, NULL, tipo_negocio, campos, API, provedores, tokens ou mecanismos internos. Diga apenas obras, valores, situação e ausências relevantes em português comum. Não explique como buscou. Não inclua observações técnicas. Para ausência de valores, diga quantas obras não têm o valor informado. Para empate, informe todos os responsáveis empatados. Não invente informações além do resultado da ferramenta.
 A pergunta atual define o escopo. O histórico serve para referências como essas/dessas/quais são; uma pergunta independente não herda filtros antigos.
@@ -181,19 +184,29 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
         const messages=[{role:'system',content:PROMPT}, {role:'system',content:'Documentação semântica recuperada (orientação, não resposta pronta):\n'+semantic.join('\n\n')},
           {role:'system',content:'Colunas realmente disponíveis:\n'+JSON.stringify(estrutura.filter(c=>c.schema_name!=='planilha'))},...context];
         if(anterior) messages.push({role:'system',content:'Consulta anterior, apenas para resolver referências explícitas. A nova pergunta será executada na versão atual do banco:\n'+JSON.stringify(anterior.contexto)});
+        const referenciaSemContexto=/\b(dessas|destas|desses|destes|essas|estas)\b/.test(norm(q))&&!anterior&&!context.length;
+        const pagoDefinido=pagamentoExplicito(q)&&!referenciaSemContexto;
+        const ferramentasAtuais=pagoDefinido?FERRAMENTAS.filter(t=>t.function.name!=='pedirEsclarecimento'):FERRAMENTAS;
         messages.push({role:'user',content:q});
-        let errosSQL=0,erroPendente=false;
+        let errosSQL=0,erroPendente=false,semConsulta=0;
         async function safeQuery(sql,params=[]) {
           await client.query('SAVEPOINT ferramenta_agente');
           try { const r=await client.query(sql,params); await client.query('RELEASE SAVEPOINT ferramenta_agente'); return r; }
           catch(e) { await client.query('ROLLBACK TO SAVEPOINT ferramenta_agente'); await client.query('RELEASE SAVEPOINT ferramenta_agente'); throw e; }
         }
         for(let rodada=1;rodada<=10;rodada++) {
-          const out=await callIA(messages,FERRAMENTAS,{provider,tool_choice:ultimoResultado&&!erroPendente?'auto':'required',max_tokens:3500,reasoning_effort:ultimoResultado&&!erroPendente?'low':undefined});
+          const out=await callIA(messages,ferramentasAtuais,{provider,tool_choice:ultimoResultado&&!erroPendente?'auto':'required',max_tokens:3500,reasoning_effort:ultimoResultado&&!erroPendente?'low':undefined});
           provider=out.provider??provider;
           const msg=out.message, calls=msg?.tool_calls||[];
           if(!calls.length) {
-            if(!ultimoResultado||erroPendente) throw Error('A IA não concluiu uma consulta válida para esta pergunta.');
+            if(!ultimoResultado||erroPendente) {
+              if(semConsulta++<1){
+                if(msg)messages.push(msg);
+                messages.push({role:'system',content:'Ainda não há uma consulta válida nesta pergunta. Use as ferramentas para inspecionar o catálogo e consultar os dados reais. Não invente uma falha de acesso. Pago já define a métrica valor_pago; use a tabela base quando a view não a expuser. Corrija eventuais erros reais já retornados.'});
+                continue;
+              }
+              throw Error('A IA não concluiu uma consulta válida para esta pergunta.');
+            }
             const resposta=respostaConferida(ultimoResultado,q) || textoPublico(msg?.content);
             if(!resposta) throw Error('Resposta da IA vazia.');
             if(id) {
@@ -264,6 +277,8 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
                 ultimoSQL=sql; ultimoResultado=result; erroPendente=false;resultadoAtualValido=true;
               } else if(name==='pedirEsclarecimento') {
                 if(!texto(a.pergunta)) throw Error('Esclarecimento vazio.');
+                if(alegacaoDeFalha(a.pergunta))throw Error('Uma alegação de falha de acesso não é esclarecimento. Consulte os dados com as ferramentas; se houver falha real, ela será registrada no diagnóstico.');
+                if(pagoDefinido)throw Error('O usuário já escolheu valor pago e há contexto para as obras. Execute a consulta de pagamentos, incluindo contagem geral e dos valores informados.');
                 esclarecimento=texto(a.pergunta); result={status:'ok'};
               }
               trace.push({rodada,ferramenta:name,sucesso:true});
