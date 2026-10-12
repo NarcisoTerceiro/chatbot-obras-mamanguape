@@ -87,3 +87,23 @@ export function recuperarContexto(pergunta, adicionais = [], k = 5) {
     return score+Math.log(1+(words.length-df+.5)/(df+.5))*tf*2.2/(tf+1.2*(.25+.75*words[i].length/avg));
   },0)})).sort((a,b) => b.score-a.score).slice(0,k).map(x=>x.doc);
 }
+
+// Identifica filtros exatos simples de bairro para conferir grafias na fonte.
+// Não altera SQL nem troca um filtro silenciosamente.
+export function filtrosExatosBairro(sql, params = []) {
+  const encontrados = new Set();
+  function visit(node) {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 'binary' && ['=', 'ILIKE', 'LIKE'].includes(node.op.toUpperCase())) {
+      let left = node.left, right = node.right;
+      if (right?.type === 'ref' && right.name === 'bairro') [left, right] = [right, left];
+      if (left?.type === 'ref' && left.name === 'bairro') {
+        const v = right?.type === 'string' ? right.value : right?.type === 'parameter' ? params[Number(right.name.slice(1))-1] : null;
+        if (typeof v === 'string' && v.trim() && v.length <= 150 && !/[%_]/.test(v)) encontrados.add(v);
+      }
+    }
+    for (const v of Object.values(node)) if (Array.isArray(v)) v.forEach(visit); else visit(v);
+  }
+  parse(sql).forEach(visit);
+  return [...encontrados];
+}
