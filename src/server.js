@@ -136,11 +136,12 @@ app.get("/", (_req, res) => res.send("Chatbot de Obras de Mamanguape no ar."));
 app.get("/diagnostico", async (req, res) => {
   if (!exigirAdmin(req, res)) return;
   try {
-    const [total, status, exemplo, sync] = await Promise.all([
+    const [total, status, exemplo, sync, abas] = await Promise.all([
       queryReadOnly('SELECT COUNT(*)::int AS total FROM public.obras'),
       queryReadOnly("SELECT COALESCE(status, 'Não informado') AS status, COUNT(*)::int AS total FROM public.obras GROUP BY status ORDER BY total DESC LIMIT 20"),
       queryReadOnly('SELECT id, objeto, bairro, status, categoria, aba_origem FROM public.obras ORDER BY id LIMIT 1'),
       queryReadOnly('SELECT atualizada_em, registros FROM public.obras_sync WHERE id=1'),
+      queryReadOnly('SELECT planilha_id,aba,view_nome,registros,linhas_lidas,avisos,atualizada_em FROM public.planilha_abas WHERE ativa=true ORDER BY aba'),
     ]);
     res.json({
       fonte_do_atendimento: 'PostgreSQL/Supabase',
@@ -149,6 +150,7 @@ app.get("/diagnostico", async (req, res) => {
       exemplo_de_obra: exemplo.rows[0] || null,
       lido_em: sync.rows[0]?.atualizada_em || null,
       ultima_sincronizacao: sync.rows[0]?.atualizada_em || null,
+      abas: abas.rows,
     });
   } catch (e) {
     res.status(500).json({ erro: e.message });
@@ -167,6 +169,8 @@ async function executarRotaSincronizacao(req, res) {
     res.json({
       ok: true,
       obras_inseridas: resultado.inseridas,
+      abas: resultado.abas,
+      planilha_id: resultado.planilha_id,
       quando: new Date().toISOString(),
     });
   } catch (e) {

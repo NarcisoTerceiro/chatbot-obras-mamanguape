@@ -29,13 +29,14 @@ export function acharLinhaCabecalho(rows,maxLinhasAnalisadas=15){
 export function rowsToObjects(rows,tabName){
  const idx=acharLinhaCabecalho(rows);
  if(idx<0)return {obras:[],cabecalho:[],ignoradas:0};
- const original=(rows[idx]||[]).map(h=>String(h??'').trim());
+ const width=rows.reduce((w,r)=>Math.max(w,(r||[]).length),0);
+ const original=Array.from({length:width},(_,j)=>String(rows[idx]?.[j]??'').trim());
  const counts=new Map();for(const name of original.filter(Boolean))counts.set(name,(counts.get(name)||0)+1);
  const letter=index=>{let out='';for(let n=index+1;n>0;n=Math.floor((n-1)/26))out=String.fromCharCode(65+(n-1)%26)+out;return out;};
  const used=new Set(original.filter(Boolean));const avisos=[];
  const header=original.map((name,j)=>{
-  if(!name)return '';
-  if(counts.get(name)===1&&!['_aba','_linha','_avisos'].includes(name))return name;
+  if(!name){const base=`SEM CABEÇALHO [coluna ${letter(j)}]`;let key=base,n=2;while(used.has(key))key=`${base} (${n++})`;used.add(key);avisos.push(`Aba ${tabName}: coluna ${letter(j)} sem cabeçalho; células preservadas como ${key}.`);return key;}
+  if(counts.get(name)===1&&!['_aba','_linha','_avisos','__registro_id','__aba','__linha','__dados_originais'].includes(name))return name;
   const base=`${name} [coluna ${letter(j)}]`;let key=base,n=2;
   while(used.has(key))key=`${base} (${n++})`;
   used.add(key);avisos.push(`Aba ${tabName}: cabeçalho ${name} na coluna ${letter(j)} identificado como ${key}; confira o significado antes de usar.`);
@@ -119,7 +120,7 @@ export function criarLeitorSheets({api,env=process.env,now=()=>Date.now(),logger
    const all=[];const report=[];
    values.forEach((vr,i)=>{
     const {obras,cabecalho,ignoradas,avisos=[]}=rowsToObjects(vr.values||[],tabs[i]);all.push(...obras);
-    report.push({aba:tabs[i],linhas_lidas:(vr.values||[]).length,obras:obras.length,linhas_ignoradas:ignoradas,cabecalho,avisos});
+    report.push({aba:tabs[i],linhas_lidas:(vr.values||[]).length,obras:obras.length,linhas_ignoradas:ignoradas,cabecalho,avisos,celulas:vr.values||[]});
    });
    if(generation!==currentGeneration)throw Error('Leitura invalidada por uma atualização. Tente novamente.');
    cache={data:all,time:now()};revision++;

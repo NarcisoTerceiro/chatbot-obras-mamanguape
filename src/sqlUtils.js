@@ -28,7 +28,7 @@ export function decimalMoeda(v) {
 
 const SAFE_FUNCTIONS = new Set(('count sum avg min max abs round ceil ceiling floor trunc mod power sqrt coalesce nullif greatest least lower upper trim btrim ltrim rtrim length char_length concat concat_ws replace regexp_replace strpos substring split_part to_char to_date date_part date_trunc extract age now current_date jsonb_each jsonb_each_text jsonb_object_keys jsonb_array_elements jsonb_array_elements_text jsonb_typeof jsonb_extract_path_text jsonb_build_object jsonb_agg json_agg string_agg array_agg row_number rank dense_rank lag lead first_value last_value bool_and bool_or').split(' '));
 const STATEMENTS = new Set(['select', 'with', 'union', 'union all']);
-const RELATIONS = new Set(['obras', 'obras_chatbot']);
+const RELATIONS = new Set(['obras', 'obras_chatbot', 'planilha_abas']);
 export function validarSQL(sql) {
   if (typeof sql !== 'string' || !sql.trim() || sql.length > 24000) throw Error('Consulta SQL vazia ou muito longa.');
   const ast = parse(sql);
@@ -45,8 +45,9 @@ export function validarSQL(sql) {
     if (['insert','update','delete','create table','drop table','truncate','with recursive'].includes(node.type)) throw Error('Operação SQL não permitida.');
     if (node.type === 'table') {
       const { name, schema } = node.name;
-      if (schema && schema !== 'public') throw Error('Somente o schema public de obras é permitido.');
-      if (!(RELATIONS.has(name) || (!schema && aliases.has(name)))) throw Error(`Relação não permitida: ${name}.`);
+      const sourceView=schema==='planilha' && /^aba_[a-z0-9_]+$/.test(name);
+      if (!sourceView && schema && schema !== 'public') throw Error('Somente public ou views autorizadas no schema planilha são permitidos.');
+      if (!sourceView && !(RELATIONS.has(name) || (!schema && aliases.has(name)))) throw Error(`Relação não permitida: ${name}.`);
     }
     if (node.type === 'call') {
       const f = node.function;
@@ -64,6 +65,7 @@ export function validarSQL(sql) {
 }
 
 export const DOCUMENTOS = [
+  'Organização por aba: public.planilha_abas guarda catálogo e células originais por GOOGLE_SHEETS_ID e aba. ativa=true identifica a fonte atual. Cada aba tem uma view no schema planilha, com cabeçalhos originais e tipos numeric/boolean somente quando a fonte comprova esses tipos. Consulte o catálogo de views reais, não invente nomes. Estas views mostram os mesmos registros de public.obras; não some dados duplicados entre fonte e tabela canônica. Matriz celulas conserva cabeçalhos, títulos e linhas não interpretadas; não é uma lista de obras.',
   'Fonte: public.obras contém uma linha por registro de cada aba. public.obras_chatbot é a view existente; prefira-a se tiver os campos necessários. Não una a tabela com sua view para somar: são os mesmos registros.',
   'Tipos: tipo_registro distingue obra, pavimentacao, projeto, licitacao, pendencia e outro. Categoria descreve a aba, não comprova status físico. Não excluir pavimentação de obras automaticamente. Examine nomes de abas e objetos para decidir o universo.',
   'Status: status_original conserva a célula; status é sua normalização. Aba em_andamento não comprova conclusão ou andamento quando status estiver vazio. Executada e concluída não são sinônimos.',

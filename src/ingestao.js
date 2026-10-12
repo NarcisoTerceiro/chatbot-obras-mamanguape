@@ -10,9 +10,12 @@
 //  Assim o banco fica sempre IGUAL a planilha - simples e seguro.
 // ============================================================
 
-import { getObras, limparCache } from "./sheets.js";
+import { getObras, limparCache, getDiagnostico } from "./sheets.js";
+import { createHash } from "node:crypto";
 import { decimalMoeda } from "./sqlUtils.js";
 import { withAdminTransaction } from "./db.js";
+
+const controle = k => ["_aba","_linha","_avisos"].includes(k);
 
 // --- utilidades de limpeza ---
 function norm(s) {
@@ -22,7 +25,7 @@ function norm(s) {
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, " ");
+    .replace(/[_\s]+/g, " ");
 }
 
 // Cada campo do banco -> nomes possiveis na planilha (sinonimos).
@@ -42,7 +45,7 @@ const MAPA = {
   percentual_executado: ["% executada", "% executado", "percentual executado", "percentual"],
   engenheiro: ["engenheiro", "engenheiro responsavel", "engenheiro/arquiteto responsavel",
                "engenheiro/arquiteto", "responsavel tecnico", "responsavel"],
-  empresa: ["empresa", "empresa responsavel", "construtora", "contratada"],
+  empresa: ["empresa", "empresa responsavel", "empresa executora", "construtora", "contratada"],
 };
 
 // Dado um objeto-obra (com chaves = nomes de coluna da planilha),
@@ -187,7 +190,7 @@ function objetoGenericoDaLinha(obra) {
   ];
 
   const entradas = Object.entries(obra)
-    .filter(([k, v]) => !k.startsWith("_") && v !== null && v !== undefined && String(v).trim() !== "");
+    .filter(([k, v]) => !controle(k) && v !== null && v !== undefined && String(v).trim() !== "");
 
   for (const termo of preferidas) {
     const achou = entradas.find(([k]) => norm(k).includes(norm(termo)));
@@ -217,12 +220,12 @@ function bairroDoNome(nome) {
 
 function coletarExtras(obra) {
   // Todas as células, inclusive vazias e zeros, com nomes e tipos originais.
-  return Object.fromEntries(Object.entries(obra || {}).filter(([k]) => !k.startsWith('_')));
+  return Object.fromEntries(Object.entries(obra || {}).filter(([k]) => !controle(k)));
 }
 
 // Transforma uma obra crua (da planilha) numa linha limpa pro banco.
 export function limpar(obra) {
-  if (!obra || typeof obra !== "object" || Array.isArray(obra) || !Object.entries(obra).some(([k,v]) => !k.startsWith("_") && v != null && String(v).trim() !== "")) return null;
+  if (!obra || typeof obra !== "object" || Array.isArray(obra) || !Object.entries(obra).some(([k,v]) => !controle(k) && v != null && String(v).trim() !== "")) return null;
   // Abas tradicionais usam OBJETO/OBRA/RUA. Abas auxiliares ou futuras
   // podem ter outros cabeçalhos; não descartamos mais a linha só por isso.
   const objeto = pegar(obra, "objeto") || objetoGenericoDaLinha(obra);
@@ -291,12 +294,27 @@ export function limpar(obra) {
 }
 
 // Roda a ingestao completa: le planilha -> limpa -> substitui no banco.
-export async function sincronizar({ lerDados = getObras, transacao = withAdminTransaction } = {}) {
+export async function sincronizar({ lerDados = getObras, diagnostico = getDiagnostico, transacao = withAdminTransaction, planilhaId = process.env.GOOGLE_SHEETS_ID } = {}) {
+  if (!planilhaId) throw new Error("GOOGLE_SHEETS_ID não configurado.");
   console.log("INGESTAO: lendo planilha...");
   limparCache(); // forca releitura da planilha fresca (ignora cache velho)
   const cruas = await lerDados({force:true});
   if (!Array.isArray(cruas)) throw new Error("Leitura da planilha inválida; banco preservado.");
-  const limpas = cruas.map(limpar).filter(Boolean);
+  const limpas = cruas.map(limpar).filter(Boolean).map(r => ({...r,planilha_id:planilhaId}));
+  const relatorio = diagnostico()?.abas || [];
+  const abas = [...new Set([...cruas.map(r=>r._aba).filter(Boolean),...relatorio.map(a=>a.aba)])];
+  const catalogos = abas.map(aba => {
+    const rows = cruas.filter(r=>r._aba===aba), report=relatorio.find(r=>r.aba===aba);
+    const keys = [...new Set([...(report?.cabecalho||[]),...rows.flatMap(r=>Object.keys(r).filter(k=>!controle(k)))])];
+    const colunas=keys.map(chave=>{
+      const values=rows.map(r=>r[chave]).filter(v=>v!==null&&v!==undefined&&v!=='');
+      const types=[...new Set(values.map(v=>typeof v))];
+      return {chave,tipo:types.length===1&&types[0]==='number'?'numeric':types.length===1&&types[0]==='boolean'?'boolean':'text'};
+    });
+    const slug=norm(aba).replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,'').slice(0,36)||'aba';
+    const hash=createHash('sha256').update(planilhaId+'|'+aba).digest('hex').slice(0,10);
+    return {aba,rows,report,colunas,view:'aba_'+slug+'_'+hash};
+  });
   console.log(`INGESTAO: ${cruas.length} linhas lidas, ${limpas.length} obras limpas.`);
 
   if (limpas.length === 0) {
@@ -308,7 +326,7 @@ export async function sincronizar({ lerDados = getObras, transacao = withAdminTr
   const campos = ["objeto","bairro","status","categoria","valor_total",
     "valor_executado","percentual_executado","engenheiro","empresa","aba_origem",
     "dados_extras", "tipo_registro", "linha_origem", "status_original", "valor_pago",
-    "valor_contratado", "valor_contratado_calculado", "avisos_fonte"];
+    "valor_contratado", "valor_contratado_calculado", "avisos_fonte", "planilha_id"];
 
   // INSERCAO EM LOTE: junta varias obras numa unica query, em blocos.
   // Antes era uma query por obra (2000 obras = 2000 idas ao banco = timeout).
@@ -330,6 +348,31 @@ export async function sincronizar({ lerDados = getObras, transacao = withAdminTr
   // estado anterior, sem ficar vazio ou pela metade.
   await transacao(async (client) => {
     await client.query("SELECT pg_advisory_xact_lock(124783991)");
+    await client.query("UPDATE public.planilha_abas SET ativa=false WHERE ativa=true");
+    const quote = v => "'"+String(v).replace(/'/g,"''")+"'";
+    const identifier = v => '"'+String(v).replace(/"/g,'""')+'"';
+    for (const tab of catalogos) {
+      await client.query(`INSERT INTO public.planilha_abas(planilha_id,aba,view_nome,colunas,celulas,linhas_lidas,registros,avisos,ativa,atualizada_em)
+        VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7,$8::jsonb,true,now())
+        ON CONFLICT(planilha_id,aba) DO UPDATE SET view_nome=EXCLUDED.view_nome,colunas=EXCLUDED.colunas,
+        celulas=EXCLUDED.celulas,linhas_lidas=EXCLUDED.linhas_lidas,registros=EXCLUDED.registros,
+        avisos=EXCLUDED.avisos,ativa=true,atualizada_em=now()`,
+        [planilhaId,tab.aba,tab.view,JSON.stringify(tab.colunas),JSON.stringify(tab.report?.celulas||[]),tab.report?.linhas_lidas??tab.rows.length,
+          limpas.filter(r=>r.aba_origem===tab.aba).length,JSON.stringify(tab.report?.avisos||[])]);
+      const projection=tab.colunas.map(c=>{
+        const expr='o.dados_extras ->> '+quote(c.chave);
+        return (c.tipo==='text'?expr:'('+expr+')::'+c.tipo)+' AS '+identifier(c.chave);
+      });
+      const definition=`SELECT o.id AS __registro_id,o.aba_origem AS __aba,o.linha_origem AS __linha,o.dados_extras AS __dados_originais
+        ${projection.length?', '+projection.join(', '):''} FROM public.obras o
+        WHERE o.planilha_id=${quote(planilhaId)} AND o.aba_origem=${quote(tab.aba)}`;
+      // Views de fonte versionadas pelo contrato de colunas evitam DROP/CASCADE quando o cabeçalho muda.
+      const version=createHash('sha256').update(JSON.stringify(tab.colunas)).digest('hex').slice(0,6);
+      const viewNome=tab.view+'_'+version;
+      await client.query('CREATE OR REPLACE VIEW planilha.'+identifier(viewNome)+' AS '+definition);
+      await client.query('GRANT SELECT ON planilha.'+identifier(viewNome)+' TO obras_chatbot_leitura');
+      await client.query('UPDATE public.planilha_abas SET view_nome=$1 WHERE planilha_id=$2 AND aba=$3',[viewNome,planilhaId,tab.aba]);
+    }
     await client.query("DELETE FROM public.obras;");
 
     for (let inicio = 0; inicio < limpas.length; inicio += TAMANHO_LOTE) {
@@ -354,10 +397,16 @@ export async function sincronizar({ lerDados = getObras, transacao = withAdminTr
       inseridas += bloco.length;
       console.log(`INGESTAO: lote inserido (${inseridas}/${limpas.length}).`);
     }
+    const conferido=await client.query('SELECT aba_origem, COUNT(*)::int AS registros FROM public.obras GROUP BY aba_origem');
+    for(const tab of catalogos) {
+      const expected=limpas.filter(r=>r.aba_origem===tab.aba).length;
+      const found=Number(conferido.rows.find(r=>r.aba_origem===tab.aba)?.registros||0);
+      if(expected!==found)throw new Error(`Conferência falhou na aba ${tab.aba}: esperado ${expected}, gravado ${found}.`);
+    }
     await client.query(`INSERT INTO public.obras_sync (id, atualizada_em, registros)
       VALUES (1, now(), $1) ON CONFLICT (id) DO UPDATE SET atualizada_em = EXCLUDED.atualizada_em, registros = EXCLUDED.registros`, [inseridas]);
   });
 
   console.log(`INGESTAO: ${inseridas} obras inseridas no banco.`);
-  return { inseridas };
+  return { inseridas, abas:catalogos.map(t=>({aba:t.aba,registros:limpas.filter(r=>r.aba_origem===t.aba).length})),planilha_id:planilhaId };
 }
