@@ -48,10 +48,13 @@ export function rowsToObjects(rows,tabName){
   if(!row.some(filled)){ignoradas++;continue;}
   const obj={_aba:tabName,_linha:i+1,...(avisos.length?{_avisos:avisos}:{})};let count=0;
   header.forEach((name,j)=>{
-   if(!name||!filled(row[j]))return;
-   const value=typeof row[j]==='string'?row[j].trim():row[j];
+   if(!name)return;
+   // Conserva colunas vazias: a ausência de pagamento num ano não é zero
+   // e o catálogo deve incluir cabeçalhos mesmo sem células preenchidas.
+   const hasValue=filled(row[j]);
+   const value=hasValue?(typeof row[j]==='string'?row[j].trim():row[j]):null;
    // Propriedade de dados, inclusive para um cabeçalho chamado __proto__.
-   Object.defineProperty(obj,name,{value,writable:true,enumerable:true,configurable:true});count++;
+   Object.defineProperty(obj,name,{value,writable:true,enumerable:true,configurable:true});count+=Number(hasValue);
   });
   if(!count){ignoradas++;continue;}
   // Repeated headers inside the same tab are not records.

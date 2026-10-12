@@ -1,6 +1,7 @@
 import DecimalBase from 'decimal.js';
 import {readFileSync} from 'node:fs';
 import {randomUUID} from 'node:crypto';
+import {paraCentavos,colunaMonetaria} from './moeda.js';
 
 const Decimal=DecimalBase.clone({precision:40,rounding:DecimalBase.ROUND_HALF_UP});
 export const schemaPlano=JSON.parse(readFileSync(new URL('./analise-plan.schema.json',import.meta.url),'utf8'));
@@ -77,19 +78,20 @@ function date(v,format='%d/%m/%Y'){
   if(out.getUTCFullYear()!==y||out.getUTCMonth()!==mo-1||out.getUTCDate()!==d)throw Error(`Data inválida: ${v}`);
   return out;
 }
-const BASE={columns:Object.fromEntries(['id_registro','aba','tipo_registro','objeto','rua','bairro','status','engenheiro','empresa'].map(c=>[c,{type:'text'}]).concat([['valor_total',{type:'money'}],['valor_executado',{type:'money'}]])),business_rules:[]};
+const BASE={columns:Object.fromEntries(['id_registro','aba','tipo_registro','objeto','rua','bairro','status','engenheiro','empresa'].map(c=>[c,{type:'text'}]).concat([['valor_total',{type:'money'}],['valor_executado',{type:'money'}],['valor_contratado',{type:'money'}],['valor_contratado_calculado',{type:'money'}],['valor_pago',{type:'money'}]])),business_rules:[]};
 
 function build(data,override){
   if(!Array.isArray(data)||!data.length)throw Error('Snapshot vazio ou inválido.');
   const config={...BASE,...override,columns:{...BASE.columns,...override.columns}};
   const warnings=new Set();
+  const sourceWarnings=new Map(data.map(r=>[r.id_registro,r.avisos_fonte||[]]));
   let records=data.map(record=>{
     for(const warning of record.avisos_fonte||[])warnings.add(String(warning));
-    const r=Object.fromEntries(Object.entries(record).filter(([k])=>!['avisos_fonte','dados_originais','valor_total_centavos','valor_total_formatado','valor_executado_centavos'].includes(k)));
+    const r=Object.fromEntries(Object.entries(record).filter(([k])=>k!=='avisos_fonte'&&k!=='dados_originais'&&k!=='valor_total_formatado'&&!k.endsWith('_centavos')));
     for(const [c,v] of Object.entries(record.dados_originais||{})){
       const name='original:'+c;r[name]=v;
     }
-    for(const name of ['valor_total','valor_executado']){
+    for(const name of ['valor_total','valor_executado','valor_contratado','valor_contratado_calculado','valor_pago']){
       const cents=record[name+'_centavos'];r[name]=cents==null?null:new Decimal(cents).div(100);
       if(record[name+'_invalido'])warnings.add(`Há ${name.replace(/_/g,' ')} inválido; análise financeira pode ficar parcial.`);
     }
@@ -102,13 +104,14 @@ function build(data,override){
     if(Object.hasOwn(config.columns,name))continue;
     const values=records.map(r=>r[name]).filter(v=>!empty(v));
     const identifier=/\b(?:cnpj|cpf|cep)\b/.test(norm(name.slice(9)));
-    if(!identifier&&values.length&&values.every(v=>typeof v==='number'&&Number.isFinite(v)))
+    if(colunaMonetaria(name.slice(9)))config.columns[name]={type:'money',locale:'auto'};
+    else if(!identifier&&values.length&&values.every(v=>typeof v==='number'&&Number.isFinite(v)))
       config.columns[name]={type:'number'};
   }
   const names=columns.map(c=>config.rename?.[c]??c.trim());
   if(new Set(names).size!==names.length)throw Error('Mapeamento de colunas duplicado.');
   const types=Object.fromEntries(names.map(c=>[c,config.columns[c]?.type||'text']));
-  const issues=new Map(),multipliers=new Map();
+  const issues=new Map(),issueRows=new Map(),multipliers=new Map();
   for(const name of names){
     const spec=config.columns[name]||{type:'text'};
     if(!['text','bool','date',...numericTypes].includes(spec.type))throw Error(`Tipo desconhecido em ${name}.`);
@@ -119,7 +122,11 @@ function build(data,override){
     const name=names[i],spec=config.columns[name]||{type:'text'};let v=empty(r[c])?null:r[c];
     try{
     if(numericTypes.has(spec.type)){
-      v=number(v,spec.locale||'en_US');if(v!==null)v=v.mul(multipliers.get(name));
+      if(spec.type==='money'&&spec.locale==='auto'){
+        const cents=paraCentavos(v);if(v!==null&&cents===null)throw Error('Moeda inválida; preserve e confira a fonte.');
+        v=cents===null?null:new Decimal(cents.toString()).div(100);
+      }else v=number(v,spec.locale||'en_US');
+      if(v!==null)v=v.mul(multipliers.get(name));
       if(spec.type==='percent'&&v!==null&&(v.lt(0)||v.gt(100)))warnings.add(`${name}: percentual fora de 0–100; confira a escala na fonte.`);
     }else if(spec.type==='date')v=date(v,spec.format);
     else if(spec.type==='bool'&&v!==null){
@@ -131,6 +138,7 @@ function build(data,override){
       // Mantém o valor bruto internamente e reporta amostras e referências.
       if(!issues.has(name))issues.set(name,{column:name,count:0,examples:[]});
       const issue=issues.get(name);issue.count++;
+      if(!issueRows.has(name))issueRows.set(name,new Set());issueRows.get(name).add(r.id_registro);
       if(issue.examples.length<3)issue.examples.push({id_registro:r.id_registro,aba:r.aba,
         value:String(r[c]).slice(0,160),reason:String(e.message).slice(0,200)});
       v=null;
@@ -157,7 +165,7 @@ function build(data,override){
     tipos_registro:[...t.tipos_registro].filter(Boolean),
     colunas:[...t.headers].map(header=>{const key='original:'+header;const queryName=config.rename?.[key]??key.trim();
       return {cabecalho:header,coluna_consulta:queryName,tipo:types[queryName]};})}));
-  return {records,rawRecords,types,metadata:{columns:profile,abas,rows:records.length,warnings:[...warnings],conversion_issues:[...issues.values()],business_rules:config.business_rules||[]}};
+  return {records,rawRecords,types,sourceWarnings,issueRows,metadata:{columns:profile,abas,rows:records.length,warnings:[...warnings],conversion_issues:[...issues.values()],business_rules:config.business_rules||[]}};
 }
 const compare=(a,b)=>a instanceof Decimal?a.comparedTo(b):a instanceof Date?Math.sign(a.getTime()-b.getTime()):a===b?0:a>b?1:-1;
 
@@ -181,7 +189,7 @@ function query(entry,input,includeRecords=false){
       r[d.name]=a===null||b===null?null:d.op==='days_between'?new Decimal(Math.floor((b-a)/86400000)):
         d.op==='add'?a.plus(b):d.op==='subtract'?a.minus(b):b.isZero()?null:a.div(b);
     }
-    types[d.name]='number';
+    types[d.name]=['add','subtract'].includes(d.op)&&types[d.left]==='money'&&types[d.right]==='money'?'money':'number';
   }
   function predicate(f){
     column(f.column);const type=types[f.column];
@@ -249,11 +257,16 @@ function query(entry,input,includeRecords=false){
   if(p.select.length)outputCols=p.select;
   const total=result.length;
   const rows=result.slice(p.offset,p.offset+p.limit).map(r=>Object.fromEntries(outputCols.map(c=>[c,serial(r[c])])));
-  const warnings=[];
+  const warnings=[...new Set(work.flatMap(r=>entry.sourceWarnings?.get(r.id_registro)||[]))];
+  const ids=new Set(work.map(r=>r.id_registro));
+  for(const issue of entry.metadata.conversion_issues||[])if(used.has(issue.column)&&([...p.filters,...p.any_filters].some(f=>f.column===issue.column)||[...(entry.issueRows?.get(issue.column)||[])].some(id=>ids.has(id))))
+    warnings.push(`${issue.column}: há valores inválidos no recorte; cálculos/filtros podem ficar incompletos, sem tratar erros como zero.`);
+  for(const c of used)if(work.some(r=>r[c+'_invalido']))warnings.push(`${c}: há valor inválido no recorte; análise financeira pode ficar parcial.`);
   if(!matched)warnings.push('Nenhum registro corresponde aos filtros. Isso não confirma que a obra não exista fora desta fonte.');
   if(Object.keys(missing).length)warnings.push('Há dados ausentes; cálculos ignoram campos vazios e não os tratam como zero.');
   if(total>p.offset+p.limit)warnings.push('Resultado parcial: há mais linhas. Use offset para continuar.');
-  const evidence={matched_source_rows:matched,
+  const moneyColumns=outputCols.filter(c=>types[c]==='money'||p.metrics.some(m=>m.name===c&&types[m.column]==='money'&&['sum','mean','min','max'].includes(m.op)));
+  const evidence={money_columns:moneyColumns,matched_source_rows:matched,
     source_samples:work.slice(0,20).map(r=>({id_registro:serial(r.id_registro),aba:serial(r.aba)})),
     source_samples_complete:matched<=20,
     selected_columns:outputCols,filters:p.filters,any_filters:p.any_filters,
@@ -320,7 +333,7 @@ export function criarMotor({now=()=>performance.now(),config}={}){
     else if(['executar','inspecionar'].includes(payload.acao)){
       const e=snapshots.get(payload.snapshot_id);if(!e)throw Error('Snapshot indisponível. Refaça a pergunta.');
       result=payload.acao==='inspecionar'?inspect(e,payload.inspecao):query(e,payload.plano);
-      result.warnings=[...new Set([...(result.warnings||[]),...e.metadata.warnings])];
+      result.warnings=[...new Set(result.warnings||[])];
       result.version=e.version;result.loaded_at=e.loaded_at;
     }else throw Error('Ação inválida.');
     if(Buffer.byteLength(JSON.stringify(result))>8*1024*1024)throw Error('Resultado maior que 8 MB. Reduza a consulta.');
