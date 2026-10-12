@@ -274,3 +274,19 @@ export async function registrarUsoConhecimento(ids = []) {
 }
 
 export { pool };
+
+// Uma versão consistente do banco durante todas as ferramentas da pergunta.
+export async function withReadSnapshot(executar) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    await client.query("SET LOCAL search_path = pg_catalog, public");
+    await client.query("SET LOCAL statement_timeout = '10s'");
+    const value = await executar(client);
+    await client.query('COMMIT');
+    return value;
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally { client.release(); }
+}

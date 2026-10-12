@@ -6,11 +6,12 @@
 //  FLEXIVEL: acha as colunas pelo NOME e aceita abas auxiliares/genéricas.
 //  Linhas de abas novas são preservadas no banco sem exigir código novo.
 //
-//  Estrategia de atualizacao: substitui tudo (TRUNCATE + INSERT).
+//  Estrategia de atualizacao: substitui tudo (DELETE + INSERT).
 //  Assim o banco fica sempre IGUAL a planilha - simples e seguro.
 // ============================================================
 
 import { getObras, limparCache } from "./sheets.js";
+import { decimalMoeda } from "./sqlUtils.js";
 import { withAdminTransaction } from "./db.js";
 
 // --- utilidades de limpeza ---
@@ -36,7 +37,8 @@ const MAPA = {
   bairro: ["bairro", "localizacao", "local", "distrito"],
   status: ["status", "situacao", "situacao atual", "fase"],
   valor_total: ["valor total da obra", "valor (r$)", "valor", "valor da obra", "valor contratado"],
-  valor_executado: ["valor executado", "valor pago", "executado"],
+  valor_executado: ["valor executado", "executado"],
+  valor_pago: ["valor pago", "total pago"],
   percentual_executado: ["% executada", "% executado", "percentual executado", "percentual"],
   engenheiro: ["engenheiro", "engenheiro responsavel", "engenheiro/arquiteto responsavel",
                "engenheiro/arquiteto", "responsavel tecnico", "responsavel"],
@@ -49,34 +51,26 @@ function pegar(obra, campo) {
   const chaves = Object.keys(obra);
   for (const sin of MAPA[campo]) {
     const achou = chaves.find((k) => norm(k) === sin);
-    if (achou && obra[achou]) return obra[achou];
+    if (achou !== undefined && obra[achou] !== null && obra[achou] !== undefined && String(obra[achou]).trim() !== "") return obra[achou];
   }
   return null;
 }
 
-function padronizarStatus(txt) {
+export function padronizarStatus(txt) {
   const s = norm(txt);
-  if (!s) return "";
-  // ORDEM IMPORTA. Primeiro identificamos ETAPAS ESPECIFICAS.
-  // Ex.: "Habilitacao em andamento" e uma etapa de LICITACAO, nao uma obra
-  // fisicamente em andamento. Antes a palavra "andamento" era testada primeiro
-  // e esses processos eram somados indevidamente como obras em execucao.
-  if (s.includes("elabora") || s.includes("em projeto") || s.includes("estudo")) return "Em projeto";
-  if (s.includes("licita") || s.includes("edital") || s.includes("propost") || s.includes("habilita")) return "Em licitação";
-  if (s.includes("homolog")) return "Homologada";
-  if (s.includes("parad") || s.includes("paralis") || s.includes("suspens")) return "Paralisada";
-  if (s.includes("iniciar")) return "A iniciar";
-  // Somente depois das etapas especificas tratamos execucao fisica.
-  if (s.includes("andamento") || s.includes("em obra") || s.includes("execu")) return "Em andamento";
-  // Concluida por ultimo: so classifica assim se o status for claramente isso
-  // (comeca com "conclu"/"finaliz" ou e exatamente a palavra), nao se "conclu"
-  // aparecer perdido no meio de uma frase.
-  if (s.startsWith("conclu") || s.startsWith("finaliz") ||
-      s === "concluida" || s === "concluido" || s === "finalizado" ||
-      s === "concluída" || s === "concluído") {
-    return "Concluída";
-  }
-  return (txt || "").toString().trim();
+  if (!s) return null;
+  // Apenas situações explícitas. Frases desconhecidas ficam preservadas.
+  const grupos = [
+    ['Concluída', /^(concluid[ao]s?|finalizad[ao]s?|concluida e entregue)$/],
+    ['Em andamento', /^(em andamento|em execucao|em obra|execucao)$/],
+    ['A iniciar', /^(a iniciar|nao iniciad[ao]|aguardando inicio|nao iniciado)$/],
+    ['Paralisada', /^(paralisad[ao]|suspens[ao]|parad[ao])$/],
+    ['Em projeto', /^(em projeto|em elaboracao|projeto em elaboracao)$/],
+    ['Em licitação', /^(em licitacao|licitacao|habilitacao em andamento)$/],
+    ['Homologada', /^homologad[ao]$/],
+  ];
+  for (const [nome, regex] of grupos) if (regex.test(s)) return nome;
+  return String(txt).trim();
 }
 
 // Converte numeros vindos do Google Sheets sem depender do formato visual.
@@ -146,7 +140,7 @@ function parseNumeroFlexivel(v, { separadorUnicoDecimal = false } = {}) {
 }
 
 function parseValor(v) {
-  return parseNumeroFlexivel(v);
+  return decimalMoeda(v);
 }
 
 // No banco, percentual_executado fica em PONTOS PERCENTUAIS para combinar
@@ -193,7 +187,7 @@ function objetoGenericoDaLinha(obra) {
   ];
 
   const entradas = Object.entries(obra)
-    .filter(([k, v]) => k !== "_aba" && v !== null && v !== undefined && String(v).trim() !== "");
+    .filter(([k, v]) => !k.startsWith("_") && v !== null && v !== undefined && String(v).trim() !== "");
 
   for (const termo of preferidas) {
     const achou = entradas.find(([k]) => norm(k).includes(norm(termo)));
@@ -221,60 +215,26 @@ function bairroDoNome(nome) {
   return null;
 }
 
-// Junta todos os nomes de coluna ja usados pelos campos fixos (com sinonimos),
-// pra saber quais colunas da planilha JA foram aproveitadas. O resto vira extra.
-const NOMES_FIXOS_USADOS = new Set();
-for (const campo of Object.keys(MAPA)) {
-  for (const sin of MAPA[campo]) NOMES_FIXOS_USADOS.add(sin);
-}
-
-// Coleta TODAS as outras colunas da planilha (as que nao viraram campo fixo)
-// num objeto "dados_extras". Assim NADA se perde: recurso, convenio, contrato,
-// aditivos, prazo, datas - tudo que a planilha tiver e nao for campo fixo entra
-// aqui, com o nome original da coluna. Se a planilha ganhar coluna nova amanha,
-// ela entra sozinha, sem mexer no codigo.
-function ehAbaCanonica(aba) {
-  const n = norm(aba);
-  return n === "em_andamento" ||
-         n === "em_licitacao" ||
-         n === "em_projeto" ||
-         n === "pavimentacao";
-}
-
 function coletarExtras(obra) {
-  const extras = {};
-  const preservarTudo = !ehAbaCanonica(obra?._aba);
-
-  for (const chave of Object.keys(obra || {})) {
-    if (chave === "_aba") continue; // controle interno, ignora
-
-    // Nas 4 abas principais evitamos duplicar campos que já viraram colunas
-    // canônicas. Em abas auxiliares/nova, preservamos tudo para não perder dado.
-    if (!preservarTudo && NOMES_FIXOS_USADOS.has(norm(chave))) continue;
-
-    const bruto = obra[chave];
-    const valor = bruto === null || bruto === undefined ? "" : bruto.toString().trim();
-    if (valor) extras[chave.trim()] = valor;
-  }
-
-  if (obra?._aba) extras["ABA ORIGEM"] = obra._aba;
-  return Object.keys(extras).length ? extras : null;
+  // Todas as células, inclusive vazias e zeros, com nomes e tipos originais.
+  return Object.fromEntries(Object.entries(obra || {}).filter(([k]) => !k.startsWith('_')));
 }
 
 // Transforma uma obra crua (da planilha) numa linha limpa pro banco.
-function limpar(obra) {
+export function limpar(obra) {
+  if (!obra || typeof obra !== "object" || Array.isArray(obra) || !Object.entries(obra).some(([k,v]) => !k.startsWith("_") && v != null && String(v).trim() !== "")) return null;
   // Abas tradicionais usam OBJETO/OBRA/RUA. Abas auxiliares ou futuras
   // podem ter outros cabeçalhos; não descartamos mais a linha só por isso.
   const objeto = pegar(obra, "objeto") || objetoGenericoDaLinha(obra);
   if (!objeto) return null; // só ignora linha realmente sem conteúdo útil
   const categoria = categoriaDaAba(obra._aba);
   const statusOriginal = (pegar(obra, "status") || "").toString().trim();
-  const statusNormalizado = padronizarStatus(statusOriginal) || categoria;
+  const statusNormalizado = padronizarStatus(statusOriginal) || null;
 
   // bairro: primeiro tenta a coluna; se vazia, tenta extrair do nome.
   let bairro = (pegar(obra, "bairro") || "").toString().trim();
   if (!bairro) {
-    bairro = bairroDoNome(objeto) || "";
+    if (norm(obra._aba).includes("paviment")) bairro = bairroDoNome(objeto) || "";
   }
 
   // Mantemos tambem o texto ORIGINAL do status dentro de dados_extras.
@@ -282,13 +242,45 @@ function limpar(obra) {
   // confundir essa etapa com uma obra fisicamente em andamento.
   const extras = coletarExtras(obra) || {};
   if (statusOriginal) extras["STATUS ORIGINAL"] = statusOriginal;
+  const avisos = [...(Array.isArray(obra._avisos) ? obra._avisos : [])];
+  const anos = Object.entries(obra).filter(([k]) => /^valor pago \d{4}$/.test(norm(k)));
+  const pagamentos = anos.map(([,v]) => parseValor(v));
+  const pagoDireto = parseValor(pegar(obra, "valor_pago"));
+  const somar = vals => {
+    const presentes = vals.filter(v => v !== null);
+    if (!presentes.length) return null;
+    const cents = presentes.reduce((acc,v) => acc + BigInt(v.replace('.', '')), 0n);
+    const abs = cents < 0n ? -cents : cents;
+    return `${cents < 0n ? '-' : ''}${abs / 100n}.${String(abs % 100n).padStart(2, '0')}`;
+  };
+  if (anos.length && pagamentos.some(v => v === null)) avisos.push('Pagamentos anuais incompletos: a soma disponível é parcial.');
+  for (const c of ['valor_total', 'valor_executado', 'valor_pago']) {
+    const bruto = pegar(obra,c);
+    if (bruto != null && parseValor(bruto) === null) avisos.push(`${c}: valor inválido; original preservado.`);
+  }
+  const componentes = ['valor inicial do contrato','valor total dos aditivos','valor total dos reajustes'].map(nome => {
+    const key = Object.keys(obra).find(k => norm(k) === nome);
+    return parseValor(key === undefined ? null : obra[key]);
+  });
+  const calculado = componentes.every(v => v !== null) ? somar(componentes) : null;
+  const total = parseValor(pegar(obra, 'valor_total'));
+  if (calculado !== null && total !== null && calculado !== total) avisos.push('Valor total diverge de inicial + aditivos + reajustes.');
+  const n = norm(obra._aba);
+  const tipo = n.includes('projeto') ? 'projeto' : n.includes('licit') ? 'licitacao' : n.includes('pendenc') ? 'pendencia' : n.includes('paviment') ? 'pavimentacao' : 'outro';
 
   return {
     objeto: objeto.toString().trim(),
     bairro: bairro || null,
     status: statusNormalizado,
     categoria,
-    valor_total: parseValor(pegar(obra, "valor_total")),
+    valor_total: total,
+    valor_contratado: total ?? calculado,
+    valor_contratado_calculado: calculado,
+    valor_pago: pagoDireto ?? somar(pagamentos),
+    tipo_registro: tipo === "outro" && pegar(obra,"objeto") && Object.keys(obra).some(k => norm(k) === "objeto da obra") ? "obra" : tipo,
+    linha_origem: Number.isInteger(Number(obra._linha)) ? Number(obra._linha) : null,
+    status_original: statusOriginal || null,
+    avisos_fonte: avisos,
     valor_executado: parseValor(pegar(obra, "valor_executado")),
     percentual_executado: parsePercentual(pegar(obra, "percentual_executado")),
     engenheiro: (pegar(obra, "engenheiro") || "").toString().trim() || null,
@@ -299,22 +291,24 @@ function limpar(obra) {
 }
 
 // Roda a ingestao completa: le planilha -> limpa -> substitui no banco.
-export async function sincronizar() {
+export async function sincronizar({ lerDados = getObras, transacao = withAdminTransaction } = {}) {
   console.log("INGESTAO: lendo planilha...");
   limparCache(); // forca releitura da planilha fresca (ignora cache velho)
-  const cruas = await getObras();
+  const cruas = await lerDados({force:true});
+  if (!Array.isArray(cruas)) throw new Error("Leitura da planilha inválida; banco preservado.");
   const limpas = cruas.map(limpar).filter(Boolean);
   console.log(`INGESTAO: ${cruas.length} linhas lidas, ${limpas.length} obras limpas.`);
 
   if (limpas.length === 0) {
     console.log("INGESTAO: nenhuma obra para inserir. Abortando (nao apaga o banco).");
-    return { inseridas: 0 };
+    throw new Error("Planilha sem registros úteis; banco anterior preservado.");
   }
 
   // Insere em lote.
   const campos = ["objeto","bairro","status","categoria","valor_total",
     "valor_executado","percentual_executado","engenheiro","empresa","aba_origem",
-    "dados_extras"];
+    "dados_extras", "tipo_registro", "linha_origem", "status_original", "valor_pago",
+    "valor_contratado", "valor_contratado_calculado", "avisos_fonte"];
 
   // INSERCAO EM LOTE: junta varias obras numa unica query, em blocos.
   // Antes era uma query por obra (2000 obras = 2000 idas ao banco = timeout).
@@ -326,16 +320,17 @@ export async function sincronizar() {
 
   function valoresDaObra(o) {
     return campos.map((c) => {
-      if (c === "dados_extras") return o[c] ? JSON.stringify(o[c]) : null;
+      if (c === "dados_extras" || c === "avisos_fonte") return o[c] ? JSON.stringify(o[c]) : null;
       return o[c];
     });
   }
 
-  // TRUNCATE + TODOS os lotes ficam na mesma transacao. O PostgreSQL torna o
-  // TRUNCATE transacional: se um INSERT falhar, o banco volta integralmente ao
+  // DELETE + TODOS os lotes ficam na mesma transacao. O PostgreSQL torna a
+  // substituição transacional: se um INSERT falhar, o banco volta integralmente ao
   // estado anterior, sem ficar vazio ou pela metade.
-  await withAdminTransaction(async (client) => {
-    await client.query("TRUNCATE TABLE obras RESTART IDENTITY;");
+  await transacao(async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(124783991)");
+    await client.query("DELETE FROM public.obras;");
 
     for (let inicio = 0; inicio < limpas.length; inicio += TAMANHO_LOTE) {
       const bloco = limpas.slice(inicio, inicio + TAMANHO_LOTE);
@@ -353,12 +348,14 @@ export async function sincronizar() {
       });
 
       await client.query(
-        `INSERT INTO obras (${campos.join(",")}) VALUES ${gruposMarcadores.join(",")}`,
+        `INSERT INTO public.obras (${campos.join(",")}) VALUES ${gruposMarcadores.join(",")}`,
         todosValores
       );
       inseridas += bloco.length;
       console.log(`INGESTAO: lote inserido (${inseridas}/${limpas.length}).`);
     }
+    await client.query(`INSERT INTO public.obras_sync (id, atualizada_em, registros)
+      VALUES (1, now(), $1) ON CONFLICT (id) DO UPDATE SET atualizada_em = EXCLUDED.atualizada_em, registros = EXCLUDED.registros`, [inseridas]);
   });
 
   console.log(`INGESTAO: ${inseridas} obras inseridas no banco.`);
