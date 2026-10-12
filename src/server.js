@@ -238,8 +238,6 @@ app.get("/testar-agente", async (req, res) => {
       historico: [...historicoTeste, ...novasMensagens],
     });
 
-    const respostaPublica = { pergunta, sessao, resposta: r.resposta };
-    if (req.query.debug !== 'true') return res.json(respostaPublica);
     res.json({
       pergunta,
       sessao,
