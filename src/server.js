@@ -210,7 +210,7 @@ app.get("/sincronizar", (req, res) => {
 app.get("/testar-agente", async (req, res) => {
   if (!exigirAdmin(req, res)) return;
   const pergunta = req.query.q;
-  if (!pergunta) return res.json({ erro: "passe a pergunta em ?q=..." });
+  if (!pergunta) return res.json({ resposta: "Digite sua pergunta sobre as obras." });
 
   // Memoria somente em RAM. Use ?sessao=nome para separar conversas de teste.
   // A sessao expira apos 30 minutos sem atividade e nao grava nada no banco.
@@ -238,6 +238,8 @@ app.get("/testar-agente", async (req, res) => {
       historico: [...historicoTeste, ...novasMensagens],
     });
 
+    const respostaPublica = { pergunta, sessao, resposta: r.resposta };
+    if (req.query.debug !== 'true') return res.json(respostaPublica);
     res.json({
       pergunta,
       sessao,
@@ -252,7 +254,8 @@ app.get("/testar-agente", async (req, res) => {
       erro: r.erro || null,
     });
   } catch (e) {
-    res.status(500).json({ erro: e.message });
+    console.error('Erro no teste do agente:', e.message);
+    res.status(500).json({ resposta: 'Não consegui responder agora. Pode tentar novamente?' });
   }
 });
 

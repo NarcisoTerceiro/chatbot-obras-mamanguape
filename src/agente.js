@@ -1,6 +1,7 @@
 // Pergunta -> contexto semântico + ferramentas SQL -> PostgreSQL -> resposta.
 import { withReadSnapshot, buscarConhecimentoAprovado } from './db.js';
 import { validarSQL, recuperarContexto, filtrosExatosBairro } from './sqlUtils.js';
+import { conferirConsulta, respostaConferida, textoPublico } from './resposta.js';
 const texto = v => v == null ? '' : String(v).trim();
 const ident = s => '"' + s.replace(/"/g, '""') + '"';
 const tool = (name, description, properties, required = []) => ({type:'function',function:{name,description,parameters:{type:'object',properties,required,additionalProperties:false}}});
@@ -14,6 +15,8 @@ export const FERRAMENTAS = Object.freeze([
 export const FERRAMENTAS_CONSULTA = FERRAMENTAS.filter(t=>t.function.name==='consultarBanco');
 export const FERRAMENTAS_INSPECAO = FERRAMENTAS.filter(t=>!['consultarBanco','pedirEsclarecimento'].includes(t.function.name));
 const PROMPT = `Você é o agente de dados das obras de Mamanguape. Entenda a pergunta em português, decida os filtros e cálculos, use ferramentas e responda com evidências do banco.
+REGRAS DE CONFERÊNCIA: perguntas sobre obras, inclusive ranking geral de engenheiros, usam apenas obras físicas (tipo_negocio='obra'), salvo pedido explícito de projetos, licitações ou todos os registros. Ranking de maior/menor deve retornar TODOS os empatados: use CTE com GROUP BY e selecione a métrica igual a MAX/MIN, nunca LIMIT 1. SUM(campo) exige COUNT(*) e COUNT(campo) separados; COUNT(*) não comprova preenchimento. Saúde inclui UBS, hospital, CAPS e unidades de saúde pelo objeto e recurso FNS/Ministério da Saúde; FNDE, escola e creche são educação. Inspecione os nomes reais para definir a área. Investido é ambíguo: se não houver definição no contexto, pergunte se deseja contratado, executado ou pago; nunca escolha executado silenciosamente.
+RESPOSTA AO CIDADÃO: nunca cite banco, planilha, SQL, SELECT, view, tabela, coluna, NULL, tipo_negocio, campos, API, provedores, tokens ou mecanismos internos. Diga apenas obras, valores, situação e ausências relevantes em português comum. Não explique como buscou. Não inclua observações técnicas. Para ausência de valores, diga quantas obras não têm o valor informado. Para empate, informe todos os responsáveis empatados. Não invente informações além do resultado da ferramenta.
 A pergunta atual define o escopo. O histórico serve para referências como essas/dessas/quais são; uma pergunta independente não herda filtros antigos.
 Prefira public.obras_chatbot; quando a view antiga não expuser um campo, use public.obras. São duas representações dos mesmos registros: não somar nem unir seus resultados como registros diferentes.
 As abas são preservadas em public.planilha_abas; ativa=true identifica a planilha atual. Para perguntas sobre um campo específico de uma aba, use a view correspondente no schema planilha informada pelo catálogo. Ela expõe os cabeçalhos daquela aba como colunas. Não invente nomes de views. Cada linha tem __registro_id, __aba, __linha e __dados_originais para origem. Views por aba e obras são representações dos mesmos registros; não somar em duplicidade. A matriz celulas contém a leitura original incluindo títulos/linhas não interpretadas e só deve ser consultada em trechos se a pergunta precisar de algo não exposto. Totais, cabeçalhos repetidos e resumos não são obras individuais. Obras físicas, projetos, licitações, pendências e abas financeiras têm significados diferentes.
@@ -31,32 +34,6 @@ Antes de redigir, confira se o critério executado responde à pergunta. Consult
 Uma consulta correta com resultado suficiente permite responder imediatamente, sem uma segunda chamada obrigatória de validação. Não responda fatos sem consultarBanco. Se não houver dados ou houver ambiguidade impeditiva, explique ou use pedirEsclarecimento.
 Formate para WhatsApp: português claro, abertura curta, obras em blocos, *negrito* simples. Não exponha SQL, tokens nem detalhes internos no texto; esses dados retornam em diagnóstico.
 Para listagens extensas use ORDER BY estável e LIMIT/OFFSET; se houver mais linhas, informe que a lista é parcial e não apresente sua quantidade como total.`;
-
-function respostaDireta(resultado) {
-  const rows=resultado.rows || [];
-  if(!rows.length) return 'A consulta ao banco não retornou registros para o critério usado.';
-  const labels={objeto:'Obra',bairro:'Bairro',status:'Situação',status_original:'Situação original',empresa:'Empresa',engenheiro:'Engenheiro',valor_total:'Valor total',valor_executado:'Valor executado',percentual_executado:'Percentual executado'};
-  const value=(k,v)=>{
-    if(v==null)return 'não informado';
-    if(typeof v==='object') {const j=JSON.stringify(v);return j.length>250?j.slice(0,250)+'… (abreviado)':j;}
-    const raw=String(v);
-    if(/^valor_|^quanto_falta$/.test(k)) {
-      const m=raw.match(/^(-?)(\d+)(?:\.(\d+))?$/);
-      if(m)return `${m[1]}R$ ${m[2].replace(/\B(?=(\d{3})+(?!\d))/g,'.')},${(m[3]||'').padEnd(2,'0')}`;
-    }
-    return raw.length>350?raw.slice(0,350)+'… (abreviado)':raw;
-  };
-  const blocks=['*Dados retornados pelo banco*'];
-  let shown=0;
-  for(const row of rows.slice(0,30)) {
-    const block='• '+Object.entries(row).filter(([k])=>k!=='id').map(([k,v])=>`${labels[k]||k.replace(/_/g,' ')}: ${value(k,v)}`).join('\n');
-    if(blocks.join('\n\n').length+block.length>3400 && shown>0)break;
-    blocks.push(block);shown++;
-  }
-  if(shown<rows.length||resultado.has_more)blocks.push(`Exibição parcial: ${shown} linhas mostradas. Isso não é uma contagem do total de obras.`);
-  blocks.push('A IA não conseguiu redigir a resposta; os dados da consulta foram preservados.');
-  return blocks.join('\n\n');
-}
 
 async function catalogo(client) {
   const r = await client.query(`SELECT c.table_schema AS schema_name, c.table_name, c.column_name, c.data_type, c.ordinal_position,
@@ -112,7 +89,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
           const msg=out.message, calls=msg?.tool_calls||[];
           if(!calls.length) {
             if(!ultimoResultado||erroPendente) throw Error('A IA não concluiu uma consulta válida para esta pergunta.');
-            const resposta=texto(msg?.content).replace(/\*\*([^*]+)\*\*/g,'*$1*');
+            const resposta=respostaConferida(ultimoResultado,q) || textoPublico(msg?.content);
             if(!resposta) throw Error('Resposta da IA vazia.');
             if(id) {
               if(sessions.size>=200 && !sessions.has(id)) sessions.delete(sessions.keys().next().value);
@@ -153,6 +130,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
                 if(errosSQL>=3) throw Error('Limite de correções SQL atingido. Peça esclarecimento ou explique a impossibilidade.');
                 erroPendente=true;resultadoAtualValido=false;
                 const sql=validarSQL(a.sql),params=a.params??[];
+                conferirConsulta(sql,q,estrutura);
                 if(!Array.isArray(params)||params.length>100||params.some(v=>v!==null&&!['string','number','boolean'].includes(typeof v))) throw Error('Parâmetros SQL inválidos.');
                 if(!texto(a.criterio)) throw Error('Informe o critério escolhido.');
                 if (a.bairro_exato !== true) {
@@ -175,6 +153,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
                 }
                 const r=await safeQuery(`SELECT * FROM (${sql}) AS resultado_agente LIMIT 201`,params);
                 result={status:'ok',rows:r.rows.slice(0,200),columns:r.fields?.map(f=>f.name)||[],has_more:r.rows.length>200,
+                  quantidade_retornada:Math.min(r.rows.length,200),
                   criterio:a.criterio,sql,limite_transporte:200,
                   orientacao:r.rows.length===0?'Nenhuma linha. Isso pode ser correto; não relaxe filtros automaticamente.':'Confira a correspondência com a pergunta; contagens/totais devem vir da agregação SQL.'};
                 ultimoSQL=sql; ultimoResultado=result; erroPendente=false;resultadoAtualValido=true;
@@ -191,16 +170,16 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
             }
             messages.push({role:'tool',tool_call_id:call.id,content:JSON.stringify(result)});
           }
-          if(esclarecimento) return {...base,resposta:esclarecimento,sql:ultimoSQL,diagnostico:{provider,trace,esclarecimento:true}};
+          if(esclarecimento) return {...base,resposta:textoPublico(esclarecimento),sql:ultimoSQL,diagnostico:{provider,trace,esclarecimento:true}};
         }
         throw Error('O agente atingiu o limite de ferramentas sem concluir a resposta.');
       });
     } catch(e) {
       const falha=texto(e.message);
-      if(resultadoAtualValido && ultimoResultado) return {...base,resposta:respostaDireta(ultimoResultado),sql:ultimoSQL,
+      if(resultadoAtualValido && ultimoResultado) return {...base,resposta:respostaConferida(ultimoResultado,q) || 'Não consegui preparar a resposta agora. Pode tentar novamente?',sql:ultimoSQL,
         linhas:ultimoResultado.rows.length,erro:'',estado:{fonte:'sql',pergunta:q},
         diagnostico:{provider,trace,resultado:ultimoResultado,erro_redacao:falha,redacao:'dados_do_banco'}};
-      return {...base,resposta:'Não consegui concluir a consulta aos dados. '+falha,erro:falha,sql:ultimoSQL,
+      return {...base,resposta:'Não consegui responder agora. Pode tentar novamente?',erro:falha,sql:ultimoSQL,
         linhas:ultimoResultado?.rows?.length||0,diagnostico:{provider,trace,resultado:ultimoResultado}};
     }
   }
