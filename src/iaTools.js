@@ -15,7 +15,9 @@ export function criarChamadorTools({ env = process.env, fetchImpl = globalThis.f
   return async function chamar(messages, tools, options = {}) {
     if (typeof fetchImpl !== 'function') throw Error('Use Node.js 18 ou superior.');
     if (!Array.isArray(messages) || !messages.length) throw Error('Lista de mensagens inválida.');
-    if (!Array.isArray(tools) || !tools.length) throw Error('Catálogo de ferramentas inválido.');
+    if (!Array.isArray(tools)) throw Error('Catálogo de ferramentas inválido.');
+    if (!tools.length && options.tool_choice === 'required') throw Error('Uma chamada que exige ferramenta precisa de um catálogo não vazio.');
+    const started=Date.now();let httpRequests=0;
     let configs = configuracoes(env);
     // Mantém preferência pelo provedor atual, permitindo fallback em falha.
     const atual = options.provider;
@@ -47,12 +49,13 @@ export function criarChamadorTools({ env = process.env, fetchImpl = globalThis.f
         return result;
       }) : messages;
       for(let attempt=0;attempt<2;attempt++) {
-        const body={model:c.modelo,messages:providerMessages,tools,
-          tool_choice:options.tool_choice || 'auto',
+        const body={model:c.modelo,messages:providerMessages,
           max_tokens:attempt ? Math.min(cap, Math.max(initialTokens+512,initialTokens*2)) : initialTokens,
           stream:false};
+        if(tools.length){body.tools=tools;body.tool_choice=options.tool_choice || 'auto';}
         if(gptoss && ['nvidia','groq'].includes(c.nome)) body.reasoning_effort=attempt?'low':effort;
         try {
+          httpRequests++;
           const res=await fetchImpl(url.toString(),{method:'POST',headers:{Authorization:`Bearer ${c.chave}`,'Content-Type':'application/json'},
             body:JSON.stringify(body),signal:AbortSignal.timeout(timeout)});
           if(!res.ok) {erros.push(`${c.nome}: HTTP ${res.status}`);break;}
@@ -70,13 +73,13 @@ export function criarChamadorTools({ env = process.env, fetchImpl = globalThis.f
               erros.push(`${c.nome}: chamada incompatível com o catálogo`);break;
             }
           }else if(body.tool_choice==='required') {erros.push(`${c.nome}: resposta sem ferramenta exigida`);break;}
-          return {provider:c.nome,model:c.modelo,message};
+          return {provider:c.nome,model:c.modelo,message,http_requests:httpRequests,elapsed_ms:Date.now()-started,usage:json.usage||null};
         }catch(e) {
           erros.push(`${c.nome}: ${['TimeoutError','AbortError'].includes(e?.name)?'tempo limite excedido':'falha de conexão ou resposta inválida'}`);break;
         }
       }
     }
-    throw Error(`Não foi possível chamar a IA. ${erros.join('; ')}.`);
+    const error=Error(`Não foi possível chamar a IA. ${erros.join('; ')}.`);error.http_requests=httpRequests;throw error;
   };
 }
 export const chamarIAComTools = criarChamadorTools();
