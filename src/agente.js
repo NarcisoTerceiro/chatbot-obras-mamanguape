@@ -49,6 +49,25 @@ function identificacoesProjetadas(ast) {
   project(selectors);
   return allowed;
 }
+// Contrato de métricas explícitas: não presume o significado de "investido".
+export function metricasPedidas(pergunta) {
+  const q=norm(pergunta), campos=[];
+  if(/\b(?:pag[oa]s?|pagamentos?)\b/.test(q))campos.push('valor_pago');
+  if(/valor|quanto|total|soma|montante|pag[oa]|pagamento|contratad/.test(q)&&/\b(?:executad[oa]s?|excutad[oa]s?)\b/.test(q))campos.push('valor_executado');
+  if(/\bcontratad[oa]s?\b/.test(q))campos.push('valor_contratado');
+  return campos;
+}
+function metricasProjetadas(sql) {
+  const result=new Set();
+  visit(parse(sql),n=>{if(n.type==='select')for(const c of n.columns||[])visit(c.expr,v=>{if(v.type==='ref')result.add(v.name);});});
+  if(result.has('valor_total'))result.add('valor_contratado');
+  return result;
+}
+function selecaoDosResultados(results) {
+  const rows=results.flatMap(r=>r.rows||[]);
+  if(!rows.length||rows.length>200||results.some(r=>r.has_more)||rows.some(r=>r.id==null||typeof r.objeto!=='string'))return null;
+  return [...new Map(rows.map(r=>[String(r.id),{id:r.id,objeto:r.objeto}])).values()];
+}
 // Conferência da consulta antes da execução; nunca troca filtros silenciosamente.
 export function conferirConsulta(sql, pergunta, catalogo=[]) {
   const q=norm(pergunta), ast=parse(sql), calls=[], refs=[], tables=[];
@@ -191,6 +210,7 @@ const texto = v => v == null ? '' : String(v).trim();
 const ident = s => '"' + s.replace(/"/g, '""') + '"';
 const tool = (name, description, properties, required = []) => ({type:'function',function:{name,description,parameters:{type:'object',properties,required,additionalProperties:false}}});
 export const FERRAMENTAS = Object.freeze([
+  tool('consultarSelecao','Consulta atributos atuais das mesmas obras identificadas na resposta anterior, sem refazer filtros de área. Node aplica os IDs guardados. Use para detalhes dessas obras. Escolha colunas existentes de public.obras.',{colunas:{type:'array',items:{type:'string'},minItems:1,maxItems:20}},['colunas']),
   tool('planejarConsulta','Registre as partes do pedido antes de consultar. Use uma parte por resultado independente; não invente filtros. Ex.: pedidos de duas áreas exigem duas partes. IDs identificam resultados e correções.', {partes:{type:'array',minItems:1,maxItems:8,items:{type:'object',properties:{id:{type:'string'},pergunta:{type:'string'}},required:['id','pergunta'],additionalProperties:false}}},['partes']),
   tool('listarTabelas', 'Lista as relações permitidas. Para ver cabeçalhos e tipos de uma aba específica, informe tabela e schema exatamente como no catálogo.', {tabela:{type:'string'},schema:{type:'string',enum:['public','planilha']}}),
   tool('listarCamposOriginais', 'Descobre todos os cabeçalhos originais em dados_extras por aba, com contagens. Paginado; não traz a planilha inteira.', {offset:{type:'integer',minimum:0},limite:{type:'integer',minimum:1,maximum:100}}),
@@ -202,7 +222,8 @@ export const FERRAMENTAS_CONSULTA = FERRAMENTAS.filter(t=>t.function.name==='con
 export const FERRAMENTAS_INSPECAO = FERRAMENTAS.filter(t=>!['consultarBanco','pedirEsclarecimento'].includes(t.function.name));
 const pagamentoExplicito = q => /\b(pago|pagos|paga|pagas|pagamento|pagamentos)\b/.test(norm(q));
 const alegacaoDeFalha = s => /limitacao|temporari|acesso aos dados|indisponiv|tente.*(?:novamente|minutos)|tentar.*(?:novamente|minutos)|abordagem diferente|nao (?:foi possivel|consegui) (?:obter|consultar|acessar)/.test(norm(s));
-const PROMPT = `PLANEJAMENTO E ENCERRAMENTO: para pedidos compostos, registre todas as partes com planejarConsulta antes de executar. Cada consultarBanco deve indicar parte. Uma parte pode usar SELECT/CTE/UNION; para duas áreas, respeite a quantidade pedida em cada área separadamente, com ORDER BY estável. Inspeção de catálogo não é resposta. Assim que todas as partes tiverem resultados suficientes, redija a resposta usando todas elas; não repita ferramentas nem faça conferências indefinidas. Se faltar uma parte, não apresente resultado parcial como resposta completa. Não exclua registros TESTE sem pedido. Respostas curtas como 'os 3' respondem ao esclarecimento pendente; resolva-as pelo contexto, sem perguntar novamente o que já foi escolhido.
+const PROMPT = `CONTINUIDADE: inclua id e objeto em listas de obras para identificar os registros entre mensagens. Ao pedir novos atributos DESSAS obras, use consultarSelecao se houver seleção guardada. A pergunta atual determina os atributos; nunca copie o plano anterior ignorando o novo pedido. Para perguntas independentes, não reutilize a seleção anterior. Não exponha os IDs na resposta.
+PLANEJAMENTO E ENCERRAMENTO: para pedidos compostos, registre todas as partes com planejarConsulta antes de executar. Cada consultarBanco deve indicar parte. Uma parte pode usar SELECT/CTE/UNION; para duas áreas, respeite a quantidade pedida em cada área separadamente, com ORDER BY estável. Inspeção de catálogo não é resposta. Assim que todas as partes tiverem resultados suficientes, redija a resposta usando todas elas; não repita ferramentas nem faça conferências indefinidas. Se faltar uma parte, não apresente resultado parcial como resposta completa. Não exclua registros TESTE sem pedido. Respostas curtas como 'os 3' respondem ao esclarecimento pendente; resolva-as pelo contexto, sem perguntar novamente o que já foi escolhido.
 Você é o agente de dados das obras de Mamanguape. Entenda a pergunta em português, decida os filtros e cálculos, use ferramentas e responda com evidências do banco.
 INTENÇÃO: "quais"/"quem"/"nomes" pede identificações, não apenas contagem. Consulte os nomes na coluna real do catálogo e use DISTINCT quando o usuário quiser a lista de responsáveis únicos. "Quais os engenheiros dessas obras" exige engenheiro, mantendo os filtros das obras referidas (por exemplo, bairro Centro), sem impor status que não foi pedido. Para "quantos engenheiros", conte os responsáveis distintos, não as obras. Se o cidadão questionar uma resposta inadequada ("como assim 21?"), retome a pergunta que ela deveria responder e corrija a consulta; não repita a contagem errada. Uma consulta executável que responde outra pergunta precisa ser corrigida antes da redação.
 REDAÇÃO LIVRE: formule uma resposta natural adaptada ao pedido, sem respostas prontas por assunto. Preserve todos os nomes e valores relevantes do resultado: uma contagem agrupada exige o nome do grupo e sua quantidade, seja bairro, responsável, empresa, categoria, recurso ou qualquer outro agrupamento. Não responda só o número. Novos cálculos devem ser consultados antes de redigir. Não invente números, exemplos ou entidades. Quando houver empate, preserve todos os empatados. As instruções de apresentação não limitam quais perguntas ou colunas podem ser consultadas.
@@ -258,7 +279,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
     const resultados=()=>[...evidencias.values()];
     const conjunto=()=>({rows:resultados().flatMap(r=>r.rows),sql:resultados().map(r=>r.sql).join('; '),contagens:resultados().map(r=>r.rows.length)});
     const completo=()=>evidencias.size>0&&!pendentes.size&&[...partes.keys()].every(k=>evidencias.has(k));
-    const guardar=()=>{if(id){if(sessions.size>=200&&!sessions.has(id))sessions.delete(sessions.keys().next().value);sessions.set(id,{last:now(),contexto:{pergunta:q,consultas:resultados().map(r=>({sql:r.sql,params:r.params,criterio:r.criterio,parte:r.parte})),sql:ultimoSQL,criterio:ultimoResultado?.criterio}});}};
+    const guardar=(resposta='')=>{if(id){if(sessions.size>=200&&!sessions.has(id))sessions.delete(sessions.keys().next().value);sessions.set(id,{last:now(),contexto:{pergunta:q,consultas:resultados().map(r=>({sql:r.sql,params:r.params,criterio:r.criterio,parte:r.parte})),sql:ultimoSQL,criterio:ultimoResultado?.criterio,selecao:resposta?selecaoDosResultados(resultados().map(r=>({...r,rows:r.rows.filter(row=>typeof row.objeto==='string'&&norm(resposta).includes(norm(row.objeto)))}))):null}});}};
     const diagnostico=()=>({provider,trace,resultados:resultados(),plano:[...partes].map(([id,pergunta])=>({id,pergunta,concluida:evidencias.has(id)&&!pendentes.has(id)}))});
     try {
       const previous=sessions.get(id);
@@ -275,6 +296,8 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
         if(anterior) messages.push({role:'system',content:'Consulta anterior, apenas para resolver referências explícitas. A nova pergunta será executada na versão atual do banco:\n'+JSON.stringify(anterior.contexto)});
         const referenciaSemContexto=/\b(dessas|destas|desses|destes|essas|estas)\b/.test(norm(q))&&!anterior&&!context.length;
         const pagoDefinido=pagamentoExplicito(q)&&!referenciaSemContexto;
+        const retomarSelecao=/\b(dessas|destas|desses|destes|essas|estas|mesmas)\b/.test(norm(q))&&Array.isArray(anterior?.contexto?.selecao)&&anterior.contexto.selecao.length>0;
+        const camposPedidos=metricasPedidas(q);
         const ferramentasAtuais=pagoDefinido?FERRAMENTAS.filter(t=>t.function.name!=='pedirEsclarecimento'):FERRAMENTAS;
         messages.push({role:'user',content:q});
         let erroPendente=false,semConsulta=0,reparosRedacao=0,repeticoes=0;
@@ -287,7 +310,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
         for(let rodada=1;rodada<=11;rodada++) {
           const finalizar=rodada===11||repeticoes>=2||(partes.size>0&&completo()&&reparosRedacao===0);
           if(finalizar)messages.push({role:'system',content:'Encerre agora sem ferramentas. Use somente resultados válidos já obtidos. Se houver partes pendentes, diga claramente que a resposta é parcial. Não invente os resultados faltantes.'});
-          const out=await callIA(messages,ferramentasAtuais,{provider,tool_choice:finalizar?'none':ultimoResultado&&!erroPendente?'auto':'required',max_tokens:3500,reasoning_effort:ultimoResultado&&!erroPendente?'low':undefined});
+          const out=await callIA(messages,retomarSelecao&&camposPedidos.length&&!ultimoResultado?FERRAMENTAS.filter(t=>t.function.name==='consultarSelecao'):ferramentasAtuais,{provider,tool_choice:finalizar?'none':ultimoResultado&&!erroPendente?'auto':'required',max_tokens:3500,reasoning_effort:ultimoResultado&&!erroPendente?'low':undefined});
           provider=out.provider??provider;
           const msg=out.message, calls=msg?.tool_calls||[];
           if(!calls.length) {
@@ -298,6 +321,12 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
                 continue;
               }
               throw Error('A IA não concluiu uma consulta válida para esta pergunta.');
+            }
+            const coverage=new Set(resultados().flatMap(r=>[...metricasProjetadas(r.sql)]));
+            const missingMetrics=camposPedidos.filter(c=>!coverage.has(c)&&!coverage.has('*'));
+            if(missingMetrics.length){
+              if(semConsulta++<2){messages.push({role:'system',content:'O pedido ATUAL exige '+missingMetrics.join(', ')+'. Consulte esses valores; repetir os nomes não responde.'});continue;}
+              evidencias.clear();throw Error('As consultas não retornaram as métricas pedidas: '+missingMetrics.join(', '));
             }
             const issues=conferirRedacao(msg?.content,conjunto(),q);
             if(partes.size>1)for(const r of resultados()){
@@ -315,7 +344,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
               throw Error('A redação não correspondeu ao resultado consultado: '+issues.join(' '));
             }
             const resposta=texto(msg?.content).replace(/\*\*([^*]+)\*\*/g,'*$1*');
-            guardar();
+            guardar(resposta);
             return {...base,resposta,sql:resultados().map(r=>r.sql).join(';\n'),linhas:conjunto().rows.length,estado:{fonte:'sql',pergunta:q},diagnostico:{...diagnostico(),resultado:ultimoResultado,contexto:semantic}};
           }
           if(calls.length>6) throw Error('Muitas ferramentas na mesma rodada.');
@@ -329,7 +358,21 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
               a=JSON.parse(call.function.arguments);
               parte=texto(a?.parte)||'principal';
               if(!a || typeof a!=='object' || Array.isArray(a)) throw Error('Argumentos inválidos.');
-              if(name==='planejarConsulta') {
+              if(name==='consultarSelecao') {
+                if(!retomarSelecao)throw Error('Não há seleção identificada para esta referência. Não adivinhe os IDs.');
+                const cols=[...new Set(a.colunas||[])];
+                if(!Array.isArray(a.colunas)||!cols.length||cols.length>20||cols.some(c=>typeof c!=='string'||!estrutura.some(x=>x.schema_name==='public'&&x.table_name==='obras'&&x.column_name===c)))throw Error('Escolha colunas existentes em public.obras.');
+                if(camposPedidos.some(c=>!cols.includes(c)&&!(c==='valor_contratado'&&cols.includes('valor_total'))))throw Error('Inclua todas as métricas pedidas: '+camposPedidos.join(', '));
+                const selection=anterior.contexto.selecao;
+                const params=selection.flatMap(r=>[r.id,r.objeto]);
+                const predicate=selection.map((r,i)=>`(id=$${i*2+1} AND objeto=$${i*2+2})`).join(' OR ');
+                const sql=`SELECT ${[...new Set(['id','objeto',...cols])].map(ident).join(', ')} FROM public.obras WHERE ${predicate} ORDER BY id`;
+                const r=await safeQuery(sql,params);
+                if(r.rows.length!==selection.length)throw Error('A seleção anterior mudou ou não está mais disponível. Refazer a seleção antes de responder evita atribuir valores a outras obras.');
+                result={status:'ok',rows:r.rows,columns:r.fields?.map(f=>f.name)||[],sql,params,parte:'principal',pergunta:q,criterio:'Mesmos IDs e objetos da seleção anterior',has_more:false};
+                evidencias.clear();partes.clear();pendentes.clear();evidencias.set('principal',result);
+                ultimoSQL=sql;ultimoResultado=result;erroPendente=false;resultadoAtualValido=true;
+              } else if(name==='planejarConsulta') {
                 if(evidencias.size||partes.size)throw Error('O plano já foi iniciado; conclua suas partes sem reiniciar.');
                 if(!Array.isArray(a.partes)||!a.partes.length||a.partes.length>8||a.partes.some(p=>!texto(p.id)||!texto(p.pergunta))||new Set(a.partes.map(p=>p.id)).size!==a.partes.length)throw Error('Informe de uma a oito partes com IDs únicos e perguntas completas.');
                 for(const p of a.partes)partes.set(p.id,p.pergunta);
@@ -359,6 +402,9 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
                 if((errosPorParte.get(parte)||0)>=3) throw Error('Limite de correções SQL atingido. Peça esclarecimento ou explique a impossibilidade.');
                 erroPendente=true;resultadoAtualValido=false;
                 const sql=validarSQL(a.sql),params=a.params??[];
+                if(retomarSelecao&&camposPedidos.length)throw Error('Use consultarSelecao para obter os atributos das mesmas obras; não repita a busca por área.');
+                const projected=metricasProjetadas(sql);
+                if(camposPedidos.length&&!camposPedidos.some(c=>projected.has(c)||projected.has('*')))throw Error('A pergunta atual pede '+camposPedidos.join(', ')+'. Esta consulta não retorna nenhuma dessas métricas.');
                 conferirConsulta(sql,partes.get(parte)||q,estrutura);
                 if(!Array.isArray(params)||params.length>100||params.some(v=>v!==null&&!['string','number','boolean'].includes(typeof v))) throw Error('Parâmetros SQL inválidos.');
                 if(!texto(a.criterio)) throw Error('Informe o critério escolhido.');
@@ -395,9 +441,9 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
                 if(pagoDefinido)throw Error('O usuário já escolheu valor pago e há contexto para as obras. Execute a consulta de pagamentos, incluindo contagem geral e dos valores informados.');
                 esclarecimento=texto(a.pergunta); result={status:'ok'};
               }
-              trace.push({rodada,ferramenta:name,sucesso:true,...(name==='consultarBanco'?{parte,sql:result.sql,params:result.params,linhas:result.rows.length,cache:result.cache}:{})});
+              trace.push({rodada,ferramenta:name,sucesso:true,...(['consultarBanco','consultarSelecao'].includes(name)?{parte,sql:result.sql,params:result.params,linhas:result.rows.length,cache:result.cache}:{})});
             } catch(e) {
-              if(name==='consultarBanco') {errosPorParte.set(parte,(errosPorParte.get(parte)||0)+1);pendentes.add(parte);evidencias.delete(parte);erroPendente=true;resultadoAtualValido=false;}
+              if(['consultarBanco','consultarSelecao'].includes(name)) {errosPorParte.set(parte,(errosPorParte.get(parte)||0)+1);pendentes.add(parte);evidencias.delete(parte);erroPendente=true;resultadoAtualValido=false;}
               result={status:'error',sqlstate:e.code||null,mensagem:texto(e.message).slice(0,2000),detalhe:e.detail||null,dica:e.hint||null,
                 orientacao:'Corrija a consulta com base no catálogo e no erro real, preservando o pedido. Vazio não é erro.'};
               trace.push({rodada,ferramenta:name,sucesso:false,parte,sql:a?.sql,params:a?.params,...result});
@@ -411,10 +457,13 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
       });
     } catch(e) {
       const falha=texto(e.message);
+      const covered=new Set(resultados().flatMap(r=>[...metricasProjetadas(r.sql)]));
+      if(metricasPedidas(q).some(c=>!covered.has(c)&&!covered.has('*')))evidencias.clear();
       if(evidencias.size) {
         const parcial=!completo();
-        if(!parcial)guardar();
+
         const respostas=resultados().map(r=>{const texto=respostaConferida(r,r.pergunta);return partes.size>1&&!privateText.test(r.pergunta)?r.pergunta+'\n'+texto:texto;}).filter(Boolean);
+        if(!parcial)guardar(respostas.join('\n\n'));
         return {...base,resposta:[...(parcial?['Consegui responder apenas parte do pedido. Ainda não consegui concluir as outras informações.']:[]),...respostas].join('\n\n'),sql:resultados().map(r=>r.sql).join(';\n'),linhas:conjunto().rows.length,erro:parcial?falha:'',estado:{fonte:'sql',pergunta:q},diagnostico:{...diagnostico(),resultado:ultimoResultado,erro_redacao:falha,parcial,redacao:'dados_do_banco'}};
       }
       return {...base,resposta:'Não consegui responder agora. Pode tentar novamente?',erro:falha,sql:ultimoSQL,
