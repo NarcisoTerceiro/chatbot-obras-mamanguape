@@ -19,6 +19,11 @@ function perguntaStatusSelecao(pergunta) {
   const q=norm(pergunta).replace(/[?!.,]/g,'').replace(/\s+/g,' ').trim();
   return /^(?:(?:e |agora )?)(?:qual (?:e )?(?:o |a )?|como (?:esta|ta) )?(?:status|situacao)(?: (?:dessa|desta|daquela|dessas|destas|daquelas) obras?)?$/.test(q);
 }
+function referenciaConversa(pergunta) {
+  const q=norm(pergunta).replace(/[?!.,]/g,'').replace(/\s+/g,' ').trim();
+  return /\b(dessa|desta|desse|deste|dessas|destas|desses|destes|essa|esta|essas|estas|mesma|mesmas|mesmo|mesmos|daquela|daquelas)\b/.test(q)||
+    perguntaStatusSelecao(q)||/^(?:(?:quero|mostre|manda|sim) )?(?:os |as )?(?:3|tres|ambos|ambas|todos|todas|contratado|executado|pago)$/.test(q);
+}
 function bairroDoRanking(value) {
   const original=String(value||'').replace(/\s+/g,' ').trim();
   const s=norm(original);
@@ -311,8 +316,24 @@ async function catalogo(client) {
   return r.rows;
 }
 
-export function criarAgente({chamarTools, snapshot=withReadSnapshot, conhecimento=buscarConhecimentoAprovado, sessionIdleSeconds=1800, now=()=>Date.now()}={}) {
+export function criarAgente({chamarTools, snapshot=withReadSnapshot, conhecimento=buscarConhecimentoAprovado, sessionIdleSeconds=1800, estruturaCacheSeconds=300, now=()=>Date.now()}={}) {
   const sessions=new Map(), locks=new Map();
+  let estruturaCache=null,estruturaCarregando=null,estruturaGeracao=0;
+  const invalidarEstrutura=()=>{estruturaCache=null;estruturaCarregando=null;estruturaGeracao++;};
+  async function estruturaAtual(client) {
+    if(estruturaCache&&now()<estruturaCache.expires)return {columns:estruturaCache.columns,cache:true};
+    if(estruturaCarregando)return {columns:await estruturaCarregando,cache:true};
+    const geracao=estruturaGeracao;
+    const loading=catalogo(client).then(columns=>columns.map(c=>c.catalogo_abas?{
+      ...c,catalogo_abas:c.catalogo_abas.map(({registros,atualizada_em,...estrutura})=>estrutura)
+    }:c));
+    estruturaCarregando=loading;
+    try {
+      const columns=await loading;
+      if(geracao===estruturaGeracao)estruturaCache={columns,expires:now()+Math.max(0,estruturaCacheSeconds)*1000};
+      return {columns,cache:false};
+    } finally {if(estruturaCarregando===loading)estruturaCarregando=null;}
+  }
   const forget = id => sessions.delete(texto(id));
   async function run(pergunta,historico=[],options={}) {
     const q=texto(pergunta), id=texto(options.conversationId||options.sessionId);
@@ -329,6 +350,12 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
     const guardar=(resposta='')=>{if(id){if(sessions.size>=200&&!sessions.has(id))sessions.delete(sessions.keys().next().value);sessions.set(id,{last:now(),contexto:{pergunta:q,consultas:resultados().map(r=>({sql:r.sql,params:r.params,criterio:r.criterio,parte:r.parte})),sql:ultimoSQL,criterio:ultimoResultado?.criterio,selecao:resposta?selecaoDosResultados(resultados().map(r=>({...r,rows:r.rows.filter(row=>typeof row.objeto==='string'&&norm(resposta).includes(norm(row.objeto)))}))):null}});}};
     const diagnostico=()=>({provider,trace,resultados:resultados(),plano:[...partes].map(([id,pergunta])=>({id,pergunta,concluida:evidencias.has(id)&&!pendentes.has(id)}))});
     try {
+      const previous=sessions.get(id);
+      if(previous && now()-previous.last>=sessionIdleSeconds*1000) forget(id);
+      const continuacao=referenciaConversa(q);
+      // Um novo pedido não herda IDs, SQL ou filtros do assunto anterior.
+      if(!continuacao)forget(id);
+      const anterior=sessions.get(id);
       if(rankingGeralBairros(q))return await snapshot(async client=>{
         const sql="SELECT bairro, COUNT(*)::text AS quantidade FROM public.obras_chatbot WHERE tipo_negocio = 'obra' GROUP BY bairro";
         const raw=await client.query(sql);
@@ -344,9 +371,6 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
         evidencias.set('ranking_bairros',ultimoResultado);guardar(resposta);
         return {...base,resposta,sql,linhas:rows.length,estado:{fonte:'sql',pergunta:q},diagnostico:{...diagnostico(),resultado:ultimoResultado,total_registros:total}};
       });
-      const previous=sessions.get(id);
-      if(previous && now()-previous.last>=sessionIdleSeconds*1000) forget(id);
-      const anterior=sessions.get(id);
       if(perguntaStatusSelecao(q)&&anterior?.contexto?.selecao?.length) {
         return await snapshot(async client=>{
           const selection=anterior.contexto.selecao;
@@ -361,18 +385,19 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
           return {...base,resposta,sql,linhas:r.rows.length,estado:{fonte:'sql',pergunta:q},diagnostico:{...diagnostico(),resultado:ultimoResultado}};
         });
       }
-      const context=(Array.isArray(historico)?historico:[]).filter(m=>['user','assistant'].includes(m?.role)&&typeof m.content==='string').slice(-8).map(m=>({role:m.role,content:m.content.slice(0,6000)}));
+      const context=(continuacao&&Array.isArray(historico)?historico:[]).filter(m=>['user','assistant'].includes(m?.role)&&typeof m.content==='string').slice(-8).map(m=>({role:m.role,content:m.content.slice(0,6000)}));
       const approved=await conhecimento({limite:200});
       const semantic=recuperarContexto(q,approved,6);
       const callIA=chamarTools||(await import('./iaTools.js')).chamarIAComTools;
       return await snapshot(async client=>{
-        const estrutura=await catalogo(client);
+        const metadata=await estruturaAtual(client),estrutura=metadata.columns;
+        trace.push({ferramenta:'estrutura',sucesso:true,cache:metadata.cache});
         const messages=[{role:'system',content:PROMPT}, {role:'system',content:'Documentação semântica recuperada (orientação, não resposta pronta):\n'+semantic.join('\n\n')},
           {role:'system',content:'Colunas realmente disponíveis:\n'+JSON.stringify(estrutura.filter(c=>c.schema_name!=='planilha'))},...context];
         if(anterior) messages.push({role:'system',content:'Consulta anterior, apenas para resolver referências explícitas. A nova pergunta será executada na versão atual do banco:\n'+JSON.stringify(anterior.contexto)});
         const referenciaSemContexto=/\b(dessas|destas|desses|destes|essas|estas)\b/.test(norm(q))&&!anterior&&!context.length;
         const pagoDefinido=pagamentoExplicito(q)&&!referenciaSemContexto;
-        const retomarSelecao=/\b(dessa|desta|desse|deste|dessas|destas|desses|destes|essa|esta|essas|estas|mesma|mesmas)\b/.test(norm(q))&&Array.isArray(anterior?.contexto?.selecao)&&anterior.contexto.selecao.length>0;
+        const retomarSelecao=continuacao&&Array.isArray(anterior?.contexto?.selecao)&&anterior.contexto.selecao.length>0;
         const camposPedidos=metricasPedidas(q);
         const ferramentasAtuais=pagoDefinido?FERRAMENTAS.filter(t=>t.function.name!=='pedirEsclarecimento'):FERRAMENTAS;
         messages.push({role:'user',content:q});
@@ -381,7 +406,11 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
         async function safeQuery(sql,params=[]) {
           await client.query('SAVEPOINT ferramenta_agente');
           try { const r=await client.query(sql,params); await client.query('RELEASE SAVEPOINT ferramenta_agente'); return r; }
-          catch(e) { await client.query('ROLLBACK TO SAVEPOINT ferramenta_agente'); await client.query('RELEASE SAVEPOINT ferramenta_agente'); throw e; }
+          catch(e) {
+            await client.query('ROLLBACK TO SAVEPOINT ferramenta_agente'); await client.query('RELEASE SAVEPOINT ferramenta_agente');
+            if(['42703','42P01'].includes(e.code))invalidarEstrutura();
+            throw e;
+          }
         }
         for(let rodada=1;rodada<=11;rodada++) {
           const finalizar=rodada===11||repeticoes>=1||(partes.size>0&&completo()&&reparosRedacao===0);
@@ -553,8 +582,10 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
     try{return await task;}finally{if(locks.get(id)===task)locks.delete(id);}
   };
   responder.encerrarConversa=forget;
-  responder.limparCache=async()=>{sessions.clear();return {status:'invalidated'};};
+  responder.invalidarEstrutura=invalidarEstrutura;
+  responder.limparCache=async()=>{sessions.clear();invalidarEstrutura();return {status:'invalidated'};};
   responder.atualizarCache=async()=>snapshot(async client=>{
+    invalidarEstrutura();await estruturaAtual(client);
     const r=await client.query('SELECT COUNT(*)::text AS registros FROM public.obras');
     return {status:'loaded',rows:Number(r.rows[0].registros),fonte:'PostgreSQL'};
   });
