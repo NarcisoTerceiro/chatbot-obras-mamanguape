@@ -45,7 +45,8 @@ function identificacoesProjetadas(ast) {
     return Object.values(expr).flatMap(v=>Array.isArray(v)?v.flatMap(names):names(v));
   }
   visit(ast,n=>{if(n.type==='select')for(const c of n.columns||[])if(c.alias)aliases.set(c.alias.name,names(c.expr));});
-  for(const c of selectors?.columns||[])names(c.expr).forEach(n=>allowed.add(n));
+  function project(n){ if(n?.type==='union'||n?.type==='union all'){project(n.left);project(n.right);} else for(const c of n?.columns||[])names(c.expr).forEach(v=>allowed.add(v)); }
+  project(selectors);
   return allowed;
 }
 // Conferência da consulta antes da execução; nunca troca filtros silenciosamente.
@@ -74,7 +75,7 @@ export function conferirConsulta(sql, pergunta, catalogo=[]) {
     if(missing.length)throw Error('A pergunta pede identificar/listar, mas a consulta não retorna os nomes pedidos: '+missing.join(', ')+'. Retorne essas identificações (DISTINCT se forem nomes únicos), preservando o universo e os filtros. COUNT(*) ou COUNT(coluna) isolados não respondem quais/quem.');
   }
   if(known&&works&&!explicitOther&&available&&!physical)throw Error("A pergunta pede obras físicas. Inclua tipo_negocio = 'obra' na view (ou os tipos físicos na tabela base), preservando os demais filtros; projetos e licitações não são obras. Se o catálogo não permitir isso, peça esclarecimento.");
-  if(/engenheiro|responsavel/.test(q)&&/mais|menos|maior|menor/.test(q)&&/\bLIMIT\s+\d+/i.test(sql))throw Error('Ranking deve incluir todos os empatados. Use CTE para agrupar e filtre a métrica igual a MAX/MIN; não limite o ranking antes de conferir empates.');
+  if(/engenheiro|responsavel/.test(q)&&/mais|menos|maior|menor/.test(q)&&!/\b(?:top\s*\d+|\d+\s+(?:engenheiros|responsaveis))\b/.test(q)&&/\bLIMIT\s+\d+/i.test(sql))throw Error('Ranking deve incluir todos os empatados. Use CTE para agrupar e filtre a métrica igual a MAX/MIN; não limite o ranking antes de conferir empates.');
   const sums=calls.filter(c=>c.function?.name?.toLowerCase()==='sum');
   const counts=calls.filter(c=>c.function?.name?.toLowerCase()==='count');
   for(const sum of sums){
@@ -152,7 +153,7 @@ export function conferirRedacao(content,result,pergunta='') {
   if(!s)return ['Resposta vazia.'];
   if(privateText.test(s))issues.push('Retire SQL, nomes internos e explicações técnicas.');
   if(alegacaoDeFalha(s))issues.push('Há resultado válido. Não invente falha de acesso.');
-  const rows=result.rows||[],available=new Set([numericToken(rows.length)]);
+  const rows=result.rows||[],available=new Set([numericToken(rows.length),...(result.contagens||[]).map(numericToken)]);
   for(const row of rows)for(const [key,val] of Object.entries(row)){
     if(val==null||typeof val==='object')continue;
     numberTokens(val).forEach(t=>available.add(numericToken(t)));
@@ -175,7 +176,7 @@ export function conferirRedacao(content,result,pergunta='') {
       if(missing>0&&!/nao informad|sem (?:esse |o |os )?valor|ausent|disponive|parcial|falt|sem pagamento/.test(norm(s)))issues.push('Explique a cobertura da soma: há valores ausentes; não apresente o total como completo.');
     }
   }
-  const unsupported=[...new Set(numberTokens(s).filter(t=>!available.has(numericToken(t))))];
+  const unsupported=[...new Set(numberTokens(s.replace(/^\s*\d+[.)]\s+/gm,'')).filter(t=>!available.has(numericToken(t))))];
   if(unsupported.length)issues.push('Números sem evidência no resultado: '+unsupported.join(', ')+'. Use os números consultados; novos cálculos exigem nova consulta.');
   const aggregateKeys=new Set(ag.filter(a=>a.fn).map(a=>a.key));
   if(ag.some(a=>a.fn)&&rows.length<=20&&!/parcial|continu|primeir|alguns|exemplo/.test(norm(s))){
@@ -190,17 +191,19 @@ const texto = v => v == null ? '' : String(v).trim();
 const ident = s => '"' + s.replace(/"/g, '""') + '"';
 const tool = (name, description, properties, required = []) => ({type:'function',function:{name,description,parameters:{type:'object',properties,required,additionalProperties:false}}});
 export const FERRAMENTAS = Object.freeze([
+  tool('planejarConsulta','Registre as partes do pedido antes de consultar. Use uma parte por resultado independente; não invente filtros. Ex.: pedidos de duas áreas exigem duas partes. IDs identificam resultados e correções.', {partes:{type:'array',minItems:1,maxItems:8,items:{type:'object',properties:{id:{type:'string'},pergunta:{type:'string'}},required:['id','pergunta'],additionalProperties:false}}},['partes']),
   tool('listarTabelas', 'Lista as relações permitidas. Para ver cabeçalhos e tipos de uma aba específica, informe tabela e schema exatamente como no catálogo.', {tabela:{type:'string'},schema:{type:'string',enum:['public','planilha']}}),
   tool('listarCamposOriginais', 'Descobre todos os cabeçalhos originais em dados_extras por aba, com contagens. Paginado; não traz a planilha inteira.', {offset:{type:'integer',minimum:0},limite:{type:'integer',minimum:1,maximum:100}}),
   tool('obterValoresColuna', 'Examina valores distintos de uma coluna ou célula original com contagens; uma página não é o universo. Para filtros compostos use consultarBanco com GROUP BY.', {tabela:{type:'string',enum:['obras','obras_chatbot']},coluna:{type:'string'},chave_original:{type:'string'},offset:{type:'integer',minimum:0},limite:{type:'integer',minimum:1,maximum:100}}, ['tabela','coluna']),
-  tool('consultarBanco', 'Executa uma única consulta PostgreSQL SELECT/CTE somente leitura. Use SUM/COUNT/GROUP BY no banco; parâmetros $1... opcionais. Retorna resultado bruto, avisos de paginação e erros reais para corrigir. Resultado vazio pode ser correto.', {sql:{type:'string'},params:{type:'array',items:{anyOf:[{type:'string'},{type:'number'},{type:'boolean'},{type:'null'}]}},bairro_exato:{type:'boolean',description:'Use true somente se o usuário exigir correspondência exata do conteúdo da célula de bairro, em vez de localizar o bairro em endereços.'},criterio:{type:'string',description:'Explique brevemente o universo, filtros e cálculo escolhidos para a pergunta atual.'}}, ['sql','criterio']),
+  tool('consultarBanco', 'Executa uma única consulta PostgreSQL SELECT/CTE somente leitura. Use SUM/COUNT/GROUP BY no banco; parâmetros $1... opcionais. Retorna resultado bruto, avisos de paginação e erros reais para corrigir. Resultado vazio pode ser correto.', {parte:{type:'string',description:'ID da parte registrada no plano. Repita o ID ao corrigir a mesma consulta.'},sql:{type:'string'},params:{type:'array',items:{anyOf:[{type:'string'},{type:'number'},{type:'boolean'},{type:'null'}]}},bairro_exato:{type:'boolean',description:'Use true somente se o usuário exigir correspondência exata do conteúdo da célula de bairro, em vez de localizar o bairro em endereços.'},criterio:{type:'string',description:'Explique brevemente o universo, filtros e cálculo escolhidos para a pergunta atual.'}}, ['sql','criterio']),
   tool('pedirEsclarecimento', 'Pergunta curta quando a ambiguidade ou falta de dados impede uma resposta fundamentada.', {pergunta:{type:'string'}}, ['pergunta']),
 ]);
 export const FERRAMENTAS_CONSULTA = FERRAMENTAS.filter(t=>t.function.name==='consultarBanco');
 export const FERRAMENTAS_INSPECAO = FERRAMENTAS.filter(t=>!['consultarBanco','pedirEsclarecimento'].includes(t.function.name));
 const pagamentoExplicito = q => /\b(pago|pagos|paga|pagas|pagamento|pagamentos)\b/.test(norm(q));
 const alegacaoDeFalha = s => /limitacao|temporari|acesso aos dados|indisponiv|tente.*(?:novamente|minutos)|tentar.*(?:novamente|minutos)|abordagem diferente|nao (?:foi possivel|consegui) (?:obter|consultar|acessar)/.test(norm(s));
-const PROMPT = `Você é o agente de dados das obras de Mamanguape. Entenda a pergunta em português, decida os filtros e cálculos, use ferramentas e responda com evidências do banco.
+const PROMPT = `PLANEJAMENTO E ENCERRAMENTO: para pedidos compostos, registre todas as partes com planejarConsulta antes de executar. Cada consultarBanco deve indicar parte. Uma parte pode usar SELECT/CTE/UNION; para duas áreas, respeite a quantidade pedida em cada área separadamente, com ORDER BY estável. Inspeção de catálogo não é resposta. Assim que todas as partes tiverem resultados suficientes, redija a resposta usando todas elas; não repita ferramentas nem faça conferências indefinidas. Se faltar uma parte, não apresente resultado parcial como resposta completa. Não exclua registros TESTE sem pedido. Respostas curtas como 'os 3' respondem ao esclarecimento pendente; resolva-as pelo contexto, sem perguntar novamente o que já foi escolhido.
+Você é o agente de dados das obras de Mamanguape. Entenda a pergunta em português, decida os filtros e cálculos, use ferramentas e responda com evidências do banco.
 INTENÇÃO: "quais"/"quem"/"nomes" pede identificações, não apenas contagem. Consulte os nomes na coluna real do catálogo e use DISTINCT quando o usuário quiser a lista de responsáveis únicos. "Quais os engenheiros dessas obras" exige engenheiro, mantendo os filtros das obras referidas (por exemplo, bairro Centro), sem impor status que não foi pedido. Para "quantos engenheiros", conte os responsáveis distintos, não as obras. Se o cidadão questionar uma resposta inadequada ("como assim 21?"), retome a pergunta que ela deveria responder e corrija a consulta; não repita a contagem errada. Uma consulta executável que responde outra pergunta precisa ser corrigida antes da redação.
 REDAÇÃO LIVRE: formule uma resposta natural adaptada ao pedido, sem respostas prontas por assunto. Preserve todos os nomes e valores relevantes do resultado: uma contagem agrupada exige o nome do grupo e sua quantidade, seja bairro, responsável, empresa, categoria, recurso ou qualquer outro agrupamento. Não responda só o número. Novos cálculos devem ser consultados antes de redigir. Não invente números, exemplos ou entidades. Quando houver empate, preserve todos os empatados. As instruções de apresentação não limitam quais perguntas ou colunas podem ser consultadas.
 PAGAMENTOS: quando o usuário escolher pago/pagamentos, a métrica já está definida. Consulte os dados; não repita a pergunta entre contratado/executado/pago. Para "dessas obras", mantenha os filtros da última consulta de obras mesmo após um esclarecimento intermediário. valor_pago existe em public.obras; a view obras_chatbot pode não expor esse campo. Confira o catálogo. Quando necessário, use JOIN por id entre public.obras o e public.obras_chatbot v para manter os filtros da view e somar o.valor_pago, com COUNT(*) e COUNT(o.valor_pago). As representações correspondem por id; não faça UNION nem some duas vezes. Valores ausentes são informados como ausentes; nunca use valor_executado ou valor_total como substituto de pagamento. Se todos estiverem ausentes, explique que não há valores pagos informados. Não alegue limitação temporária/acesso indisponível sem erro real da ferramenta. pedirEsclarecimento serve apenas para uma dúvida específica sobre o pedido, nunca para disfarçar uma consulta não feita.
@@ -251,7 +254,12 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
       forget(id); return {...base,resposta:'Conversa encerrada.'};
     }
     let provider,ultimoSQL='',ultimoResultado=null,resultadoAtualValido=false;
-    const trace=[];
+    const trace=[], evidencias=new Map(), partes=new Map(), pendentes=new Set(), cache=new Map();
+    const resultados=()=>[...evidencias.values()];
+    const conjunto=()=>({rows:resultados().flatMap(r=>r.rows),sql:resultados().map(r=>r.sql).join('; '),contagens:resultados().map(r=>r.rows.length)});
+    const completo=()=>evidencias.size>0&&!pendentes.size&&[...partes.keys()].every(k=>evidencias.has(k));
+    const guardar=()=>{if(id){if(sessions.size>=200&&!sessions.has(id))sessions.delete(sessions.keys().next().value);sessions.set(id,{last:now(),contexto:{pergunta:q,consultas:resultados().map(r=>({sql:r.sql,params:r.params,criterio:r.criterio,parte:r.parte})),sql:ultimoSQL,criterio:ultimoResultado?.criterio}});}};
+    const diagnostico=()=>({provider,trace,resultados:resultados(),plano:[...partes].map(([id,pergunta])=>({id,pergunta,concluida:evidencias.has(id)&&!pendentes.has(id)}))});
     try {
       const previous=sessions.get(id);
       if(previous && now()-previous.last>=sessionIdleSeconds*1000) forget(id);
@@ -269,18 +277,21 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
         const pagoDefinido=pagamentoExplicito(q)&&!referenciaSemContexto;
         const ferramentasAtuais=pagoDefinido?FERRAMENTAS.filter(t=>t.function.name!=='pedirEsclarecimento'):FERRAMENTAS;
         messages.push({role:'user',content:q});
-        let errosSQL=0,erroPendente=false,semConsulta=0,reparosRedacao=0;
+        let erroPendente=false,semConsulta=0,reparosRedacao=0,repeticoes=0;
+        const errosPorParte=new Map();
         async function safeQuery(sql,params=[]) {
           await client.query('SAVEPOINT ferramenta_agente');
           try { const r=await client.query(sql,params); await client.query('RELEASE SAVEPOINT ferramenta_agente'); return r; }
           catch(e) { await client.query('ROLLBACK TO SAVEPOINT ferramenta_agente'); await client.query('RELEASE SAVEPOINT ferramenta_agente'); throw e; }
         }
-        for(let rodada=1;rodada<=10;rodada++) {
-          const out=await callIA(messages,ferramentasAtuais,{provider,tool_choice:ultimoResultado&&!erroPendente?'auto':'required',max_tokens:3500,reasoning_effort:ultimoResultado&&!erroPendente?'low':undefined});
+        for(let rodada=1;rodada<=11;rodada++) {
+          const finalizar=rodada===11||repeticoes>=2||(partes.size>0&&completo()&&reparosRedacao===0);
+          if(finalizar)messages.push({role:'system',content:'Encerre agora sem ferramentas. Use somente resultados válidos já obtidos. Se houver partes pendentes, diga claramente que a resposta é parcial. Não invente os resultados faltantes.'});
+          const out=await callIA(messages,ferramentasAtuais,{provider,tool_choice:finalizar?'none':ultimoResultado&&!erroPendente?'auto':'required',max_tokens:3500,reasoning_effort:ultimoResultado&&!erroPendente?'low':undefined});
           provider=out.provider??provider;
           const msg=out.message, calls=msg?.tool_calls||[];
           if(!calls.length) {
-            if(!ultimoResultado||erroPendente) {
+            if(!completo()) {
               if(semConsulta++<1){
                 if(msg)messages.push(msg);
                 messages.push({role:'system',content:'Ainda não há uma consulta válida nesta pergunta. Use as ferramentas para inspecionar o catálogo e consultar os dados reais. Não invente uma falha de acesso. Pago já define a métrica valor_pago; use a tabela base quando a view não a expuser. Corrija eventuais erros reais já retornados.'});
@@ -288,7 +299,12 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
               }
               throw Error('A IA não concluiu uma consulta válida para esta pergunta.');
             }
-            const issues=conferirRedacao(msg?.content,ultimoResultado,q);
+            const issues=conferirRedacao(msg?.content,conjunto(),q);
+            if(partes.size>1)for(const r of resultados()){
+              if(r.rows.length<=20&&!r.has_more)for(const row of r.rows){
+                if(typeof row.objeto==='string'&&!norm(msg?.content).includes(norm(row.objeto)))issues.push('A resposta omitiu uma identificação da parte '+r.parte+': '+row.objeto+'.');
+              }
+            }
             if(issues.length){
               trace.push({rodada,ferramenta:'conferirRedacao',sucesso:false,problemas:issues});
               if(reparosRedacao++<1){
@@ -299,23 +315,26 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
               throw Error('A redação não correspondeu ao resultado consultado: '+issues.join(' '));
             }
             const resposta=texto(msg?.content).replace(/\*\*([^*]+)\*\*/g,'*$1*');
-            if(id) {
-              if(sessions.size>=200 && !sessions.has(id)) sessions.delete(sessions.keys().next().value);
-              sessions.set(id,{last:now(),contexto:{pergunta:q,sql:ultimoSQL,criterio:ultimoResultado.criterio}});
-            }
-            return {...base,resposta,sql:ultimoSQL,linhas:ultimoResultado.rows.length,estado:{fonte:'sql',pergunta:q},diagnostico:{provider,trace,resultado:ultimoResultado,contexto:semantic}};
+            guardar();
+            return {...base,resposta,sql:resultados().map(r=>r.sql).join(';\n'),linhas:conjunto().rows.length,estado:{fonte:'sql',pergunta:q},diagnostico:{...diagnostico(),resultado:ultimoResultado,contexto:semantic}};
           }
           if(calls.length>6) throw Error('Muitas ferramentas na mesma rodada.');
           messages.push(msg);
           let esclarecimento=null;
           for(const call of calls) {
-            let result;
+            let result,parte='principal',a;
             const name=call.function?.name;
             try {
               if(!call.id || !FERRAMENTAS.some(t=>t.function.name===name)) throw Error('Ferramenta desconhecida.');
-              const a=JSON.parse(call.function.arguments);
+              a=JSON.parse(call.function.arguments);
+              parte=texto(a?.parte)||'principal';
               if(!a || typeof a!=='object' || Array.isArray(a)) throw Error('Argumentos inválidos.');
-              if(name==='listarTabelas') {
+              if(name==='planejarConsulta') {
+                if(evidencias.size||partes.size)throw Error('O plano já foi iniciado; conclua suas partes sem reiniciar.');
+                if(!Array.isArray(a.partes)||!a.partes.length||a.partes.length>8||a.partes.some(p=>!texto(p.id)||!texto(p.pergunta))||new Set(a.partes.map(p=>p.id)).size!==a.partes.length)throw Error('Informe de uma a oito partes com IDs únicos e perguntas completas.');
+                for(const p of a.partes)partes.set(p.id,p.pergunta);
+                result={status:'ok',partes:a.partes};
+              } else if(name==='listarTabelas') {
                 const selected=a.tabela?estrutura.filter(c=>c.table_name===a.tabela&&(!a.schema||c.schema_name===a.schema)):estrutura.filter(c=>c.schema_name!=='planilha');
                 result={status:'ok',columns:selected};
               }
@@ -335,10 +354,12 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
                 const r=await safeQuery(`SELECT ${expr} AS valor, COUNT(*)::text AS registros FROM public.${ident(a.tabela)} GROUP BY 1 ORDER BY 1 NULLS LAST LIMIT $${hasKey?2:1} OFFSET $${hasKey?3:2}`,params);
                 result={status:'ok',rows:r.rows.slice(0,limit),has_more:r.rows.length>limit,next_offset:r.rows.length>limit?offset+limit:null};
               } else if(name==='consultarBanco') {
-                if(errosSQL>=3) throw Error('Limite de correções SQL atingido. Peça esclarecimento ou explique a impossibilidade.');
+                if(partes.size&&!partes.has(parte))throw Error('Informe parte com um dos IDs do plano: '+[...partes.keys()].join(', '));
+                pendentes.add(parte);evidencias.delete(parte);
+                if((errosPorParte.get(parte)||0)>=3) throw Error('Limite de correções SQL atingido. Peça esclarecimento ou explique a impossibilidade.');
                 erroPendente=true;resultadoAtualValido=false;
                 const sql=validarSQL(a.sql),params=a.params??[];
-                conferirConsulta(sql,q,estrutura);
+                conferirConsulta(sql,partes.get(parte)||q,estrutura);
                 if(!Array.isArray(params)||params.length>100||params.some(v=>v!==null&&!['string','number','boolean'].includes(typeof v))) throw Error('Parâmetros SQL inválidos.');
                 if(!texto(a.criterio)) throw Error('Informe o critério escolhido.');
                 if (a.bairro_exato !== true) {
@@ -359,36 +380,43 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
                     e.detail=JSON.stringify(variantes);throw e;
                   }
                 }
-                const r=await safeQuery(`SELECT * FROM (${sql}) AS resultado_agente LIMIT 201`,params);
+                const key=JSON.stringify([sql,params]);
+                const cached=cache.get(key);
+                const r=cached||await safeQuery(`SELECT * FROM (${sql}) AS resultado_agente LIMIT 201`,params);
+                if(cached)repeticoes++;else {cache.set(key,r);repeticoes=0;}
                 result={status:'ok',rows:r.rows.slice(0,200),columns:r.fields?.map(f=>f.name)||[],has_more:r.rows.length>200,
                   quantidade_retornada:Math.min(r.rows.length,200),
-                  criterio:a.criterio,sql,limite_transporte:200,
+                  criterio:a.criterio,sql,params,parte,pergunta:partes.get(parte)||q,cache:!!cached,limite_transporte:200,
                   orientacao:r.rows.length===0?'Nenhuma linha. Isso pode ser correto; não relaxe filtros automaticamente.':'Confira a correspondência com a pergunta; contagens/totais devem vir da agregação SQL.'};
-                ultimoSQL=sql; ultimoResultado=result; erroPendente=false;resultadoAtualValido=true;
+                ultimoSQL=sql; ultimoResultado=result; evidencias.set(parte,result);pendentes.delete(parte);erroPendente=pendentes.size>0;resultadoAtualValido=completo();
               } else if(name==='pedirEsclarecimento') {
                 if(!texto(a.pergunta)) throw Error('Esclarecimento vazio.');
                 if(alegacaoDeFalha(a.pergunta))throw Error('Uma alegação de falha de acesso não é esclarecimento. Consulte os dados com as ferramentas; se houver falha real, ela será registrada no diagnóstico.');
                 if(pagoDefinido)throw Error('O usuário já escolheu valor pago e há contexto para as obras. Execute a consulta de pagamentos, incluindo contagem geral e dos valores informados.');
                 esclarecimento=texto(a.pergunta); result={status:'ok'};
               }
-              trace.push({rodada,ferramenta:name,sucesso:true});
+              trace.push({rodada,ferramenta:name,sucesso:true,...(name==='consultarBanco'?{parte,sql:result.sql,params:result.params,linhas:result.rows.length,cache:result.cache}:{})});
             } catch(e) {
-              if(name==='consultarBanco') {errosSQL++;erroPendente=true;resultadoAtualValido=false;}
+              if(name==='consultarBanco') {errosPorParte.set(parte,(errosPorParte.get(parte)||0)+1);pendentes.add(parte);evidencias.delete(parte);erroPendente=true;resultadoAtualValido=false;}
               result={status:'error',sqlstate:e.code||null,mensagem:texto(e.message).slice(0,2000),detalhe:e.detail||null,dica:e.hint||null,
                 orientacao:'Corrija a consulta com base no catálogo e no erro real, preservando o pedido. Vazio não é erro.'};
-              trace.push({rodada,ferramenta:name,sucesso:false,...result});
+              trace.push({rodada,ferramenta:name,sucesso:false,parte,sql:a?.sql,params:a?.params,...result});
             }
             messages.push({role:'tool',tool_call_id:call.id,content:JSON.stringify(result)});
           }
+          if(esclarecimento&&id)sessions.set(id,{last:now(),contexto:{...anterior?.contexto,pergunta_pendente:q,esclarecimento}});
           if(esclarecimento) return {...base,resposta:textoPublico(esclarecimento),sql:ultimoSQL,diagnostico:{provider,trace,esclarecimento:true}};
         }
         throw Error('O agente atingiu o limite de ferramentas sem concluir a resposta.');
       });
     } catch(e) {
       const falha=texto(e.message);
-      if(resultadoAtualValido && ultimoResultado) return {...base,resposta:respostaConferida(ultimoResultado,q) || 'Não consegui preparar a resposta agora. Pode tentar novamente?',sql:ultimoSQL,
-        linhas:ultimoResultado.rows.length,erro:'',estado:{fonte:'sql',pergunta:q},
-        diagnostico:{provider,trace,resultado:ultimoResultado,erro_redacao:falha,redacao:'dados_do_banco'}};
+      if(evidencias.size) {
+        const parcial=!completo();
+        if(!parcial)guardar();
+        const respostas=resultados().map(r=>{const texto=respostaConferida(r,r.pergunta);return partes.size>1&&!privateText.test(r.pergunta)?r.pergunta+'\n'+texto:texto;}).filter(Boolean);
+        return {...base,resposta:[...(parcial?['Consegui responder apenas parte do pedido. Ainda não consegui concluir as outras informações.']:[]),...respostas].join('\n\n'),sql:resultados().map(r=>r.sql).join(';\n'),linhas:conjunto().rows.length,erro:parcial?falha:'',estado:{fonte:'sql',pergunta:q},diagnostico:{...diagnostico(),resultado:ultimoResultado,erro_redacao:falha,parcial,redacao:'dados_do_banco'}};
+      }
       return {...base,resposta:'Não consegui responder agora. Pode tentar novamente?',erro:falha,sql:ultimoSQL,
         linhas:ultimoResultado?.rows?.length||0,diagnostico:{provider,trace,resultado:ultimoResultado}};
     }
