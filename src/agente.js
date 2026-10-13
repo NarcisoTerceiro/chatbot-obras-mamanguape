@@ -11,7 +11,7 @@ function perguntaStatusSelecao(pergunta) {
 }
 function referenciaConversa(pergunta) {
   const q=norm(pergunta).replace(/[?!.,]/g,'').replace(/\s+/g,' ').trim();
-  return /\b(dessa|desta|desse|deste|dessas|destas|desses|destes|essa|esta|essas|estas|mesma|mesmas|mesmo|mesmos|daquela|daquelas)\b/.test(q)||
+  return /\b(dessa|desta|desse|deste|dessas|destas|desses|destes|nessa|nesta|nessas|nestas|nesses|nestes|essa|esta|essas|estas|mesma|mesmas|mesmo|mesmos|daquela|daquelas)\b/.test(q)||
     perguntaStatusSelecao(q)||/^(?:(?:quero|mostre|manda|sim) )?(?:os |as )?(?:3|tres|ambos|ambas|todos|todas|contratado|executado|pago)$/.test(q);
 }
 function calcularBairrosInterpretados(originais,mapa) {
@@ -126,6 +126,7 @@ export function conferirConsulta(sql, pergunta, catalogo=[]) {
     const requested=colunasDeIdentificacao(pergunta,catalogo),selected=identificacoesProjetadas(ast);
     const missing=requested.filter(c=>!selected.has(c)&&!selected.has('*'));
     if(missing.length)throw Error('A pergunta pede identificar/listar, mas a consulta não retorna os nomes pedidos: '+missing.join(', ')+'. Retorne essas identificações (DISTINCT se forem nomes únicos), preservando o universo e os filtros. COUNT(*) ou COUNT(coluna) isolados não respondem quais/quem.');
+    if(selected.has('objeto')&&!selected.has('id')&&!selected.has('*')&&!calls.some(c=>['count','sum','avg','min','max'].includes(c.function?.name?.toLowerCase()))&&!/\b(?:GROUP\s+BY|DISTINCT)\b/i.test(sql))throw Error('Listas de obras precisam retornar id e objeto para preservar a seleção nas próximas perguntas. Inclua id sem mudar os filtros. O id não é exibido ao cidadão.');
   }
   if(known&&works&&!explicitOther&&available&&!physical)throw Error("A pergunta pede obras físicas. Inclua tipo_negocio = 'obra' na view (ou os tipos físicos na tabela base), preservando os demais filtros; projetos e licitações não são obras. Se o catálogo não permitir isso, peça esclarecimento.");
   if(/engenheiro|responsavel/.test(q)&&/mais|menos|maior|menor/.test(q)&&!/\b(?:top\s*\d+|\d+\s+(?:engenheiros|responsaveis))\b/.test(q)&&/\bLIMIT\s+\d+/i.test(sql))throw Error('Ranking deve incluir todos os empatados. Use CTE para agrupar e filtre a métrica igual a MAX/MIN; não limite o ranking antes de conferir empates.');
@@ -246,7 +247,7 @@ const tool = (name, description, properties, required = []) => ({type:'function'
 export const FERRAMENTAS = Object.freeze([
   tool('inspecionarBairros','Retorna todos os textos distintos de localização das obras físicas, com contagens. Examine grafias, endereços, locais compartilhados e ausências antes de interpretar um ranking geral de bairros.',{}),
   tool('agruparBairros','Node calcula o ranking geral a partir da interpretação que VOCÊ faz de cada localização retornada por inspecionarBairros. Forneça um mapeamento completo: origem idêntica ao texto retornado (null para ausente), bairros identificados com evidência, ou lista vazia quando não identificável. Não invente bairros. Locais compartilhados ficam separados e cada registro é contado uma vez. Não use para rankings com outros filtros.',{parte:{type:'string'},mapa:{type:'array',maxItems:500,items:{type:'object',properties:{origem:{anyOf:[{type:'string'},{type:'null'}]},bairros:{type:'array',maxItems:20,items:{type:'string'}}},required:['origem','bairros'],additionalProperties:false}}},['mapa']),
-  tool('consultarSelecao','Consulta atributos atuais das mesmas obras identificadas na resposta anterior, sem refazer filtros de área. Node aplica os IDs guardados. Use para detalhes dessas obras. Escolha colunas existentes de public.obras.',{colunas:{type:'array',items:{type:'string'},minItems:1,maxItems:20}},['colunas']),
+  tool('consultarSelecao','Consulta somente os IDs e objetos guardados da seleção anterior, com valores atuais. Escolha colunas existentes de public.obras. operacao=detalhes lista cada obra; soma calcula o total, media/minimo/maximo agregam as métricas numéricas. Para valor TOTAL nessas obras, use soma. Node inclui contagens gerais e valores preenchidos. Nunca amplia para todas as obras.',{colunas:{type:'array',items:{type:'string'},minItems:1,maxItems:20},operacao:{type:'string',enum:['detalhes','soma','media','minimo','maximo']}},['colunas']),
   tool('planejarConsulta','Registre as partes do pedido antes de consultar. Use uma parte por resultado independente; não invente filtros. Ex.: pedidos de duas áreas exigem duas partes. IDs identificam resultados e correções.', {partes:{type:'array',minItems:1,maxItems:8,items:{type:'object',properties:{id:{type:'string'},pergunta:{type:'string'}},required:['id','pergunta'],additionalProperties:false}}},['partes']),
   tool('listarTabelas', 'Lista as relações permitidas. Para ver cabeçalhos e tipos de uma aba específica, informe tabela e schema exatamente como no catálogo.', {tabela:{type:'string'},schema:{type:'string',enum:['public','planilha']}}),
   tool('listarCamposOriginais', 'Descobre todos os cabeçalhos originais em dados_extras por aba, com contagens. Paginado; não traz a planilha inteira.', {offset:{type:'integer',minimum:0},limite:{type:'integer',minimum:1,maximum:100}}),
@@ -327,12 +328,19 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
     if(options.encerrar===true || /^(tchau|encerrar(?: conversa)?|fim da conversa|até mais)[.!\s]*$/i.test(q)) {
       forget(id); return {...base,resposta:'Conversa encerrada.'};
     }
-    let provider,ultimoSQL='',ultimoResultado=null,resultadoAtualValido=false;
+    let provider,ultimoSQL='',ultimoResultado=null,resultadoAtualValido=false,selecaoAnterior=null;
     const trace=[], evidencias=new Map(), partes=new Map(), pendentes=new Set(), cache=new Map();
     const resultados=()=>[...evidencias.values()];
     const conjunto=()=>({rows:resultados().flatMap(r=>r.rows),sql:resultados().map(r=>r.sql).join('; '),contagens:resultados().map(r=>r.rows.length)});
     const completo=()=>evidencias.size>0&&!pendentes.size&&[...partes.keys()].every(k=>evidencias.has(k));
-    const guardar=(resposta='')=>{if(id){if(sessions.size>=200&&!sessions.has(id))sessions.delete(sessions.keys().next().value);sessions.set(id,{last:now(),contexto:{pergunta:q,consultas:resultados().map(r=>({sql:r.sql,params:r.params,criterio:r.criterio,parte:r.parte})),sql:ultimoSQL,criterio:ultimoResultado?.criterio,selecao:resposta?selecaoDosResultados(resultados().map(r=>({...r,rows:r.rows.filter(row=>typeof row.objeto==='string'&&norm(resposta).includes(norm(row.objeto)))}))):null}});}};
+    const guardar=(resposta='')=>{if(id){
+      const canonical=v=>norm(v).replace(/[^a-z0-9]/g,'');
+      const selection=selecaoDosResultados(resultados());
+      const mentioned=selection&&selection.every(row=>canonical(resposta).includes(canonical(row.objeto)));
+      const aggregate=resultados().length>0&&resultados().every(r=>r.selecao_preservada===true);
+      if(sessions.size>=200&&!sessions.has(id))sessions.delete(sessions.keys().next().value);
+      sessions.set(id,{last:now(),contexto:{pergunta:q,consultas:resultados().map(r=>({sql:r.sql,params:r.params,criterio:r.criterio,parte:r.parte})),sql:ultimoSQL,criterio:ultimoResultado?.criterio,selecao:mentioned?selection:aggregate?selecaoAnterior:null}});
+    }};
     const diagnostico=()=>({provider,trace,resultados:resultados(),plano:[...partes].map(([id,pergunta])=>({id,pergunta,concluida:evidencias.has(id)&&!pendentes.has(id)}))});
     try {
       const previous=sessions.get(id);
@@ -341,6 +349,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
       // Um novo pedido não herda IDs, SQL ou filtros do assunto anterior.
       if(!continuacao)forget(id);
       const anterior=sessions.get(id);
+      selecaoAnterior=anterior?.contexto?.selecao||null;
       const context=(continuacao&&Array.isArray(historico)?historico:[]).filter(m=>['user','assistant'].includes(m?.role)&&typeof m.content==='string').slice(-8).map(m=>({role:m.role,content:m.content.slice(0,6000)}));
       const approved=await conhecimento({limite:200});
       const semantic=recuperarContexto(q,approved,6);
@@ -351,11 +360,13 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
         const messages=[{role:'system',content:PROMPT}, {role:'system',content:'Documentação semântica recuperada (orientação, não resposta pronta):\n'+semantic.join('\n\n')},
           {role:'system',content:'Colunas realmente disponíveis:\n'+JSON.stringify(estrutura.filter(c=>c.schema_name!=='planilha'))},...context];
         if(anterior) messages.push({role:'system',content:'Consulta anterior, apenas para resolver referências explícitas. A nova pergunta será executada na versão atual do banco:\n'+JSON.stringify(anterior.contexto)});
-        const referenciaSemContexto=/\b(dessas|destas|desses|destes|essas|estas)\b/.test(norm(q))&&!anterior&&!context.length;
-        const pagoDefinido=pagamentoExplicito(q)&&!referenciaSemContexto;
+        const referenciaObras=/\b(dessa|desta|desse|deste|dessas|destas|desses|destes|nessa|nesta|nessas|nestas|nesses|nestes|essas|estas|mesmas)\b/.test(norm(q));
         const retomarSelecao=continuacao&&Array.isArray(anterior?.contexto?.selecao)&&anterior.contexto.selecao.length>0;
+        const referenciaSemContexto=referenciaObras&&!retomarSelecao;
+        const pagoDefinido=pagamentoExplicito(q)&&!referenciaSemContexto;
         const camposPedidos=metricasPedidas(q);
-        const ferramentasAtuais=pagoDefinido?FERRAMENTAS.filter(t=>t.function.name!=='pedirEsclarecimento'):FERRAMENTAS;
+        const ferramentasAtuais=referenciaSemContexto?FERRAMENTAS.filter(t=>t.function.name==='pedirEsclarecimento'):pagoDefinido?FERRAMENTAS.filter(t=>t.function.name!=='pedirEsclarecimento'):FERRAMENTAS;
+        if(referenciaSemContexto)messages.push({role:'system',content:'O usuário se refere a obras anteriores, mas não há seleção com IDs disponível. Peça que identifique ou liste novamente essas obras. Não execute total geral como substituto.'});
         messages.push({role:'user',content:q});
         let erroPendente=false,semConsulta=0,reparosRedacao=0,repeticoes=0,bairrosInspecionados=null;
         const sqlBairros="SELECT bairro, COUNT(*)::text AS quantidade FROM public.obras_chatbot WHERE tipo_negocio = 'obra' GROUP BY bairro ORDER BY bairro NULLS FIRST";
@@ -420,6 +431,8 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
               a=JSON.parse(call.function.arguments);
               parte=partes.size?(texto(a?.parte)||'principal'):'principal';
               if(!a || typeof a!=='object' || Array.isArray(a)) throw Error('Argumentos inválidos.');
+              if(referenciaSemContexto&&name!=='pedirEsclarecimento')throw Error('Seleção anterior indisponível. Peça esclarecimento; não substitua pelas obras em geral.');
+              if(retomarSelecao&&name!=='consultarSelecao'&&name!=='pedirEsclarecimento')throw Error('Use consultarSelecao para manter exatamente as obras anteriores.');
               if(name==='inspecionarBairros') {
                 const r=await safeQuery(sqlBairros);
                 if(r.rows.length>500)throw Error('Mais de 500 localizações distintas. Use consultarBanco com inspeção paginada e agregação SQL.');
@@ -438,12 +451,18 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
                 if(perguntaStatusSelecao(q)&&!cols.includes('status')&&!cols.includes('status_original'))throw Error('Inclua a situação da seleção para responder ao pedido atual.');
                 if(camposPedidos.some(c=>!cols.includes(c)&&!(c==='valor_contratado'&&cols.includes('valor_total'))))throw Error('Inclua todas as métricas pedidas: '+camposPedidos.join(', '));
                 const selection=anterior.contexto.selecao;
+                const operacao=a.operacao||'detalhes';
+                if(!['detalhes','soma','media','minimo','maximo'].includes(operacao))throw Error('Operação inválida para a seleção.');
+                if(camposPedidos.length&&/\b(total|soma|somar)\b/.test(norm(q))&&operacao==='detalhes')throw Error('O pedido exige o total. Use operacao=soma nas métricas da seleção.');
+                if(operacao!=='detalhes'&&cols.some(c=>!estrutura.some(x=>x.schema_name==='public'&&x.table_name==='obras'&&x.column_name===c&&/numeric|decimal|double|real|integer|bigint|smallint/.test(x.data_type||''))))throw Error('Agregação exige métricas numéricas existentes.');
                 const params=selection.flatMap(r=>[r.id,r.objeto]);
                 const predicate=selection.map((r,i)=>`(id=$${i*2+1} AND objeto=$${i*2+2})`).join(' OR ');
-                const sql=`SELECT ${[...new Set(['id','objeto',...cols])].map(ident).join(', ')} FROM public.obras WHERE ${predicate} ORDER BY id`;
+                const detailSql=`SELECT ${[...new Set(['id','objeto',...cols])].map(ident).join(', ')} FROM public.obras WHERE ${predicate}`;
+                const fn={soma:'SUM',media:'AVG',minimo:'MIN',maximo:'MAX'}[operacao];
+                const sql=operacao==='detalhes'?detailSql+' ORDER BY id':`WITH selecionadas AS (${detailSql}) SELECT COUNT(*)::text AS total_obras, ${cols.map(c=>`COUNT(${ident(c)})::text AS ${ident(c+'__informados')}, ${fn}(${ident(c)}) AS ${ident(c)}`).join(', ')} FROM selecionadas`;
                 const r=await safeQuery(sql,params);
-                if(r.rows.length!==selection.length)throw Error('A seleção anterior mudou ou não está mais disponível. Refazer a seleção antes de responder evita atribuir valores a outras obras.');
-                result={status:'ok',rows:r.rows,columns:r.fields?.map(f=>f.name)||[],sql,params,parte:'principal',pergunta:q,criterio:'Mesmos IDs e objetos da seleção anterior',has_more:false};
+                if((operacao==='detalhes'?r.rows.length:Number(r.rows[0]?.total_obras))!==selection.length)throw Error('A seleção anterior mudou ou não está mais disponível. Refazer a seleção antes de responder evita atribuir valores a outras obras.');
+                result={status:'ok',rows:r.rows,columns:r.fields?.map(f=>f.name)||[],sql,params,parte:'principal',pergunta:q,criterio:'Mesmos IDs e objetos da seleção anterior',has_more:false,selecao_preservada:true,operacao};
                 evidencias.clear();partes.clear();pendentes.clear();evidencias.set('principal',result);
                 ultimoSQL=sql;ultimoResultado=result;erroPendente=false;resultadoAtualValido=true;
               } else if(name==='planejarConsulta') {
