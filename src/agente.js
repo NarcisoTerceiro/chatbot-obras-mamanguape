@@ -8,7 +8,16 @@ const norm = v => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g,''
 // Apenas ranking geral de quantidade: outros pedidos continuam no agente SQL.
 function rankingGeralBairros(pergunta) {
   const q=norm(pergunta).replace(/[?!.,]/g,'').replace(/\s+/g,' ').trim();
-  return /^(?:(?:faz|faca|mostre|liste|me mostre) (?:o |um )?)?ranking (?:de |dos |por )?(?:todos os |todos )?bairros(?: (?:com|por) (?:a |as )?quantidades? de obras)?$/.test(q);
+  // Vocabulário restrito ao ranking geral: não absorve filtros de status,
+  // bairros específicos, rankings de valores nem pedidos compostos.
+  const allowed=new Set('agora faz faca fazer mostre mostrar liste lista listar me o os a as um uma de dos das do por todos todas bairros bairro com mais obras obra quantidade quantidades ranking em ordem decrescente favor'.split(' '));
+  const words=q.split(' ');
+  return words.every(w=>allowed.has(w))&&words.includes('bairros')&&
+    (words.includes('ranking')||(words.includes('mais')&&words.includes('obras')));
+}
+function perguntaStatusSelecao(pergunta) {
+  const q=norm(pergunta).replace(/[?!.,]/g,'').replace(/\s+/g,' ').trim();
+  return /^(?:(?:e |agora )?)(?:qual (?:e )?(?:o |a )?|como (?:esta|ta) )?(?:status|situacao)(?: (?:dessa|desta|daquela|dessas|destas|daquelas) obras?)?$/.test(q);
 }
 function bairroDoRanking(value) {
   const original=String(value||'').replace(/\s+/g,' ').trim();
@@ -192,7 +201,7 @@ export function respostaConferida(result, pergunta='') {
     chunks.push(block);shown++;
   }
   const limited=result.has_more||/\b(?:LIMIT|OFFSET)\b/i.test(result.sql||'');
-  const heading=works?(!limited?`Encontrei *${rows.length} obras*.`:'*Obras encontradas:*'):'*Informações encontradas:*';
+  const heading=works?(!limited?`Encontrei *${rows.length} ${rows.length===1?'obra':'obras'}*.`:'*Obras encontradas:*'):'*Informações encontradas:*';
   if(shown<rows.length||limited)chunks.push(limited?`Mostrando ${shown} resultados. A lista é parcial; peça para continuar.`:`Mostrando ${shown} das ${rows.length} obras. Peça para continuar.`);
   return [heading,...chunks].join('\n\n');
 }
@@ -338,6 +347,20 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
       const previous=sessions.get(id);
       if(previous && now()-previous.last>=sessionIdleSeconds*1000) forget(id);
       const anterior=sessions.get(id);
+      if(perguntaStatusSelecao(q)&&anterior?.contexto?.selecao?.length) {
+        return await snapshot(async client=>{
+          const selection=anterior.contexto.selecao;
+          const params=selection.flatMap(row=>[row.id,row.objeto]);
+          const predicate=selection.map((row,i)=>`(id=$${i*2+1} AND objeto=$${i*2+2})`).join(' OR ');
+          const sql=`SELECT id, objeto, status FROM public.obras_chatbot WHERE ${predicate} ORDER BY id`;
+          const r=await client.query(sql,params);
+          if(r.rows.length!==selection.length)throw Error('A seleção anterior mudou. Consulte novamente a obra.');
+          const resposta=r.rows.map(row=>`• *${row.objeto}* — Situação: *${row.status||'não informada'}*.`).join('\n');
+          ultimoSQL=sql;ultimoResultado={status:'ok',rows:r.rows,sql,params,parte:'principal',pergunta:q,has_more:false,criterio:'Situação atual dos mesmos registros identificados anteriormente'};
+          evidencias.set('principal',ultimoResultado);guardar(resposta);
+          return {...base,resposta,sql,linhas:r.rows.length,estado:{fonte:'sql',pergunta:q},diagnostico:{...diagnostico(),resultado:ultimoResultado}};
+        });
+      }
       const context=(Array.isArray(historico)?historico:[]).filter(m=>['user','assistant'].includes(m?.role)&&typeof m.content==='string').slice(-8).map(m=>({role:m.role,content:m.content.slice(0,6000)}));
       const approved=await conhecimento({limite:200});
       const semantic=recuperarContexto(q,approved,6);
@@ -349,7 +372,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
         if(anterior) messages.push({role:'system',content:'Consulta anterior, apenas para resolver referências explícitas. A nova pergunta será executada na versão atual do banco:\n'+JSON.stringify(anterior.contexto)});
         const referenciaSemContexto=/\b(dessas|destas|desses|destes|essas|estas)\b/.test(norm(q))&&!anterior&&!context.length;
         const pagoDefinido=pagamentoExplicito(q)&&!referenciaSemContexto;
-        const retomarSelecao=/\b(dessas|destas|desses|destes|essas|estas|mesmas)\b/.test(norm(q))&&Array.isArray(anterior?.contexto?.selecao)&&anterior.contexto.selecao.length>0;
+        const retomarSelecao=/\b(dessa|desta|desse|deste|dessas|destas|desses|destes|essa|esta|essas|estas|mesma|mesmas)\b/.test(norm(q))&&Array.isArray(anterior?.contexto?.selecao)&&anterior.contexto.selecao.length>0;
         const camposPedidos=metricasPedidas(q);
         const ferramentasAtuais=pagoDefinido?FERRAMENTAS.filter(t=>t.function.name!=='pedirEsclarecimento'):FERRAMENTAS;
         messages.push({role:'user',content:q});
@@ -361,7 +384,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
           catch(e) { await client.query('ROLLBACK TO SAVEPOINT ferramenta_agente'); await client.query('RELEASE SAVEPOINT ferramenta_agente'); throw e; }
         }
         for(let rodada=1;rodada<=11;rodada++) {
-          const finalizar=rodada===11||repeticoes>=2||(partes.size>0&&completo()&&reparosRedacao===0);
+          const finalizar=rodada===11||repeticoes>=1||(partes.size>0&&completo()&&reparosRedacao===0);
           if(finalizar)messages.push({role:'system',content:'Encerre agora sem ferramentas. Use somente resultados válidos já obtidos. Se houver partes pendentes, diga claramente que a resposta é parcial. Não invente os resultados faltantes.'});
           const out=await callIA(messages,retomarSelecao&&camposPedidos.length&&!ultimoResultado?FERRAMENTAS.filter(t=>t.function.name==='consultarSelecao'):ferramentasAtuais,{provider,tool_choice:finalizar?'none':ultimoResultado&&!erroPendente?'auto':'required',max_tokens:3500,reasoning_effort:ultimoResultado&&!erroPendente?'low':undefined});
           provider=out.provider??provider;
@@ -409,7 +432,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
             try {
               if(!call.id || !FERRAMENTAS.some(t=>t.function.name===name)) throw Error('Ferramenta desconhecida.');
               a=JSON.parse(call.function.arguments);
-              parte=texto(a?.parte)||'principal';
+              parte=partes.size?(texto(a?.parte)||'principal'):'principal';
               if(!a || typeof a!=='object' || Array.isArray(a)) throw Error('Argumentos inválidos.');
               if(name==='consultarSelecao') {
                 if(!retomarSelecao)throw Error('Não há seleção identificada para esta referência. Não adivinhe os IDs.');
