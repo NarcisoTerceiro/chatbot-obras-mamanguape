@@ -4,6 +4,44 @@ import { validarSQL, recuperarContexto, filtrosExatosBairro } from './sqlUtils.j
 import { parse } from 'pgsql-ast-parser';
 
 const norm = v => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+
+// Apenas ranking geral de quantidade: outros pedidos continuam no agente SQL.
+function rankingGeralBairros(pergunta) {
+  const q=norm(pergunta).replace(/[?!.,]/g,'').replace(/\s+/g,' ').trim();
+  return /^(?:(?:faz|faca|mostre|liste|me mostre) (?:o |um )?)?ranking (?:de |dos |por )?(?:todos os |todos )?bairros(?: (?:com|por) (?:a |as )?quantidades? de obras)?$/.test(q);
+}
+function bairroDoRanking(value) {
+  const original=String(value||'').replace(/\s+/g,' ').trim();
+  const s=norm(original);
+  const desconhecido='Bairro não identificado';
+  if(!s || (!/\bbairro\s*:/.test(s) && /^(?:mamanguape|trecho\b|travessa\b|zona\b|diversas\b|estradas\b|localidades\b|margens\b|sitio\b)/.test(s)))return desconhecido;
+  let nome=original;
+  const explicito=original.match(/\bbairro\s*:\s*([^;]+)/i);
+  if(explicito) nome=explicito[1].split(/,/)[0].trim();
+  else if(/^(?:rua|avenida|av\.?|r\.?|travessa)\b/.test(s)) {
+    // Só extrai um bairro indicado no endereço; nunca adivinha pela rua.
+    const final=original.match(/\s[-–]\s*([^,;]+)(?:[,;].*)?$/);
+    const centro=original.match(/,\s*(Centro)\s*(?:,|$)/i);
+    if(centro)nome=centro[1];
+    else if(final && !/^(?:pb|paraiba)$/i.test(final[1].trim()))nome=final[1].trim();
+    else return desconhecido;
+  }
+  nome=nome.toLocaleLowerCase('pt-BR').replace(/\s+/g,' ').trim();
+  if(!nome || /\d|\b(?:pb|rua|avenida|travessa|trecho|municipio|mamanguape|s\/n|zona|diversas)\b/.test(norm(nome)))return desconhecido;
+  const label=nome.split(' ').map((word,i)=>i>0&&['e','de','da','do','das','dos'].includes(word)?word:word.charAt(0).toLocaleUpperCase('pt-BR')+word.slice(1)).join(' ');
+  return /\s+e\s+/.test(nome)?'Vários bairros: '+label:label;
+}
+function agruparRankingBairros(rows) {
+  const grupos=new Map();
+  for(const row of rows) {
+    const bairro=bairroDoRanking(row.bairro);
+    const key=norm(bairro);
+    const grupo=grupos.get(key)||{bairro,quantidade:0};
+    grupo.quantidade+=Number(row.quantidade);grupos.set(key,grupo);
+  }
+  return [...grupos.values()]
+    .sort((a,b)=>b.quantidade-a.quantidade||a.bairro.localeCompare(b.bairro,'pt-BR'));
+}
 const labels = {
   objeto:'Obra',bairro:'Bairro',status:'Situação',status_original:'Situação',empresa:'Empresa',engenheiro:'Responsável',
   valor_total:'Valor contratado',valor_contratado:'Valor contratado',valor_executado:'Valor executado',valor_pago:'Valor pago',
@@ -282,6 +320,21 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
     const guardar=(resposta='')=>{if(id){if(sessions.size>=200&&!sessions.has(id))sessions.delete(sessions.keys().next().value);sessions.set(id,{last:now(),contexto:{pergunta:q,consultas:resultados().map(r=>({sql:r.sql,params:r.params,criterio:r.criterio,parte:r.parte})),sql:ultimoSQL,criterio:ultimoResultado?.criterio,selecao:resposta?selecaoDosResultados(resultados().map(r=>({...r,rows:r.rows.filter(row=>typeof row.objeto==='string'&&norm(resposta).includes(norm(row.objeto)))}))):null}});}};
     const diagnostico=()=>({provider,trace,resultados:resultados(),plano:[...partes].map(([id,pergunta])=>({id,pergunta,concluida:evidencias.has(id)&&!pendentes.has(id)}))});
     try {
+      if(rankingGeralBairros(q))return await snapshot(async client=>{
+        const sql="SELECT bairro, COUNT(*)::text AS quantidade FROM public.obras_chatbot WHERE tipo_negocio = 'obra' GROUP BY bairro";
+        const raw=await client.query(sql);
+        const rows=agruparRankingBairros(raw.rows);
+        const total=rows.reduce((sum,row)=>sum+row.quantidade,0);
+        const ranking=rows.filter(row=>row.bairro!=='Bairro não identificado'&&!row.bairro.startsWith('Vários bairros:'));
+        const pendencias=rows.filter(row=>!ranking.includes(row));
+        const resposta=[`*Ranking por bairro* (${total} registros classificados como obra):`,
+          ...ranking.map((row,i)=>`${i+1}. ${row.bairro}: ${row.quantidade}`),
+          ...(pendencias.length?['', '*Localização pendente ou compartilhada:*',...pendencias.map(row=>`• ${row.bairro}: ${row.quantidade}`)]:[]),
+          '', 'Grafias iguais foram unificadas. Bairros explícitos nos endereços foram agrupados. Ruas, trechos e locais genéricos sem bairro identificável ficam nas pendências. Cada registro é contado uma vez; locais com vários bairros ficam separados.'].join('\n');
+        ultimoSQL=sql;ultimoResultado={status:'ok',rows,sql,params:[],criterio:'Obras por bairro identificado, sem inferir localização e sem duplicar registros',parte:'ranking_bairros',pergunta:q};
+        evidencias.set('ranking_bairros',ultimoResultado);guardar(resposta);
+        return {...base,resposta,sql,linhas:rows.length,estado:{fonte:'sql',pergunta:q},diagnostico:{...diagnostico(),resultado:ultimoResultado,total_registros:total}};
+      });
       const previous=sessions.get(id);
       if(previous && now()-previous.last>=sessionIdleSeconds*1000) forget(id);
       const anterior=sessions.get(id);
