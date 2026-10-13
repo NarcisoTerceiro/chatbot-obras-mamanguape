@@ -5,16 +5,6 @@ import { parse } from 'pgsql-ast-parser';
 
 const norm = v => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
 
-// Apenas ranking geral de quantidade: outros pedidos continuam no agente SQL.
-function rankingGeralBairros(pergunta) {
-  const q=norm(pergunta).replace(/[?!.,]/g,'').replace(/\s+/g,' ').trim();
-  // Vocabulário restrito ao ranking geral: não absorve filtros de status,
-  // bairros específicos, rankings de valores nem pedidos compostos.
-  const allowed=new Set('agora faz faca fazer mostre mostrar liste lista listar me o os a as um uma de dos das do por todos todas bairros bairro com mais obras obra quantidade quantidades ranking em ordem decrescente favor'.split(' '));
-  const words=q.split(' ');
-  return words.every(w=>allowed.has(w))&&words.includes('bairros')&&
-    (words.includes('ranking')||(words.includes('mais')&&words.includes('obras')));
-}
 function perguntaStatusSelecao(pergunta) {
   const q=norm(pergunta).replace(/[?!.,]/g,'').replace(/\s+/g,' ').trim();
   return /^(?:(?:e |agora )?)(?:qual (?:e )?(?:o |a )?|como (?:esta|ta) )?(?:status|situacao)(?: (?:dessa|desta|daquela|dessas|destas|daquelas) obras?)?$/.test(q);
@@ -24,37 +14,29 @@ function referenciaConversa(pergunta) {
   return /\b(dessa|desta|desse|deste|dessas|destas|desses|destes|essa|esta|essas|estas|mesma|mesmas|mesmo|mesmos|daquela|daquelas)\b/.test(q)||
     perguntaStatusSelecao(q)||/^(?:(?:quero|mostre|manda|sim) )?(?:os |as )?(?:3|tres|ambos|ambas|todos|todas|contratado|executado|pago)$/.test(q);
 }
-function bairroDoRanking(value) {
-  const original=String(value||'').replace(/\s+/g,' ').trim();
-  const s=norm(original);
-  const desconhecido='Bairro não identificado';
-  if(!s || (!/\bbairro\s*:/.test(s) && /^(?:mamanguape|trecho\b|travessa\b|zona\b|diversas\b|estradas\b|localidades\b|margens\b|sitio\b)/.test(s)))return desconhecido;
-  let nome=original;
-  const explicito=original.match(/\bbairro\s*:\s*([^;]+)/i);
-  if(explicito) nome=explicito[1].split(/,/)[0].trim();
-  else if(/^(?:rua|avenida|av\.?|r\.?|travessa)\b/.test(s)) {
-    // Só extrai um bairro indicado no endereço; nunca adivinha pela rua.
-    const final=original.match(/\s[-–]\s*([^,;]+)(?:[,;].*)?$/);
-    const centro=original.match(/,\s*(Centro)\s*(?:,|$)/i);
-    if(centro)nome=centro[1];
-    else if(final && !/^(?:pb|paraiba)$/i.test(final[1].trim()))nome=final[1].trim();
-    else return desconhecido;
+function calcularBairrosInterpretados(originais,mapa) {
+  if(!Array.isArray(mapa)||mapa.length>500)throw Error('Envie o mapeamento completo das localizações inspecionadas.');
+  const known=new Set(originais.map(r=>JSON.stringify(r.bairro))),mapping=new Map();
+  for(const item of mapa) {
+    if(!item||!(item.origem===null||typeof item.origem==='string')||!Array.isArray(item.bairros)||item.bairros.length>20||item.bairros.some(v=>typeof v!=='string'||!v.trim()))throw Error('Mapeamento inválido.');
+    const key=JSON.stringify(item.origem);
+    if(!known.has(key)||mapping.has(key))throw Error('Origem inexistente ou duplicada no mapeamento.');
+    const nomes=[...new Map(item.bairros.map(v=>[norm(v.trim()).replace(/\s+/g,' '),v.trim()])).values()].sort((a,b)=>norm(a).localeCompare(norm(b)));
+    if((item.origem==null||!item.origem.trim())&&nomes.length)throw Error('Localização vazia não permite identificar um bairro.');
+    mapping.set(key,nomes);
   }
-  nome=nome.toLocaleLowerCase('pt-BR').replace(/\s+/g,' ').trim();
-  if(!nome || /\d|\b(?:pb|rua|avenida|travessa|trecho|municipio|mamanguape|s\/n|zona|diversas)\b/.test(norm(nome)))return desconhecido;
-  const label=nome.split(' ').map((word,i)=>i>0&&['e','de','da','do','das','dos'].includes(word)?word:word.charAt(0).toLocaleUpperCase('pt-BR')+word.slice(1)).join(' ');
-  return /\s+e\s+/.test(nome)?'Vários bairros: '+label:label;
-}
-function agruparRankingBairros(rows) {
-  const grupos=new Map();
-  for(const row of rows) {
-    const bairro=bairroDoRanking(row.bairro);
-    const key=norm(bairro);
-    const grupo=grupos.get(key)||{bairro,quantidade:0};
-    grupo.quantidade+=Number(row.quantidade);grupos.set(key,grupo);
+  const faltantes=originais.filter(r=>!mapping.has(JSON.stringify(r.bairro)));
+  if(faltantes.length){const e=Error('O mapeamento omite localizações. Complete antes de contar.');e.detail=JSON.stringify(faltantes);throw e;}
+  const grupos=new Map();let total=0;
+  for(const row of originais) {
+    const nomes=mapping.get(JSON.stringify(row.bairro));
+    const quantidade=Number(row.quantidade);
+    if(!Number.isSafeInteger(quantidade)||quantidade<0)throw Error('Contagem inválida na origem.');
+    const key=JSON.stringify(nomes.map(v=>norm(v).replace(/\s+/g,' ')));
+    const group=grupos.get(key)||{bairro:nomes.length?nomes.join(' e '):'Bairro não identificado',classificacao:nomes.length>1?'compartilhado':nomes.length?'identificado':'não identificado',quantidade:0};
+    group.quantidade+=quantidade;total+=quantidade;grupos.set(key,group);
   }
-  return [...grupos.values()]
-    .sort((a,b)=>b.quantidade-a.quantidade||a.bairro.localeCompare(b.bairro,'pt-BR'));
+  return [...grupos.values()].sort((a,b)=>b.quantidade-a.quantidade||a.bairro.localeCompare(b.bairro,'pt-BR')).map(row=>({...row,total_obras:total}));
 }
 const labels = {
   objeto:'Obra',bairro:'Bairro',status:'Situação',status_original:'Situação',empresa:'Empresa',engenheiro:'Responsável',
@@ -262,6 +244,8 @@ const texto = v => v == null ? '' : String(v).trim();
 const ident = s => '"' + s.replace(/"/g, '""') + '"';
 const tool = (name, description, properties, required = []) => ({type:'function',function:{name,description,parameters:{type:'object',properties,required,additionalProperties:false}}});
 export const FERRAMENTAS = Object.freeze([
+  tool('inspecionarBairros','Retorna todos os textos distintos de localização das obras físicas, com contagens. Examine grafias, endereços, locais compartilhados e ausências antes de interpretar um ranking geral de bairros.',{}),
+  tool('agruparBairros','Node calcula o ranking geral a partir da interpretação que VOCÊ faz de cada localização retornada por inspecionarBairros. Forneça um mapeamento completo: origem idêntica ao texto retornado (null para ausente), bairros identificados com evidência, ou lista vazia quando não identificável. Não invente bairros. Locais compartilhados ficam separados e cada registro é contado uma vez. Não use para rankings com outros filtros.',{parte:{type:'string'},mapa:{type:'array',maxItems:500,items:{type:'object',properties:{origem:{anyOf:[{type:'string'},{type:'null'}]},bairros:{type:'array',maxItems:20,items:{type:'string'}}},required:['origem','bairros'],additionalProperties:false}}},['mapa']),
   tool('consultarSelecao','Consulta atributos atuais das mesmas obras identificadas na resposta anterior, sem refazer filtros de área. Node aplica os IDs guardados. Use para detalhes dessas obras. Escolha colunas existentes de public.obras.',{colunas:{type:'array',items:{type:'string'},minItems:1,maxItems:20}},['colunas']),
   tool('planejarConsulta','Registre as partes do pedido antes de consultar. Use uma parte por resultado independente; não invente filtros. Ex.: pedidos de duas áreas exigem duas partes. IDs identificam resultados e correções.', {partes:{type:'array',minItems:1,maxItems:8,items:{type:'object',properties:{id:{type:'string'},pergunta:{type:'string'}},required:['id','pergunta'],additionalProperties:false}}},['partes']),
   tool('listarTabelas', 'Lista as relações permitidas. Para ver cabeçalhos e tipos de uma aba específica, informe tabela e schema exatamente como no catálogo.', {tabela:{type:'string'},schema:{type:'string',enum:['public','planilha']}}),
@@ -270,8 +254,8 @@ export const FERRAMENTAS = Object.freeze([
   tool('consultarBanco', 'Executa uma única consulta PostgreSQL SELECT/CTE somente leitura. Use SUM/COUNT/GROUP BY no banco; parâmetros $1... opcionais. Retorna resultado bruto, avisos de paginação e erros reais para corrigir. Resultado vazio pode ser correto.', {parte:{type:'string',description:'ID da parte registrada no plano. Repita o ID ao corrigir a mesma consulta.'},sql:{type:'string'},params:{type:'array',items:{anyOf:[{type:'string'},{type:'number'},{type:'boolean'},{type:'null'}]}},bairro_exato:{type:'boolean',description:'Use true somente se o usuário exigir correspondência exata do conteúdo da célula de bairro, em vez de localizar o bairro em endereços.'},criterio:{type:'string',description:'Explique brevemente o universo, filtros e cálculo escolhidos para a pergunta atual.'}}, ['sql','criterio']),
   tool('pedirEsclarecimento', 'Pergunta curta quando a ambiguidade ou falta de dados impede uma resposta fundamentada.', {pergunta:{type:'string'}}, ['pergunta']),
 ]);
-export const FERRAMENTAS_CONSULTA = FERRAMENTAS.filter(t=>t.function.name==='consultarBanco');
-export const FERRAMENTAS_INSPECAO = FERRAMENTAS.filter(t=>!['consultarBanco','pedirEsclarecimento'].includes(t.function.name));
+export const FERRAMENTAS_CONSULTA = FERRAMENTAS.filter(t=>['consultarBanco','agruparBairros'].includes(t.function.name));
+export const FERRAMENTAS_INSPECAO = FERRAMENTAS.filter(t=>!['consultarBanco','agruparBairros','pedirEsclarecimento'].includes(t.function.name));
 const pagamentoExplicito = q => /\b(pago|pagos|paga|pagas|pagamento|pagamentos)\b/.test(norm(q));
 const alegacaoDeFalha = s => /limitacao|temporari|acesso aos dados|indisponiv|tente.*(?:novamente|minutos)|tentar.*(?:novamente|minutos)|abordagem diferente|nao (?:foi possivel|consegui) (?:obter|consultar|acessar)/.test(norm(s));
 const PROMPT = `CONTINUIDADE: inclua id e objeto em listas de obras para identificar os registros entre mensagens. Ao pedir novos atributos DESSAS obras, use consultarSelecao se houver seleção guardada. A pergunta atual determina os atributos; nunca copie o plano anterior ignorando o novo pedido. Para perguntas independentes, não reutilize a seleção anterior. Não exponha os IDs na resposta.
@@ -279,6 +263,7 @@ PLANEJAMENTO E ENCERRAMENTO: para pedidos compostos, registre todas as partes co
 Você é o agente de dados das obras de Mamanguape. Entenda a pergunta em português, decida os filtros e cálculos, use ferramentas e responda com evidências do banco.
 INTENÇÃO: "quais"/"quem"/"nomes" pede identificações, não apenas contagem. Consulte os nomes na coluna real do catálogo e use DISTINCT quando o usuário quiser a lista de responsáveis únicos. "Quais os engenheiros dessas obras" exige engenheiro, mantendo os filtros das obras referidas (por exemplo, bairro Centro), sem impor status que não foi pedido. Para "quantos engenheiros", conte os responsáveis distintos, não as obras. Se o cidadão questionar uma resposta inadequada ("como assim 21?"), retome a pergunta que ela deveria responder e corrija a consulta; não repita a contagem errada. Uma consulta executável que responde outra pergunta precisa ser corrigida antes da redação.
 REDAÇÃO LIVRE: formule uma resposta natural adaptada ao pedido, sem respostas prontas por assunto. Preserve todos os nomes e valores relevantes do resultado: uma contagem agrupada exige o nome do grupo e sua quantidade, seja bairro, responsável, empresa, categoria, recurso ou qualquer outro agrupamento. Não responda só o número. Novos cálculos devem ser consultados antes de redigir. Não invente números, exemplos ou entidades. Quando houver empate, preserve todos os empatados. As instruções de apresentação não limitam quais perguntas ou colunas podem ser consultadas.
+INTERPRETAÇÃO DE LOCALIZAÇÕES: você interpreta quais textos representam o mesmo bairro, com base nos dados reais. Maiúsculas, espaços e acentos diferentes não criam bairros distintos. Endereços que explicitamente informam o bairro pertencem a esse bairro; não confunda município, rua, trecho ou travessa com bairro. Nunca deduza localização só pelo nome da rua. Para ranking geral, use inspecionarBairros e depois agruparBairros com seu mapeamento completo. Node conta; você explica os resultados, as localizações compartilhadas e as ausências. Para filtros por bairro, inspecione os candidatos, escolha os textos corretos e execute consultarBanco com parâmetros; inclua localizações compartilhadas quando o bairro pedido estiver explicitamente indicado. Rankings com filtros adicionais são calculados por consultarBanco, preservando todos os filtros. Para outros agrupamentos, como engenheiros, consulte também o total e a quantidade sem responsável para explicar as ausências. Todas as respostas normais passam pela sua redação final; inspeção de valores não é resposta pronta.
 PAGAMENTOS: quando o usuário escolher pago/pagamentos, a métrica já está definida. Consulte os dados; não repita a pergunta entre contratado/executado/pago. Para "dessas obras", mantenha os filtros da última consulta de obras mesmo após um esclarecimento intermediário. valor_pago existe em public.obras; a view obras_chatbot pode não expor esse campo. Confira o catálogo. Quando necessário, use JOIN por id entre public.obras o e public.obras_chatbot v para manter os filtros da view e somar o.valor_pago, com COUNT(*) e COUNT(o.valor_pago). As representações correspondem por id; não faça UNION nem some duas vezes. Valores ausentes são informados como ausentes; nunca use valor_executado ou valor_total como substituto de pagamento. Se todos estiverem ausentes, explique que não há valores pagos informados. Não alegue limitação temporária/acesso indisponível sem erro real da ferramenta. pedirEsclarecimento serve apenas para uma dúvida específica sobre o pedido, nunca para disfarçar uma consulta não feita.
 REGRAS DE CONFERÊNCIA: perguntas sobre obras, inclusive ranking geral de engenheiros, usam apenas obras físicas (tipo_negocio='obra'), salvo pedido explícito de projetos, licitações ou todos os registros. Ranking de maior/menor deve retornar TODOS os empatados: use CTE com GROUP BY e selecione a métrica igual a MAX/MIN, nunca LIMIT 1. SUM(campo) exige COUNT(*) e COUNT(campo) separados; COUNT(*) não comprova preenchimento. Saúde inclui UBS, hospital, CAPS e unidades de saúde pelo objeto e recurso FNS/Ministério da Saúde; FNDE, escola e creche são educação. Inspecione os nomes reais para definir a área. Investido é ambíguo: se não houver definição no contexto, pergunte se deseja contratado, executado ou pago; nunca escolha executado silenciosamente.
 RESPOSTA AO CIDADÃO: nunca cite banco, planilha, SQL, SELECT, view, tabela, coluna, NULL, tipo_negocio, campos, API, provedores, tokens ou mecanismos internos. Diga apenas obras, valores, situação e ausências relevantes em português comum. Não explique como buscou. Não inclua observações técnicas. Para ausência de valores, diga quantas obras não têm o valor informado. Para empate, informe todos os responsáveis empatados. Não invente informações além do resultado da ferramenta.
@@ -356,35 +341,6 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
       // Um novo pedido não herda IDs, SQL ou filtros do assunto anterior.
       if(!continuacao)forget(id);
       const anterior=sessions.get(id);
-      if(rankingGeralBairros(q))return await snapshot(async client=>{
-        const sql="SELECT bairro, COUNT(*)::text AS quantidade FROM public.obras_chatbot WHERE tipo_negocio = 'obra' GROUP BY bairro";
-        const raw=await client.query(sql);
-        const rows=agruparRankingBairros(raw.rows);
-        const total=rows.reduce((sum,row)=>sum+row.quantidade,0);
-        const ranking=rows.filter(row=>row.bairro!=='Bairro não identificado'&&!row.bairro.startsWith('Vários bairros:'));
-        const pendencias=rows.filter(row=>!ranking.includes(row));
-        const resposta=[`*Ranking por bairro* (${total} registros classificados como obra):`,
-          ...ranking.map((row,i)=>`${i+1}. ${row.bairro}: ${row.quantidade}`),
-          ...(pendencias.length?['', '*Localização pendente ou compartilhada:*',...pendencias.map(row=>`• ${row.bairro}: ${row.quantidade}`)]:[]),
-          '', 'Grafias iguais foram unificadas. Bairros explícitos nos endereços foram agrupados. Ruas, trechos e locais genéricos sem bairro identificável ficam nas pendências. Cada registro é contado uma vez; locais com vários bairros ficam separados.'].join('\n');
-        ultimoSQL=sql;ultimoResultado={status:'ok',rows,sql,params:[],criterio:'Obras por bairro identificado, sem inferir localização e sem duplicar registros',parte:'ranking_bairros',pergunta:q};
-        evidencias.set('ranking_bairros',ultimoResultado);guardar(resposta);
-        return {...base,resposta,sql,linhas:rows.length,estado:{fonte:'sql',pergunta:q},diagnostico:{...diagnostico(),resultado:ultimoResultado,total_registros:total}};
-      });
-      if(perguntaStatusSelecao(q)&&anterior?.contexto?.selecao?.length) {
-        return await snapshot(async client=>{
-          const selection=anterior.contexto.selecao;
-          const params=selection.flatMap(row=>[row.id,row.objeto]);
-          const predicate=selection.map((row,i)=>`(id=$${i*2+1} AND objeto=$${i*2+2})`).join(' OR ');
-          const sql=`SELECT id, objeto, status FROM public.obras_chatbot WHERE ${predicate} ORDER BY id`;
-          const r=await client.query(sql,params);
-          if(r.rows.length!==selection.length)throw Error('A seleção anterior mudou. Consulte novamente a obra.');
-          const resposta=r.rows.map(row=>`• *${row.objeto}* — Situação: *${row.status||'não informada'}*.`).join('\n');
-          ultimoSQL=sql;ultimoResultado={status:'ok',rows:r.rows,sql,params,parte:'principal',pergunta:q,has_more:false,criterio:'Situação atual dos mesmos registros identificados anteriormente'};
-          evidencias.set('principal',ultimoResultado);guardar(resposta);
-          return {...base,resposta,sql,linhas:r.rows.length,estado:{fonte:'sql',pergunta:q},diagnostico:{...diagnostico(),resultado:ultimoResultado}};
-        });
-      }
       const context=(continuacao&&Array.isArray(historico)?historico:[]).filter(m=>['user','assistant'].includes(m?.role)&&typeof m.content==='string').slice(-8).map(m=>({role:m.role,content:m.content.slice(0,6000)}));
       const approved=await conhecimento({limite:200});
       const semantic=recuperarContexto(q,approved,6);
@@ -401,7 +357,8 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
         const camposPedidos=metricasPedidas(q);
         const ferramentasAtuais=pagoDefinido?FERRAMENTAS.filter(t=>t.function.name!=='pedirEsclarecimento'):FERRAMENTAS;
         messages.push({role:'user',content:q});
-        let erroPendente=false,semConsulta=0,reparosRedacao=0,repeticoes=0;
+        let erroPendente=false,semConsulta=0,reparosRedacao=0,repeticoes=0,bairrosInspecionados=null;
+        const sqlBairros="SELECT bairro, COUNT(*)::text AS quantidade FROM public.obras_chatbot WHERE tipo_negocio = 'obra' GROUP BY bairro ORDER BY bairro NULLS FIRST";
         const errosPorParte=new Map();
         async function safeQuery(sql,params=[]) {
           await client.query('SAVEPOINT ferramenta_agente');
@@ -413,9 +370,9 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
           }
         }
         for(let rodada=1;rodada<=11;rodada++) {
-          const finalizar=rodada===11||repeticoes>=1||(partes.size>0&&completo()&&reparosRedacao===0);
+          const finalizar=rodada===11||repeticoes>=1||((partes.size>0||retomarSelecao||ultimoResultado?.interpretacao_bairros)&&completo()&&reparosRedacao===0);
           if(finalizar)messages.push({role:'system',content:'Encerre agora sem ferramentas. Use somente resultados válidos já obtidos. Se houver partes pendentes, diga claramente que a resposta é parcial. Não invente os resultados faltantes.'});
-          const out=await callIA(messages,retomarSelecao&&camposPedidos.length&&!ultimoResultado?FERRAMENTAS.filter(t=>t.function.name==='consultarSelecao'):ferramentasAtuais,{provider,tool_choice:finalizar?'none':ultimoResultado&&!erroPendente?'auto':'required',max_tokens:3500,reasoning_effort:ultimoResultado&&!erroPendente?'low':undefined});
+          const out=await callIA(messages,retomarSelecao&&!ultimoResultado?FERRAMENTAS.filter(t=>t.function.name==='consultarSelecao'):ferramentasAtuais,{provider,tool_choice:finalizar?'none':ultimoResultado&&!erroPendente?'auto':'required',max_tokens:3500,reasoning_effort:ultimoResultado&&!erroPendente?'low':undefined});
           provider=out.provider??provider;
           const msg=out.message, calls=msg?.tool_calls||[];
           if(!calls.length) {
@@ -463,10 +420,22 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
               a=JSON.parse(call.function.arguments);
               parte=partes.size?(texto(a?.parte)||'principal'):'principal';
               if(!a || typeof a!=='object' || Array.isArray(a)) throw Error('Argumentos inválidos.');
-              if(name==='consultarSelecao') {
+              if(name==='inspecionarBairros') {
+                const r=await safeQuery(sqlBairros);
+                if(r.rows.length>500)throw Error('Mais de 500 localizações distintas. Use consultarBanco com inspeção paginada e agregação SQL.');
+                bairrosInspecionados=r.rows;
+                result={status:'ok',rows:r.rows,total_obras:r.rows.reduce((sum,row)=>sum+Number(row.quantidade),0),orientacao:'Interprete cada localização e envie o mapeamento completo a agruparBairros. Não some nem redija o ranking antes da execução.'};
+              } else if(name==='agruparBairros') {
+                if(!bairrosInspecionados)throw Error('Inspecione as localizações antes de propor o agrupamento.');
+                if(partes.size&&!partes.has(parte))throw Error('Use uma parte registrada no plano.');
+                const rows=calcularBairrosInterpretados(bairrosInspecionados,a.mapa);
+                result={status:'ok',rows,sql:sqlBairros,params:[],parte,pergunta:partes.get(parte)||q,criterio:'Obras físicas agrupadas segundo interpretação da IA sobre localizações reais; cada registro contado uma vez',has_more:false,interpretacao_bairros:true,mapa:a.mapa};
+                evidencias.set(parte,result);pendentes.delete(parte);ultimoSQL=result.sql;ultimoResultado=result;erroPendente=pendentes.size>0;resultadoAtualValido=completo();
+              } else if(name==='consultarSelecao') {
                 if(!retomarSelecao)throw Error('Não há seleção identificada para esta referência. Não adivinhe os IDs.');
                 const cols=[...new Set(a.colunas||[])];
                 if(!Array.isArray(a.colunas)||!cols.length||cols.length>20||cols.some(c=>typeof c!=='string'||!estrutura.some(x=>x.schema_name==='public'&&x.table_name==='obras'&&x.column_name===c)))throw Error('Escolha colunas existentes em public.obras.');
+                if(perguntaStatusSelecao(q)&&!cols.includes('status')&&!cols.includes('status_original'))throw Error('Inclua a situação da seleção para responder ao pedido atual.');
                 if(camposPedidos.some(c=>!cols.includes(c)&&!(c==='valor_contratado'&&cols.includes('valor_total'))))throw Error('Inclua todas as métricas pedidas: '+camposPedidos.join(', '));
                 const selection=anterior.contexto.selecao;
                 const params=selection.flatMap(r=>[r.id,r.objeto]);
@@ -548,7 +517,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
               }
               trace.push({rodada,ferramenta:name,sucesso:true,...(['consultarBanco','consultarSelecao'].includes(name)?{parte,sql:result.sql,params:result.params,linhas:result.rows.length,cache:result.cache}:{})});
             } catch(e) {
-              if(['consultarBanco','consultarSelecao'].includes(name)) {errosPorParte.set(parte,(errosPorParte.get(parte)||0)+1);pendentes.add(parte);evidencias.delete(parte);erroPendente=true;resultadoAtualValido=false;}
+                if(['consultarBanco','consultarSelecao','agruparBairros'].includes(name)) {errosPorParte.set(parte,(errosPorParte.get(parte)||0)+1);pendentes.add(parte);evidencias.delete(parte);erroPendente=true;resultadoAtualValido=false;}
               result={status:'error',sqlstate:e.code||null,mensagem:texto(e.message).slice(0,2000),detalhe:e.detail||null,dica:e.hint||null,
                 orientacao:'Corrija a consulta com base no catálogo e no erro real, preservando o pedido. Vazio não é erro.'};
               trace.push({rodada,ferramenta:name,sucesso:false,parte,sql:a?.sql,params:a?.params,...result});
