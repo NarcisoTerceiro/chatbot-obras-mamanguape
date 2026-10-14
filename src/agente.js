@@ -50,10 +50,10 @@ function tokens(s) {
 // Catálogo (colunas, tipos e valores frequentes) - recalculado só quando
 // a lista de linhas muda (o sheets.js já mantém o cache).
 // ------------------------------------------------------------
-let catalogoCache = { ref: null, cat: null };
+const catalogoCache = new WeakMap();
 
 function montarCatalogo(linhas) {
-  if (catalogoCache.ref === linhas) return catalogoCache.cat;
+  if (catalogoCache.has(linhas)) return catalogoCache.get(linhas);
   const colunas = new Map();
   for (const l of linhas) {
     for (const [c, v] of Object.entries(l)) {
@@ -79,7 +79,7 @@ function montarCatalogo(linhas) {
   });
   const abas = [...new Set(linhas.map((l) => l._aba))];
   const cat = { colunas: lista, abas, total: linhas.length };
-  catalogoCache = { ref: linhas, cat };
+  catalogoCache.set(linhas, cat);
   return cat;
 }
 
@@ -256,10 +256,11 @@ function extrairJSON(t) {
   try { return JSON.parse(s.slice(i, j + 1)); } catch { return null; }
 }
 
-async function planoIA(pergunta, historico, cat) {
-  const anterior = [...historico].reverse().find((m) => m?.role === "assistant" && m.estado?.plano)?.estado?.plano;
+async function planoIA(pergunta, historico, cat, categoria) {
+  const anteriorEstado = [...historico].reverse().find((m) => m?.role === "assistant" && m.estado?.plano)?.estado;
+  const anterior = anteriorEstado?.categoria === categoria ? anteriorEstado.plano : null;
   const conversa = historico.slice(-4).map((m) => `${m.role === "user" ? "Usuário" : "Bot"}: ${String(m.content || "").slice(0, 300)}`).join("\n");
-  const sistema = `Você converte perguntas em português sobre uma planilha em um PLANO JSON. Responda SÓ o JSON.
+  const sistema = `Você converte perguntas em português sobre a planilha de obras de Mamanguape em um PLANO JSON. Responda SÓ o JSON.\nUniverso desta pergunta: SOMENTE ${CATEGORIAS[categoria].rotulo} (aba(s): ${cat.abas.join(", ")}). Não use dados de outras categorias.
 Colunas disponíveis (use o nome EXATO):
 ${resumoCatalogo(cat)}
 
@@ -292,6 +293,107 @@ function buscaLivre(pergunta, linhas) {
   }).filter((x) => x.s >= Math.max(1, Math.ceil(ts.length / 2))).sort((a, b) => b.s - a.s).map((x) => x.l);
 }
 
+
+// ------------------------------------------------------------
+// Categorias: cada aba é um universo separado. Obras, projetos,
+// licitações, pavimentação e pendências NUNCA são misturados.
+// ------------------------------------------------------------
+const CATEGORIAS = {
+  obra: { rotulo: "obras contratadas/em andamento", nome: "obra(s)" },
+  licitacao: { rotulo: "licitações", nome: "licitação(ões)" },
+  projeto: { rotulo: "projetos", nome: "projeto(s)" },
+  pavimentacao: { rotulo: "pavimentação de ruas", nome: "rua(s)" },
+  pendencia: { rotulo: "pendências", nome: "pendência(s)" },
+  recurso_proprio: { rotulo: "recursos próprios a pagar", nome: "registro(s)" },
+  outros: { rotulo: "outras abas", nome: "registro(s)" },
+};
+
+function categoriaDaAba(aba = "") {
+  const a = norm(aba);
+  if (/licit/.test(a)) return "licitacao";
+  if (/projet/.test(a)) return "projeto";
+  if (/paviment|calcament/.test(a)) return "pavimentacao";
+  if (/pendenc/.test(a)) return "pendencia";
+  if (/andamento|obra|contrat/.test(a)) return "obra";
+  return "outros";
+}
+
+// Aba sem nome claro (ex.: Sheet6): a aba inteira é classificada pelo conteúdo.
+const categoriaAbaCache = new WeakMap();
+function mapaCategorias(linhas) {
+  if (categoriaAbaCache.has(linhas)) return categoriaAbaCache.get(linhas);
+  const mapa = new Map();
+  for (const l of linhas) {
+    if (mapa.get(l._aba) === "recurso_proprio") continue;
+    let c = categoriaDaAba(l._aba);
+    if (c === "outros") {
+      const txt = norm(Object.keys(l).join(" ") + " " + Object.values(l).join(" "));
+      if (/recursos? propri|a serem pagos|contrapartida/.test(txt)) c = "recurso_proprio";
+    }
+    if (!mapa.has(l._aba) || c !== "outros") mapa.set(l._aba, c);
+  }
+  categoriaAbaCache.set(linhas, mapa);
+  return mapa;
+}
+function categoriaDaLinha(l, linhas) {
+  return linhas ? mapaCategorias(linhas).get(l._aba) : categoriaDaAba(l._aba);
+}
+
+function categoriaDaPergunta(p, anterior) {
+  const q = norm(p);
+  if (/\bpendenc/.test(q)) return "pendencia";
+  if (/\blicita|\bedital|\bhomolog|\bhabilita|\bproposta analisada|\bpregao|\bcertame/.test(q)) return "licitacao";
+  if (/\bprojeto/.test(q)) return "projeto";
+  if (/\bpaviment|\bcalcament|\basfalt|\bmeio[ -]fio|\bruas?\b.*\bpaviment|\bm2\b|\bm²/.test(q)) return "pavimentacao";
+  if (/recursos? propri.*(pagar|pago)|a serem pagos|contrapartida/.test(q)) return "recurso_proprio";
+  if (/\bobras?\b|\bcontrato|\baditivo|\breajuste|\bexecutad|\bsaldo devedor|\bempresa/.test(q)) return "obra";
+  return anterior || "obra";
+}
+
+// ------------------------------------------------------------
+// Redação final pela IA: explica a resposta em linguagem simples e
+// organiza para WhatsApp. A IA NÃO pode mudar números: se algum número
+// da resposta calculada sumir ou aparecer um novo, usamos a original.
+// ------------------------------------------------------------
+const REDIGIR = process.env.AGENTE_REDIGIR !== "false";
+// Ignora a numeração de listas ("1.", "2.") — só compara dados reais.
+const numerosDe = (t) => (String(t).replace(/^\s*\d+[.)]\s/gm, "").match(/\d[\d.,]*/g) || [])
+  .map((n) => n.replace(/[.,]+$/, ""));
+
+async function redigirParaWhatsApp(pergunta, respostaBase, categoria) {
+  if (!REDIGIR) return respostaBase;
+  const sistema = `Você é o assistente de obras da Prefeitura de Mamanguape no WhatsApp.
+Reescreva a RESPOSTA CALCULADA para o cidadão, de forma clara, educada e organizada.
+Regras OBRIGATÓRIAS:
+- Use SOMENTE os dados da resposta calculada. Não invente, não arredonde, não some, não omita números, nomes ou valores.
+- Copie números e valores em R$ exatamente como estão.
+- Comece com 1 frase curta que responde direto a pergunta (ex.: "Hoje são *2* obras concluídas.").
+- Depois, se houver lista, organize em tópicos curtos, um item por linha, com o nome em *negrito*.
+- Termine com 1 linha explicando de onde veio a informação (${CATEGORIAS[categoria]?.rotulo || "planilha"}) e, se fizer sentido, sugira um próximo filtro (bairro, status, empresa…).
+- Formatação de WhatsApp: *negrito*, _itálico_, listas com "•" ou "1.". NÃO use markdown (#, **, tabelas, links em colchetes).
+- Pode usar no máximo 2 emojis discretos (📍 🏗️ 💰 📋 ✅ ⏳).
+- Máximo de 1200 caracteres.`;
+  try {
+    const texto = await chamarIAbruta([
+      { role: "system", content: sistema },
+      { role: "user", content: `Pergunta: ${pergunta}\n\nRESPOSTA CALCULADA:\n${respostaBase}` },
+    ], { max_tokens: 700, temperature: 0.2 });
+    const final = String(texto || "").replace(/\*\*(.+?)\*\*/g, "*$1*").replace(/^#+\s*/gm, "").trim();
+    if (!final) return respostaBase;
+    const antes = new Set(numerosDe(respostaBase)), depois = new Set(numerosDe(final));
+    const perdeu = [...antes].some((n) => !depois.has(n));
+    const inventou = [...depois].some((n) => !antes.has(n) && n.length > 1);
+    if (perdeu || inventou) {
+      console.warn("AGENTE: redação descartada (números divergentes).");
+      return respostaBase;
+    }
+    return final.slice(0, 3500);
+  } catch (e) {
+    console.error("AGENTE: falha na redação:", e.message);
+    return respostaBase;
+  }
+}
+
 // ------------------------------------------------------------
 function respostaSocial(pergunta = "") {
   const p = norm(pergunta);
@@ -314,39 +416,53 @@ export async function responderPergunta(pergunta, historico = [], _opcoes = {}) 
     console.error("AGENTE: falha ao ler planilha:", e.message);
     return { resposta: "Não consegui acessar a planilha agora. Tente novamente em instantes.", erro: e.message };
   }
-  const cat = montarCatalogo(linhas);
+  const hist = Array.isArray(historico) ? historico : [];
+  const catAnterior = [...hist].reverse().find((m) => m?.role === "assistant" && m.estado?.categoria)?.estado?.categoria;
+  const categoria = categoriaDaPergunta(texto, catAnterior);
+  const universo = linhas.filter((l) => categoriaDaLinha(l, linhas) === categoria);
+  if (!universo.length) return { resposta: `Não encontrei dados de ${CATEGORIAS[categoria].rotulo} na planilha.`, modoAgente: "categoria_vazia", estado: { categoria } };
+
+  // Licitações têm dois campos de análise diferentes: pergunta qual antes.
+  const pn = norm(texto);
+  if (categoria === "licitacao" && /\bnao\b[\s\S]{0,40}\banalisad|\banalisad[\s\S]{0,40}\bnao\b/.test(pn) && !/propost|habilit/.test(pn))
+    return { resposta: "Você quer as licitações com *proposta* não analisada ou com *habilitação* não analisada?", modoAgente: "clarificacao", estado: { categoria } };
+
+  const cat = montarCatalogo(universo);
 
   let plano = planoLocal(texto, cat), modo = "regra_local";
   if (!plano) {
-    try { plano = await planoIA(texto, Array.isArray(historico) ? historico : [], cat); modo = "plano_ia"; }
+    try { plano = await planoIA(texto, hist, cat, categoria); modo = "plano_ia"; }
     catch (e) { console.error("AGENTE: IA indisponível:", e.message); plano = null; }
   }
 
   if (plano?.operacao === "fora_do_escopo")
-    return { resposta: "Só consigo responder sobre as informações da planilha de obras. O que você quer saber sobre elas?", modoAgente: "fora_do_escopo" };
+    return { resposta: "Só consigo responder sobre as informações da planilha de obras, projetos, licitações, pavimentação e pendências. O que você quer saber?", modoAgente: "fora_do_escopo" };
 
-  let res = plano ? executarPlano(plano, linhas, cat) : null;
+  let res = plano ? executarPlano(plano, universo, cat) : null;
 
-  // Se o plano não achou nada, tenta a busca livre antes de desistir.
+  // Nada encontrado: busca por palavras DENTRO da mesma categoria.
   if (!res || (res.total === 0 && ["listar", "detalhar", "contar"].includes(plano?.operacao))) {
-    const achadas = buscaLivre(texto, linhas);
+    const achadas = buscaLivre(texto, universo);
     if (achadas.length) {
       plano = { operacao: achadas.length <= 3 ? "detalhar" : "listar", filtros: [], descricao: "busca por palavras" };
       res = { op: plano.operacao, filtradas: achadas, total: achadas.length };
       modo = "busca_livre";
     }
   }
-  if (!res) return { resposta: "Não entendi bem. Pode reformular citando, por exemplo, o bairro, o status ou o nome da obra?", modoAgente: "sem_plano" };
+  if (!res) return { resposta: "Não entendi bem. Pode reformular citando, por exemplo, o bairro, o status ou o nome?", modoAgente: "sem_plano", estado: { categoria } };
+  plano.descricao = [CATEGORIAS[categoria].rotulo, plano.descricao].filter(Boolean).join(" — ");
 
-  const resposta = formatar(res, plano, cat);
+  const respostaBase = formatar(res, plano, cat);
+  const resposta = await redigirParaWhatsApp(texto, respostaBase, categoria);
   return {
     resposta,
     linhas: res.total,
     modoAgente: modo,
-    estado: { plano },
-    diagnostico: { plano, total_planilha: linhas.length, ms: Date.now() - inicio },
+    estado: { plano, categoria },
+    resposta_calculada: respostaBase,
+    diagnostico: { categoria, plano, registros_na_categoria: universo.length, total_planilha: linhas.length, ms: Date.now() - inicio },
   };
 }
 
 // Exportado para testes.
-export const _interno = { montarCatalogo, executarPlano, planoLocal, paraNumero, formatar, buscaLivre };
+export const _interno = { montarCatalogo, executarPlano, planoLocal, paraNumero, formatar, buscaLivre, numerosDe, redigirParaWhatsApp, categoriaDaPergunta, categoriaDaLinha };
