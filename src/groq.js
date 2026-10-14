@@ -1,21 +1,29 @@
+import { medirEtapa, medirRequisicaoIA, registrarChamadaIA } from "./telemetria.js";
+
 
 //  groq.js
-//  IA do chatbot: SOMENTE Groq + Gemini.
+//  IA do chatbot: NVIDIA -> Groq -> Gemini.
 //
 //  Estrategia:
-//    1) Groq primeiro, usando modelo leve/atual.
+//    1) NVIDIA primeiro quando NVIDIA_API_KEY estiver configurada.
 //    2) Se o modelo configurado nao existir, tenta outro modelo Groq atual.
 //    3) Em 429/erro, cai imediatamente para Gemini.
 //    4) Gemini usa a API nativa + x-goog-api-key (mais robusto que a camada
 //       OpenAI-compatible para chaves do Google AI Studio).
 //
 //  Variaveis de ambiente:
+//    NVIDIA_API_KEY
+//    NVIDIA_MODEL    opcional; padrao openai/gpt-oss-120b
+//    NVIDIA_BASE_URL opcional; padrao https://integrate.api.nvidia.com/v1
 //    GROQ_API_KEY
 //    GROQ_MODEL       opcional; padrao openai/gpt-oss-20b
 //    GEMINI_API_KEY   (tambem aceita GOOGLE_API_KEY / GOOGLE_GENAI_API_KEY)
 //    GEMINI_MODEL     opcional; padrao gemini-3.5-flash-lite
 // ============================================================
 
+const NVIDIA_KEY = (process.env.NVIDIA_API_KEY || "").trim();
+const NVIDIA_MODEL = (process.env.NVIDIA_MODEL || "openai/gpt-oss-120b").trim();
+const NVIDIA_BASE_URL = (process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1").trim();
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_KEY = (process.env.GROQ_API_KEY || "").trim();
 const GROQ_MODEL_ENV = (process.env.GROQ_MODEL || "").trim();
@@ -37,10 +45,11 @@ const GEMINI_KEY = (
 const GEMINI_MODEL = (process.env.GEMINI_MODEL || "gemini-3.5-flash-lite").trim();
 
 const PROVEDORES = [];
+if (NVIDIA_KEY) PROVEDORES.push({ nome: "nvidia" });
 if (GROQ_KEY) PROVEDORES.push({ nome: "groq" });
 if (GEMINI_KEY) PROVEDORES.push({ nome: "gemini" });
 if (PROVEDORES.length === 0) {
-  console.warn("AVISO: configure GROQ_API_KEY e/ou GEMINI_API_KEY.");
+  console.warn("AVISO: configure NVIDIA_API_KEY, GROQ_API_KEY ou GEMINI_API_KEY.");
 }
 
 // Contato para escalar quando o bot nao resolve (opcional, via .env).
@@ -98,7 +107,48 @@ const modelosGroqIndisponiveis = new Set();
 const modelosGroqDescansando = new Map();
 
 function dormir(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return medirEtapa("espera_ia", () => new Promise((resolve) => setTimeout(resolve, ms)));
+}
+
+async function consultarProvedor(url, opcoes, metadados) {
+  return medirRequisicaoIA(metadados, async () => {
+    const resp = await fetchComTimeout(url, opcoes);
+    if (!resp.ok) return { ok: false, status: resp.status, headers: resp.headers, erroTxt: await resp.text() };
+    return { ok: true, status: resp.status, headers: resp.headers, data: await resp.json() };
+  });
+}
+
+async function chamarNvidia(body) {
+  const url = new URL(NVIDIA_BASE_URL.replace(/\/+$/, "") + "/chat/completions");
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+    throw new Error("NVIDIA_BASE_URL deve ser HTTPS, sem credenciais, query ou fragmento.");
+  }
+  const corpo = {
+    model: NVIDIA_MODEL,
+    messages: body.messages,
+    max_tokens: limiteSaida(body),
+    stream: false,
+  };
+  if (body.temperature !== undefined) corpo.temperature = body.temperature;
+  // Parâmetro documentado para GPT-OSS; outros modelos recebem o payload comum.
+  if (/^openai\/gpt-oss-(?:20b|120b)$/i.test(NVIDIA_MODEL) && ["low", "medium", "high"].includes(body.reasoning_effort)) {
+    corpo.reasoning_effort = body.reasoning_effort;
+  }
+  const resp = await consultarProvedor(url.toString(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${NVIDIA_KEY}` },
+    body: JSON.stringify(corpo),
+  }, { provedor: "nvidia", modelo: NVIDIA_MODEL });
+  if (!resp.ok) {
+    const err = new Error(`nvidia respondeu ${resp.status}`);
+    err.status = resp.status;
+    if (resp.status === 429) err.retryAfterMs = retryDepoisMs(resp, resp.erroTxt);
+    throw err;
+  }
+  const texto = resp.data?.choices?.[0]?.message?.content?.trim() || "";
+  if (!texto) throw new Error("nvidia devolveu resposta vazia");
+  console.log(`DEBUG IA usada: NVIDIA (principal) | modelo: ${NVIDIA_MODEL}`);
+  return texto;
 }
 
 async function chamarGroq(body) {
@@ -122,17 +172,17 @@ async function chamarGroq(body) {
       delete corpo.reasoning_effort;
     }
 
-    const resp = await fetchComTimeout(GROQ_URL, {
+    const resp = await consultarProvedor(GROQ_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${GROQ_KEY}`,
       },
       body: JSON.stringify(corpo),
-    });
+    }, { provedor: "groq", modelo: model });
 
     if (!resp.ok) {
-      const erroTxt = await resp.text();
+      const erroTxt = resp.erroTxt;
       const ehModeloInexistente = resp.status === 404 || /model_not_found|does not exist|do not have access/i.test(erroTxt);
       if (ehModeloInexistente) {
         modelosGroqIndisponiveis.add(model);
@@ -155,7 +205,7 @@ async function chamarGroq(body) {
       throw err;
     }
 
-    const data = await resp.json();
+    const data = resp.data;
     const texto = data.choices?.[0]?.message?.content?.trim() || "";
     if (!texto) throw new Error(`groq (${model}) devolveu resposta vazia`);
     console.log(`DEBUG IA usada: Groq (principal) | modelo: ${model}`);
@@ -205,24 +255,24 @@ function corpoGeminiNativo(body) {
 
 async function chamarGemini(body) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
-  const resp = await fetchComTimeout(url, {
+  const resp = await consultarProvedor(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-goog-api-key": GEMINI_KEY,
     },
     body: JSON.stringify(corpoGeminiNativo(body)),
-  });
+  }, { provedor: "gemini", modelo: GEMINI_MODEL });
 
   if (!resp.ok) {
-    const erroTxt = await resp.text();
+    const erroTxt = resp.erroTxt;
     const err = new Error(`gemini respondeu ${resp.status}: ${erroTxt.slice(0, 320)}`);
     err.status = resp.status;
     if (resp.status === 429) err.retryAfterMs = retryDepoisMs(resp, erroTxt);
     throw err;
   }
 
-  const data = await resp.json();
+  const data = resp.data;
   const parts = data?.candidates?.[0]?.content?.parts || [];
   const texto = parts.map((p) => typeof p?.text === "string" ? p.text : "").join("").trim();
   if (!texto) throw new Error("gemini devolveu resposta vazia");
@@ -232,7 +282,7 @@ async function chamarGemini(body) {
 
 async function chamarIA(body, tentativa429 = 0) {
   if (PROVEDORES.length === 0) {
-    throw new Error("Nenhuma chave de IA configurada (GROQ_API_KEY ou GEMINI_API_KEY).");
+    throw new Error("Nenhuma chave de IA configurada (NVIDIA_API_KEY, GROQ_API_KEY ou GEMINI_API_KEY).");
   }
 
   const agora = Date.now();
@@ -255,7 +305,8 @@ async function chamarIA(body, tentativa429 = 0) {
   let ultimoErro = null;
   for (const prov of ordem) {
     try {
-      const texto = prov.nome === "groq" ? await chamarGroq(body) : await chamarGemini(body);
+      const texto = prov.nome === "nvidia" ? await chamarNvidia(body)
+        : prov.nome === "groq" ? await chamarGroq(body) : await chamarGemini(body);
       provedorDescansando.delete(prov.nome);
       return texto;
     } catch (e) {
@@ -270,9 +321,9 @@ async function chamarIA(body, tentativa429 = 0) {
         continue;
       }
 
-      if (prov.nome === "gemini" && (e.status === 401 || e.status === 403)) {
+      if (["nvidia", "gemini"].includes(prov.nome) && (e.status === 401 || e.status === 403)) {
         provedorDescansando.set(prov.nome, Date.now() + 10 * 60 * 1000);
-        console.error("DEBUG Gemini: confira GEMINI_API_KEY no Render (chave do Google AI Studio).");
+        console.error(`DEBUG ${prov.nome}: confira a chave e o acesso ao modelo no Render.`);
       }
       // Erro de um provedor nao impede tentar o seguinte.
     }
@@ -293,7 +344,7 @@ async function chamarIA(body, tentativa429 = 0) {
     }
   }
 
-  throw ultimoErro || new Error("Groq e Gemini falharam.");
+  throw ultimoErro || new Error("NVIDIA, Groq e Gemini falharam.");
 }
 
 // Normaliza o historico em mensagens que a API entende.
@@ -721,6 +772,7 @@ export async function gerarCodigoPython(pergunta, colunas) {
 //  fallback Groq -> Gemini e limpeza de parametros por provedor).
 // ============================================================
 export async function chamarIAbruta(mensagens, opcoes = {}) {
+  registrarChamadaIA(mensagens);
   const body = {
     max_tokens: Math.min(Number(opcoes.max_tokens) || 384, MAX_SAIDA_GLOBAL),
     messages: mensagens,

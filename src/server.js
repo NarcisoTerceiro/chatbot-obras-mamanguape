@@ -16,6 +16,7 @@ import { sincronizar } from "./ingestao.js";
 import { responderPergunta } from "./agente.js";
 import { enviarTexto } from "./whatsapp.js";
 import { queryReadOnly } from "./db.js";
+import { executarComMetricas, medirEtapa } from "./telemetria.js";
 
 const app = express();
 // Guarda os bytes originais para validar a assinatura HMAC enviada pela Meta.
@@ -222,7 +223,7 @@ app.get("/testar-agente", async (req, res) => {
   const historicoTeste = memoriaTeste.historico || [];
 
   try {
-    const r = await responderPergunta(pergunta, historicoTeste, { conversationId: chaveTeste });
+    const r = await responderPergunta(pergunta, historicoTeste, { conversationId: chaveTeste, canal: "teste" });
     const novasMensagens = [
       { role: "user", content: pergunta },
       {
@@ -249,6 +250,7 @@ app.get("/testar-agente", async (req, res) => {
       tentativas: r.tentativas || null,
       modo_agente: r.modoAgente || null,
       diagnostico: r.diagnostico || null,
+      metricas: r.metricas || null,
       erro: r.erro || null,
     });
   } catch (e) {
@@ -314,6 +316,10 @@ async function processarWebhook(payload) {
 
 async function processarMensagem(mensagem) {
   if (!mensagem || mensagem.type !== 'text' || !mensagem.from || !mensagem.text?.body) return;
+  return executarComMetricas("whatsapp", () => processarMensagemInterno(mensagem));
+}
+
+async function processarMensagemInterno(mensagem) {
   const de = mensagem.from;
   const pergunta = mensagem.text.body;
   console.log('Mensagem recebida:', { id: mensagem.id || null, de: mascararTelefone(de), caracteres: pergunta.length });
@@ -348,7 +354,8 @@ async function processarMensagem(mensagem) {
 
     // Nao persiste conversa no PostgreSQL. O contexto existe apenas em RAM
     // por ate 30 minutos sem atividade.
-    await enviarTexto(de, respostaAg);
+    await medirEtapa("envio_whatsapp", () => enviarTexto(de, respostaAg));
+    return resultadoAg || { erro: "falha_agente" };
  }
 
 export { app, processarWebhook };

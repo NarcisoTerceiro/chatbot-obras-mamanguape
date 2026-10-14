@@ -14,8 +14,13 @@
 // - A IA pode gerar SQL, mas o Node valida e o PostgreSQL executa READ ONLY.
 // ============================================================
 
-import { queryReadOnly } from "./db.js";
+import { queryReadOnly as consultarBanco } from "./db.js";
 import { chamarIAbruta } from "./groq.js";
+import { executarComMetricas, medirEtapa, registrarCacheSchema, registrarSaidaSQL } from "./telemetria.js";
+
+async function queryReadOnly(...args) {
+  return medirEtapa("banco", () => consultarBanco(...args));
+}
 
 // Bibliotecas Arquero/Decimal removidas: o agente usa apenas validacoes nativas do Node.
 
@@ -445,6 +450,18 @@ function objetoJSONEmTexto(texto = "") {
 
 function extrairSQLDaResposta(texto = "") {
   const t = stripThink(texto).trim();
+  const resultado = extrairSQLDaRespostaInterno(texto);
+  const formato = !t ? "vazio"
+    : objetoJSONEmTexto(t) ? "json"
+    : t.includes("```") ? "bloco"
+    : t.startsWith("{") ? "json_invalido"
+    : /\b(?:SELECT|WITH)\b/i.test(t) ? "texto" : "outro";
+  registrarSaidaSQL({ formato, caracteres: t.length, sqlExtraida: !!resultado.query });
+  return resultado;
+}
+
+function extrairSQLDaRespostaInterno(texto = "") {
+  const t = stripThink(texto).trim();
   if (!t) return { query: "", descricao: "" };
 
   // 1) JSON direto / 2) JSON embutido
@@ -488,9 +505,17 @@ async function relacaoPreferida() {
   throw new Error("Nao encontrei public.obras_chatbot nem public.obras no PostgreSQL.");
 }
 
-async function carregarSchemaContexto() {
+async function carregarSchemaContexto(...args) {
+  return medirEtapa("schema", () => carregarSchemaContextoInterno(...args));
+}
+
+async function carregarSchemaContextoInterno() {
   const agora = Date.now();
-  if (cacheSchema.contexto && agora - cacheSchema.quando < CACHE_SCHEMA_MS) return cacheSchema.contexto;
+  if (cacheSchema.contexto && agora - cacheSchema.quando < CACHE_SCHEMA_MS) {
+    registrarCacheSchema(true);
+    return cacheSchema.contexto;
+  }
+  registrarCacheSchema(false);
 
   const relacao = await relacaoPreferida();
   const colunasR = await queryReadOnly(`
@@ -635,7 +660,11 @@ function regrasNegocio(ctx) {
 // ------------------------------------------------------------
 // Geracao SQL (estagio 1)
 // ------------------------------------------------------------
-async function gerarSQL(pergunta, historico, ctx, correcao = "") {
+async function gerarSQL(...args) {
+  return medirEtapa("geracao_sql", () => gerarSQLInterno(...args));
+}
+
+async function gerarSQLInterno(pergunta, historico, ctx, correcao = "") {
   const prompt = `Voce e um SQL AGENT especializado em PostgreSQL para um chatbot de obras publicas.\n` +
     `Transforme a pergunta do usuario em UMA consulta SQL que responda exatamente ao pedido.\n\n` +
     `${regrasNegocio(ctx)}\n` +
@@ -679,7 +708,6 @@ async function gerarSQL(pergunta, historico, ctx, correcao = "") {
     `SCHEMA E DADOS REAIS:\n${schemaParaPrompt(ctx)}\n\n` +
     `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
     `ANCORA DO CONTEXTO ATUAL:\n${ancoraContextoRecente(historico)}\n\n` +
-    `REFERENCIA DE PESSOA NO CONTEXTO:\n${contextoReferenciaPessoa(historico, pergunta)}\n\n` +
     `REFERENCIA DE PESSOA NO CONTEXTO:\n${contextoReferenciaPessoa(historico, pergunta)}\n\n` +
     (correcao ? `CONTEXTO DE CORRECAO: ${correcao}\n\n` : "") +
     `PERGUNTA ATUAL: ${JSON.stringify(pergunta)}`;
@@ -767,7 +795,11 @@ function diagnosticoErroPG(e) {
 // ------------------------------------------------------------
 // Estagio 2: avaliacao e self-healing
 // ------------------------------------------------------------
-async function repararSQL({ pergunta, historico, ctx, sqlAtual, erro = null, linhas = [], motivoSemantico = "" }) {
+async function repararSQL(...args) {
+  return medirEtapa("reparo_sql", () => repararSQLInterno(...args));
+}
+
+async function repararSQLInterno({ pergunta, historico, ctx, sqlAtual, erro = null, linhas = [], motivoSemantico = "" }) {
   const erroTexto = erro
     ? `ERRO POSTGRESQL REAL:\n${jsonSeguro(erro, 4000)}`
     : motivoSemantico
@@ -1182,7 +1214,11 @@ function respostaContagemDiretaSegura(pergunta = "", rows = []) {
   return n === 1 ? "Encontrei 1 registro com esses critérios." : `Encontrei ${n} registros com esses critérios.`;
 }
 
-async function redigirResposta(pergunta, historico, sql, rows, ctx) {
+async function redigirResposta(...args) {
+  return medirEtapa("redacao", () => redigirRespostaInterno(...args));
+}
+
+async function redigirRespostaInterno(pergunta, historico, sql, rows, ctx) {
   // Ranking/agrupamento com uma dimensao + uma medida deve citar AMBOS.
   // Ex.: { engenheiro: "Eng. X", total_obras: 1 } nao pode virar apenas
   // "Ha 1 obra"; o nome do engenheiro e parte essencial da resposta.
@@ -1264,7 +1300,11 @@ function estadoPublico(ctx, execucao) {
 // ------------------------------------------------------------
 // Fluxo principal
 // ------------------------------------------------------------
-export async function responderPergunta(pergunta, historico = []) {
+export async function responderPergunta(pergunta, historico = [], opcoes = {}) {
+  return executarComMetricas(opcoes?.canal || "direto", () => responderPerguntaInterno(pergunta, historico));
+}
+
+async function responderPerguntaInterno(pergunta, historico = []) {
   const texto = textoSeguro(pergunta, 1600);
   if (!texto) return { resposta: "Pode enviar sua pergunta sobre as obras?", erro: "pergunta_vazia" };
 
