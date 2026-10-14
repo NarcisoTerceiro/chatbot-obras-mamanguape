@@ -3,6 +3,7 @@ import { withReadSnapshot, buscarConhecimentoAprovado } from './db.js';
 import { validarSQL, recuperarContexto } from './sqlUtils.js';
 import { parse } from 'pgsql-ast-parser';
 import { executarAnalisePython } from './analista_exec.js';
+import { restringirUniverso, resumirPerfil, DOCUMENTACAO_DADOS, TIPOS_REGISTRO } from './fundamentacao.js';
 
 const norm = v => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
 
@@ -195,7 +196,7 @@ function catalogoCompacto(estrutura){
   const tables=new Map(),extras=[];
   for(const c of estrutura){
     if(c.schema_name==='planilha')continue;
-    if(!c.column_name){extras.push(c);continue;}
+    if(!c.column_name){const {catalogo_objetos,...publicProfile}=c;extras.push(publicProfile);continue;}
     const key=c.schema_name+'.'+c.table_name;
     if(!tables.has(key))tables.set(key,[]);
     tables.get(key).push([c.column_name,c.data_type,...(c.descricao?[c.descricao]:[])]);
@@ -229,11 +230,14 @@ export const FERRAMENTAS = Object.freeze([
   tool('obterValoresColuna', 'Examina valores distintos de uma coluna ou célula original com contagens; uma página não é o universo. Para filtros compostos use consultarBanco com GROUP BY.', {tabela:{type:'string',enum:['obras','obras_chatbot']},coluna:{type:'string'},chave_original:{type:'string'},offset:{type:'integer',minimum:0},limite:{type:'integer',minimum:1,maximum:100}}, ['tabela','coluna']),
   tool('consultarBanco','Execute diretamente SQL SELECT/CTE somente leitura. Parâmetros opcionais. Para várias consultas independentes, use nome_resultado diferente para cada resultado; reutilize o nome ao corrigir. pedido_completo=false permite buscar informações adicionais antes de redigir.',{sql:{type:'string'},params:{type:'array',items:{anyOf:[{type:'string'},{type:'number'},{type:'boolean'},{type:'null'}]}},nome_resultado:{type:'string'},pedido_completo:{type:'boolean'},criterio:{type:'string'}},['sql']),
   tool('pedirEsclarecimento', 'Pergunta curta quando a ambiguidade ou falta de dados impede uma resposta fundamentada.', {pergunta:{type:'string'}}, ['pergunta']),
+  tool('inspecionarObjetos','Catálogo real de objetos por tipo e aba, para verificar cobertura de classificações e termos omitidos. Não retorna valores financeiros nem classifica temas automaticamente. Use tipo_registro para restringir; paginado.',{tipo_registro:{type:'string',enum:TIPOS_REGISTRO},offset:{type:'integer',minimum:0},limite:{type:'integer',minimum:1,maximum:200}},['tipo_registro']),
 ].map(t=>{
   if(['consultarBanco','carregarDados'].includes(t.function.name)){
     t.function.parameters.properties.escopo=escopoConsulta;
     t.function.parameters.required.push('escopo');
+    t.function.parameters.properties.tipo_registro={type:'string',enum:TIPOS_REGISTRO,description:'Universo da pergunta atual. Obras físicas usa obra; projetos usa projeto; registros de várias naturezas usa todos. Na continuação, os IDs anteriores definem o universo.'};
     t.function.description+=' Declare escopo. Com escopo=anterior, SQL deve ser SELECT sobre obras_selecionadas (mesmas colunas de obras_chatbot); Node aplica os IDs anteriores. Para carregarDados, usar_selecao=true também preserva a seleção.';
+    t.function.description+=' Com escopo=novo, informe tipo_registro: Node aplica essa restrição antes dos filtros SQL, sem depender de um WHERE manual.';
   }
   return t;
 }));
@@ -260,6 +264,8 @@ async function catalogo(client) {
     const abas=await client.query('SELECT planilha_id,aba,view_nome,colunas,registros,avisos,atualizada_em FROM public.planilha_abas WHERE ativa=true ORDER BY aba');
     r.rows.push({catalogo_abas:abas.rows.map(a=>({...a,colunas_disponiveis:a.colunas?.length||0,colunas:undefined}))});
   }
+  const inventory=await client.query('SELECT tipo_negocio, aba_origem, objeto, COUNT(*)::text AS registros FROM public.obras_chatbot GROUP BY tipo_negocio, aba_origem, objeto ORDER BY tipo_negocio, objeto, aba_origem LIMIT 10001');
+  r.rows.push({perfil_conteudo:resumirPerfil(inventory.rows.slice(0,10000)),catalogo_objetos:inventory.rows.slice(0,10000),perfil_parcial:inventory.rows.length>10000});
   return r.rows;
 }
 
@@ -340,7 +346,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
         const estruturaInicio=Date.now(),metadata=await estruturaAtual(client),estrutura=metadata.columns;
         tempos.estrutura_ms+=Date.now()-estruturaInicio;
         trace.push({ferramenta:'estrutura',sucesso:true,cache:metadata.cache});
-        const messages=[{role:'system',content:PROMPT}, {role:'system',content:'Documentação semântica recuperada (orientação, não resposta pronta):\n'+semantic.join('\n\n')},
+        const messages=[{role:'system',content:PROMPT+'\n'+DOCUMENTACAO_DADOS}, {role:'system',content:'Documentação semântica recuperada (orientação, não resposta pronta):\n'+semantic.join('\n\n')},
           {role:'system',content:'Colunas realmente disponíveis (nome, tipo, descrição opcional):\n'+JSON.stringify(catalogoCompacto(estrutura))},...context];
         if(anterior) messages.push({role:'system',content:'Memória opcional para continuações; não impõe filtros à pergunta atual. Valores serão relidos pelos IDs:\n'+JSON.stringify(memoriaPrompt)});
         const retomarSelecao=Array.isArray(selecaoAnterior)&&selecaoAnterior.length>0;
@@ -365,8 +371,8 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
           const finalizar=completo()&&!continuarFerramentas;
           // A redação recebe só pergunta, critérios e evidências: não recebe
           // novamente catálogo, histórico de ferramentas ou SQLs anteriores.
-          const redacao=finalizar?[{role:'system',content:PROMPT_REDACAO+' Confira se os critérios e resultados respondem ao pedido atual antes de escrever.'},
-            {role:'user',content:JSON.stringify({pergunta:q,escopo:escopoAtual,contexto:escopoAtual==='anterior'?context:[],consulta_anterior:escopoAtual==='anterior'?memoriaPrompt:null,colunas_disponiveis:estrutura.filter(c=>c.column_name&&c.table_name==='obras_chatbot').map(c=>c.column_name),evidencias:resultados().map(r=>({nome_resultado:r.parte,pedido:r.pergunta,criterio:r.criterio,parcial:!!r.has_more,rows:r.rows})),correcoes:problemasRedacao})}]:messages;
+          const redacao=finalizar?[{role:'system',content:PROMPT_REDACAO+'\n'+DOCUMENTACAO_DADOS+' Confira se os critérios e resultados respondem ao pedido atual antes de escrever.'},
+            {role:'user',content:JSON.stringify({pergunta:q,escopo:escopoAtual,contexto:escopoAtual==='anterior'?context:[],consulta_anterior:escopoAtual==='anterior'?memoriaPrompt:null,perfil_dados:estrutura.find(c=>c.perfil_conteudo)?.perfil_conteudo,colunas_disponiveis:estrutura.filter(c=>c.column_name&&c.table_name==='obras_chatbot').map(c=>c.column_name),evidencias:resultados().map(r=>({nome_resultado:r.parte,pedido:r.pergunta,criterio:r.criterio,parcial:!!r.has_more,rows:r.rows})),correcoes:problemasRedacao})}]:messages;
           const inicioIA=Date.now();tempos.ia_chamadas++;
           let out;
           try {out=await callIA(redacao,ferramentasAtuais,{provider,tool_choice:finalizar?'auto':'required',max_tokens:finalizar?2200:3000,reasoning_effort:process.env.IA_REASONING_EFFORT||'low'});tempos.ia_http_chamadas+=Number(out.http_requests)||1;}
@@ -413,6 +419,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
               if(['consultarBanco','carregarDados','consultarSelecao'].includes(name)){
                 const chosen=name==='consultarSelecao'||a.usar_selecao===true?'anterior':a.escopo;
                 if(!['novo','anterior'].includes(chosen))throw Error('Declare escopo novo ou anterior; se ambíguo, peça esclarecimento.');
+                if(chosen==='novo'&&!TIPOS_REGISTRO.includes(a.tipo_registro))throw Error('Declare tipo_registro para a busca nova. Não confunda todos os registros com obras físicas.');
                 if(escopoAtual&&chosen!==escopoAtual)throw Error('Não misture universo novo e anterior na mesma resposta. Esclareça o pedido.');
                 if(chosen==='anterior'&&!selecaoAnterior?.length)throw Error('Não há IDs anteriores. Esclareça quais registros deseja.');
                 escopoAtual=chosen;
@@ -430,7 +437,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
                   if(!Array.isArray(a.colunas)||cols.some(c=>!estrutura.some(x=>x.schema_name==='public'&&x.table_name==='obras'&&x.column_name===c)))throw Error('Escolha colunas existentes da seleção.');
                   params=selecaoAnterior.flatMap(r=>[r.id,r.objeto]);
                   sql=`SELECT ${cols.map(ident).join(', ')} FROM public.obras WHERE ${selecaoAnterior.map((r,i)=>`(id=$${2*i+1} AND objeto=$${2*i+2})`).join(' OR ')} ORDER BY id`;
-                }else {sql=validarSQL(a.sql);params=a.params??[];if(a.escopo==='anterior'){const scoped=sqlDaSelecao(sql,params,selecaoAnterior);sql=scoped.sql;params=scoped.params;}}
+                }else {sql=validarSQL(a.sql);params=a.params??[];if(a.escopo==='anterior'){const scoped=sqlDaSelecao(sql,params,selecaoAnterior);sql=scoped.sql;params=scoped.params;}else {const scoped=restringirUniverso(sql,params,a.tipo_registro);sql=scoped.sql;params=scoped.params;}}
                 if(!Array.isArray(params)||params.length>400||params.some(v=>v!==null&&!['string','number','boolean'].includes(typeof v)))throw Error('Parâmetros inválidos.');
                 const loaded=await safeQuery(`SELECT * FROM (${sql}) AS dados_analista LIMIT 10001`,params);
                 if(loaded.rows.length>10000)throw Error('Mais de 10.000 registros. Restrinja os dados ou use agregação SQL; a análise parcial foi bloqueada.');
@@ -467,6 +474,12 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
                 result={status:'ok',rows:r.rows,columns:r.fields?.map(f=>f.name)||[],sql,params,parte:'principal',pergunta:q,criterio:'Mesmos IDs e objetos da seleção anterior',has_more:false,selecao_preservada:true,operacao};
                 evidencias.clear();pendentes.clear();evidencias.set('principal',result);
                 ultimoSQL=sql;ultimoResultado=result;erroPendente=false;resultadoAtualValido=true;
+              } else if(name==='inspecionarObjetos') {
+                if(!TIPOS_REGISTRO.includes(a.tipo_registro))throw Error('Tipo de registro inválido.');
+                const inventory=estrutura.find(c=>c.catalogo_objetos)||{};
+                const rows=(inventory.catalogo_objetos||[]).filter(r=>a.tipo_registro==='todos'||r.tipo_negocio===a.tipo_registro);
+                const offset=Math.max(0,Math.trunc(Number(a.offset)||0)),limit=Math.min(200,Math.max(1,Math.trunc(Number(a.limite)||100)));
+                result={status:'ok',rows:rows.slice(offset,offset+limit),has_more:!!inventory.perfil_parcial||rows.length>offset+limit,universo:a.tipo_registro,orientacao:'Inspecione a cobertura temática; nomes iguais não autorizam deduplicar registros.'};
               } else if(name==='listarTabelas') {
                 const selected=a.tabela?estrutura.filter(c=>c.table_name===a.tabela&&(!a.schema||c.schema_name===a.schema)):estrutura.filter(c=>c.schema_name!=='planilha');
                 result={status:'ok',columns:selected};
@@ -493,6 +506,7 @@ export function criarAgente({chamarTools, snapshot=withReadSnapshot, conheciment
                 let sql=validarSQL(a.sql),params=a.params??[];
                 if(!Array.isArray(params)||params.length>100||params.some(v=>v!==null&&!['string','number','boolean'].includes(typeof v))) throw Error('Parâmetros SQL inválidos.');
                 if(a.escopo==='anterior'){const scoped=sqlDaSelecao(sql,params,selecaoAnterior);sql=scoped.sql;params=scoped.params;}
+                else {const scoped=restringirUniverso(sql,params,a.tipo_registro);sql=scoped.sql;params=scoped.params;}
                 if(!texto(a.criterio)) throw Error('Informe o critério escolhido.');
                 const key=JSON.stringify([sql,params]);
                 const cached=cache.get(key);
