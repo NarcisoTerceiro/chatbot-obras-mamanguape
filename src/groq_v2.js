@@ -225,6 +225,13 @@ async function chamarGroq(body) {
 
     if (!resp.ok) {
       const erroTxt = resp.erroTxt;
+      if (resp.status === 413 || /request too large|reduce your message size/i.test(erroTxt)) {
+        // Pergunta grande demais para o limite por minuto da conta Groq:
+        // nao adianta repetir; sai direto para o proximo provedor.
+        const err = new Error(`groq (${model}) pedido grande demais para o limite da conta (413)`);
+        err.status = 413;
+        throw err;
+      }
       const ehModeloInexistente = resp.status === 404 || /model_not_found|does not exist|do not have access/i.test(erroTxt);
       if (ehModeloInexistente) {
         modelosGroqIndisponiveis.add(model);
@@ -369,7 +376,7 @@ async function chamarIA(body, tentativa429 = 0) {
         provedorDescansando.set("nvidia", Date.now() + 20 * 1000);
       }
       const proximo = ordem[ordem.indexOf(prov) + 1];
-      if (proximo) console.log(`DEBUG IA: ${prov.nome} falhou -> caindo para ${proximo.nome}.`);
+      if (proximo) console.log(`DEBUG IA: ${prov.nome} falhou (${String(e.message).slice(0, 160)}) -> caindo para ${proximo.nome}.`);
 
       if (["nvidia", "gemini"].includes(prov.nome) && (e.status === 401 || e.status === 403)) {
         provedorDescansando.set(prov.nome, Date.now() + 10 * 60 * 1000);

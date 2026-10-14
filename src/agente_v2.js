@@ -608,10 +608,10 @@ function schemaParaPrompt(ctx) {
   // Isso reduz TPM sem esconder do agente os valores reais importantes.
   const valores = Object.entries(ctx.categorias || {})
     .filter(([, arr]) => arr?.length)
-    .map(([k, arr]) => `- ${k}: ${arr.slice(0, 24).join(" | ")}`)
+    .map(([k, arr]) => `- ${k}: ${arr.slice(0, 15).join(" | ")}`)
     .join("\n");
 
-  const objetos = (ctx.objetosCatalogo || []).slice(0, 100).map((r) => {
+  const objetos = (ctx.objetosCatalogo || []).slice(0, 60).map((r) => {
     const partes = [];
     if (r.tipo_negocio) partes.push(r.tipo_negocio);
     partes.push(r.objeto);
@@ -619,13 +619,13 @@ function schemaParaPrompt(ctx) {
     return `- ${partes.join(" | ")}`;
   }).join("\n");
 
-  const chavesExtras = (ctx.chavesDadosExtras || []).slice(0, 180).join(" | ");
+  const chavesExtras = (ctx.chavesDadosExtras || []).slice(0, 120).join(" | ");
 
   return `RELACAO AUTORIZADA: public.${ctx.relacao}\n\nCOLUNAS REAIS:\n${colunas}` +
     `\n\nCHAVES REAIS DE dados_extras (JSONB):\n${chavesExtras || "(nenhuma coletada)"}` +
     `\n\nVALORES REAIS IMPORTANTES:\n${valores || "(nao coletados)"}` +
     `\n\nCATALOGO DE OBJETOS REAIS (use para ligacao semantica; nao invente nomes):\n${objetos || "(nao coletado)"}` +
-    `\n\nUMA AMOSTRA DE FORMATO:\n${jsonSeguro(ctx.amostras, 2500)}`;
+    `\n\nUMA AMOSTRA DE FORMATO:\n${jsonSeguro(ctx.amostras, 1200)}`;
 }
 
 function regrasNegocio(ctx) {
