@@ -23,6 +23,13 @@ import { medirEtapa, medirRequisicaoIA, registrarChamadaIA } from "./telemetria.
 
 const NVIDIA_KEY = (process.env.NVIDIA_API_KEY || "").trim();
 const NVIDIA_MODEL = (process.env.NVIDIA_MODEL || "openai/gpt-oss-120b").trim();
+// Modelos NVIDIA tentados em ordem ANTES de sair da NVIDIA. Pode sobrescrever
+// com NVIDIA_MODELOS="modelo1,modelo2". So depois de todos falharem cai p/ Groq.
+const NVIDIA_MODELOS = [...new Set([
+  NVIDIA_MODEL,
+  ...String(process.env.NVIDIA_MODELOS || "meta/llama-3.3-70b-instruct").split(","),
+].map((m) => m.trim()).filter(Boolean))];
+const modelosNvidiaIndisponiveis = new Set();
 const NVIDIA_BASE_URL = (process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1").trim();
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_KEY = (process.env.GROQ_API_KEY || "").trim();
@@ -45,6 +52,8 @@ const GEMINI_KEY = (
 const GEMINI_MODEL = (process.env.GEMINI_MODEL || "gemini-3.5-flash-lite").trim();
 
 const PROVEDORES = [];
+// Ordem FIXA de prioridade: NVIDIA sempre primeiro; Groq e Gemini so entram
+// quando a NVIDIA falhar (erro, timeout, limite ou resposta vazia).
 if (NVIDIA_KEY) PROVEDORES.push({ nome: "nvidia" });
 if (GROQ_KEY) PROVEDORES.push({ nome: "groq" });
 if (GEMINI_KEY) PROVEDORES.push({ nome: "gemini" });
@@ -118,37 +127,70 @@ async function consultarProvedor(url, opcoes, metadados) {
   });
 }
 
+function textoDaRespostaOpenAI(data) {
+  const msg = data?.choices?.[0]?.message || {};
+  let texto = typeof msg.content === "string" ? msg.content
+    : Array.isArray(msg.content) ? msg.content.map((p) => p?.text || "").join("") : "";
+  // Remove raciocinio interno que alguns modelos devolvem no content.
+  texto = texto.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  return texto;
+}
+
 async function chamarNvidia(body) {
   const url = new URL(NVIDIA_BASE_URL.replace(/\/+$/, "") + "/chat/completions");
   if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
     throw new Error("NVIDIA_BASE_URL deve ser HTTPS, sem credenciais, query ou fragmento.");
   }
-  const corpo = {
-    model: NVIDIA_MODEL,
-    messages: body.messages,
-    max_tokens: limiteSaida(body),
-    stream: false,
-  };
-  if (body.temperature !== undefined) corpo.temperature = body.temperature;
-  // Parâmetro documentado para GPT-OSS; outros modelos recebem o payload comum.
-  if (/^openai\/gpt-oss-(?:20b|120b)$/i.test(NVIDIA_MODEL) && ["low", "medium", "high"].includes(body.reasoning_effort)) {
-    corpo.reasoning_effort = body.reasoning_effort;
+  let ultimoErro = null;
+  for (const modelo of NVIDIA_MODELOS) {
+    if (modelosNvidiaIndisponiveis.has(modelo)) continue;
+    const corpo = {
+      model: modelo,
+      messages: body.messages,
+      max_tokens: limiteSaida(body),
+      stream: false,
+    };
+    if (body.temperature !== undefined) corpo.temperature = body.temperature;
+    if (/^openai\/gpt-oss-(?:20b|120b)$/i.test(modelo) && ["low", "medium", "high"].includes(body.reasoning_effort)) {
+      corpo.reasoning_effort = body.reasoning_effort;
+    }
+    let resp;
+    try {
+      resp = await consultarProvedor(url.toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${NVIDIA_KEY}` },
+        body: JSON.stringify(corpo),
+      }, { provedor: "nvidia", modelo });
+    } catch (e) {
+      // Timeout/rede: tenta o proximo modelo NVIDIA e depois cai p/ Groq.
+      ultimoErro = new Error(`nvidia (${modelo}) sem resposta: ${e.name === "AbortError" ? "timeout" : e.message}`);
+      console.warn(`DEBUG NVIDIA: ${ultimoErro.message}`);
+      continue;
+    }
+    if (!resp.ok) {
+      const erroTxt = resp.erroTxt || "";
+      if (resp.status === 404 || /model_not_found|not found|does not exist|not available/i.test(erroTxt)) {
+        modelosNvidiaIndisponiveis.add(modelo);
+      }
+      const err = new Error(`nvidia (${modelo}) respondeu ${resp.status}: ${erroTxt.slice(0, 200)}`);
+      err.status = resp.status;
+      if (resp.status === 429) err.retryAfterMs = retryDepoisMs(resp, erroTxt);
+      // Chave invalida vale para todos os modelos: sai direto para o fallback.
+      if (resp.status === 401 || resp.status === 403) throw err;
+      ultimoErro = err;
+      console.warn(`DEBUG NVIDIA: ${err.message.slice(0, 120)}; tentando proximo modelo.`);
+      continue;
+    }
+    const texto = textoDaRespostaOpenAI(resp.data);
+    if (!texto) {
+      ultimoErro = new Error(`nvidia (${modelo}) devolveu resposta vazia`);
+      console.warn(`DEBUG NVIDIA: ${ultimoErro.message}`);
+      continue;
+    }
+    console.log(`DEBUG IA usada: NVIDIA (principal) | modelo: ${modelo}`);
+    return texto;
   }
-  const resp = await consultarProvedor(url.toString(), {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${NVIDIA_KEY}` },
-    body: JSON.stringify(corpo),
-  }, { provedor: "nvidia", modelo: NVIDIA_MODEL });
-  if (!resp.ok) {
-    const err = new Error(`nvidia respondeu ${resp.status}`);
-    err.status = resp.status;
-    if (resp.status === 429) err.retryAfterMs = retryDepoisMs(resp, resp.erroTxt);
-    throw err;
-  }
-  const texto = resp.data?.choices?.[0]?.message?.content?.trim() || "";
-  if (!texto) throw new Error("nvidia devolveu resposta vazia");
-  console.log(`DEBUG IA usada: NVIDIA (principal) | modelo: ${NVIDIA_MODEL}`);
-  return texto;
+  throw ultimoErro || new Error("Nenhum modelo NVIDIA disponivel.");
 }
 
 async function chamarGroq(body) {
@@ -206,9 +248,9 @@ async function chamarGroq(body) {
     }
 
     const data = resp.data;
-    const texto = data.choices?.[0]?.message?.content?.trim() || "";
+    const texto = textoDaRespostaOpenAI(data);
     if (!texto) throw new Error(`groq (${model}) devolveu resposta vazia`);
-    console.log(`DEBUG IA usada: Groq (principal) | modelo: ${model}`);
+    console.log(`DEBUG IA usada: Groq (fallback 1) | modelo: ${model}`);
     return texto;
   }
 
@@ -276,7 +318,7 @@ async function chamarGemini(body) {
   const parts = data?.candidates?.[0]?.content?.parts || [];
   const texto = parts.map((p) => typeof p?.text === "string" ? p.text : "").join("").trim();
   if (!texto) throw new Error("gemini devolveu resposta vazia");
-  console.log(`DEBUG IA usada: Gemini (fallback) | modelo: ${GEMINI_MODEL}`);
+  console.log(`DEBUG IA usada: Gemini (fallback 2) | modelo: ${GEMINI_MODEL}`);
   return texto;
 }
 
@@ -320,6 +362,14 @@ async function chamarIA(body, tentativa429 = 0) {
         // NAO interrompe: o proximo provedor (por exemplo Gemini) e tentado imediatamente.
         continue;
       }
+
+      if (prov.nome === "nvidia" && (!e.status || e.status >= 500)) {
+        // Instabilidade/timeout: pausa curta para nao atrasar cada pergunta,
+        // e logo volta a tentar a NVIDIA como principal.
+        provedorDescansando.set("nvidia", Date.now() + 20 * 1000);
+      }
+      const proximo = ordem[ordem.indexOf(prov) + 1];
+      if (proximo) console.log(`DEBUG IA: ${prov.nome} falhou -> caindo para ${proximo.nome}.`);
 
       if (["nvidia", "gemini"].includes(prov.nome) && (e.status === 401 || e.status === 403)) {
         provedorDescansando.set(prov.nome, Date.now() + 10 * 60 * 1000);

@@ -703,6 +703,12 @@ async function gerarSQLInterno(pergunta, historico, ctx, correcao = "") {
     `- Para alvo proprio/especifico (nome de bairro, rua, equipamento com nome proprio), seja conservador: nao expanda para conceitos diferentes.\n` +
     `- Em busca ampla por assunto, voce pode procurar em objeto, categoria e dados_extras::text quando essas colunas existirem; mantenha o tipo_negocio correto.\n` +
     `- Se um termo livre puder ser nome parcial, use ILIKE/LOWER de forma tolerante.\n` +
+    `- QUALQUER PERGUNTA SOBRE A PLANILHA deve virar consulta: cada coluna e cada chave de dados_extras e um campo consultavel (datas, prazos, contratos, numeros de processo, empresas, fiscais, observacoes, percentuais, aditivos, enderecos etc.). Nunca responda query="" so porque a pergunta e incomum; procure a coluna ou a chave de dados_extras mais proxima do conceito pedido.\n` +
+    `- BUSCA TOLERANTE A ACENTO E CAIXA: para texto livre compare com translate(lower(campo),'áàâãäéèêëíìîïóòôõöúùûüç','aaaaaeeeeiiiiooooouuuuc') ILIKE '%termo_sem_acento%'.\n` +
+    `- DATAS: chaves de dados_extras sao texto; para comparar/ordenar datas use to_date quando o formato for claro (ex.: dd/mm/yyyy) e proteja com um filtro de formato (campo ~ '^\\d{2}/\\d{2}/\\d{4}$'). Para 'atrasadas'/'vencidas' compare a previsao de termino com CURRENT_DATE.\n` +
+    `- NUMEROS EM TEXTO: valores em dados_extras podem vir como 'R$ 1.234,56'; converta com NULLIF(regexp_replace(replace(replace(campo,'.',''),',','.'),'[^0-9.-]','','g'),'')::numeric.\n` +
+    `- COMPARACOES E PERCENTUAIS: 'qual percentual', 'quanto % do total', 'comparar bairros/empresas/anos' -> use GROUP BY e calcule participacao com SUM(x) / NULLIF(SUM(SUM(x)) OVER (),0).\n` +
+    `- PERGUNTAS ABERTAS ('resumo', 'panorama', 'como estao as obras', 'o que tem na planilha'): retorne um resumo agrupado por tipo_negocio/status com COUNT e SUM(valor_total).\n` +
     `- Retorne colunas suficientes para responder, mas nao SELECT * sem necessidade.\n` +
     `- Retorne SOMENTE JSON {"description":"...","query":"SELECT ..."}. Se nao puder responder com o schema, use query="".\n\n` +
     `SCHEMA E DADOS REAIS:\n${schemaParaPrompt(ctx)}\n\n` +
@@ -1263,7 +1269,9 @@ async function redigirRespostaInterno(pergunta, historico, sql, rows, ctx) {
     `PERCENTUAL: percentual_executado e percentual de EXECUCAO. Escreva sempre 'X% executado' ou 'X% de execucao'. NUNCA escreva 'X% concluido' para uma obra que ainda esta em andamento.\n` +
     `LICITACAO: se status_original vier no resultado, use-o como etapa/status especifico da licitacao (ex.: 'Habilitacao em andamento', 'Edital publicado'). Nao esconda essa etapa atras do rotulo generico 'Em licitacao'.\n` +
     `Recurso e tipo_recurso sao campos diferentes; nao troque um pelo outro.\n` +
-    `Nao mostre SQL ao usuario na resposta natural.\n\n` +
+    `Nao mostre SQL ao usuario na resposta natural.\n` +
+    `Se a pergunta pedir algo que os dados retornados respondem so em parte, responda a parte disponivel e diga de forma simples qual informacao nao esta preenchida na planilha.\n` +
+    `Datas: escreva no formato dd/mm/aaaa. Valores: R$ com separador brasileiro (R$ 1.234,56).\n\n` +
     `PERGUNTA: ${JSON.stringify(pergunta)}\n` +
     `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
     `SQL EXECUTADA: ${sql}\n` +
@@ -1334,6 +1342,12 @@ async function responderPerguntaInterno(pergunta, historico = []) {
     if (!gerada.query) {
       // Uma segunda tentativa curta so para formato/interpretacao, sem criar regra de frase.
       gerada = await gerarSQL(texto, historico, ctx, "A tentativa anterior nao produziu SQL. Gere uma consulta SELECT valida usando apenas o schema fornecido.");
+    }
+    if (!gerada.query) {
+      // Ultima tentativa: em vez de desistir, busca um recorte amplo da planilha
+      // e deixa a etapa de redacao responder com base nos registros reais.
+      gerada = await gerarSQL(texto, historico, ctx,
+        "Ainda sem SQL. Nao desista: escolha as colunas/chaves de dados_extras mais relacionadas a pergunta e retorne ate 60 registros com objeto e esses campos, ou um resumo agrupado se a pergunta for geral.");
     }
     if (!gerada.query) {
       return {
