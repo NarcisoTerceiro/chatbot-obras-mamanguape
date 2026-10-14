@@ -11,7 +11,7 @@ function headerScore(row){
   return score+Number(words.some(word=>new RegExp(`\\b${word}\\b`).test(label)));
  },0);
 }
-export function acharLinhaCabecalho(rows,maxLinhasAnalisadas=15){
+export function acharLinhaCabecalho(rows,maxLinhasAnalisadas=20){
  if(!Array.isArray(rows)||!rows.length)return -1;
  let best=-1,score=1;
  for(let i=0;i<Math.min(rows.length,maxLinhasAnalisadas);i++){
