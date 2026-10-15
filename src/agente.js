@@ -14,13 +14,8 @@
 // - A IA pode gerar SQL, mas o Node valida e o PostgreSQL executa READ ONLY.
 // ============================================================
 
-import { queryReadOnly as consultarBanco } from "./db.js";
+import { queryReadOnly } from "./db.js";
 import { chamarIAbruta } from "./groq.js";
-import { executarComMetricas, medirEtapa, registrarCacheSchema, registrarSaidaSQL } from "./telemetria.js";
-
-async function queryReadOnly(...args) {
-  return medirEtapa("banco", () => consultarBanco(...args));
-}
 
 // Bibliotecas Arquero/Decimal removidas: o agente usa apenas validacoes nativas do Node.
 
@@ -31,6 +26,71 @@ const CACHE_SCHEMA_MS = Math.max(60_000, Math.min(Number(process.env.AGENTE_CACH
 const MAX_HISTORICO_PROMPT = 6;
 
 let cacheSchema = { quando: 0, contexto: null };
+const cacheRecortesArea = new Map();
+
+// O modelo classifica somente o catalogo de identificadores/nomes, nao a
+// planilha inteira. Nao existe um dicionario fixo de siglas de saude/educacao.
+async function resolverRecorteArea(pergunta, ctx) {
+  if (!/\b(area|setor)\b/.test(normalizar(pergunta))) return ctx;
+  const todos = ctx.objetosCatalogo || [];
+  // Um equipamento chamado "Area de Convivencia ..." e um alvo proprio,
+  // nao uma solicitacao de classificacao de um setor.
+  if (todos.some((r) => r.objeto && normalizar(pergunta).includes(normalizar(r.objeto)))) return ctx;
+  const universo = universoNegocioDaPergunta(pergunta);
+  const catalogo = universo ? todos.filter((r) => r.tipo_negocio === universo) : todos;
+  if (!ctx.colunas.some((c) => c.column_name === "id") || !catalogo.length) return ctx;
+  if (todos.length >= 501) throw new Error("Catalogo de areas incompleto; refine o carregamento antes de classificar.");
+  const chave = JSON.stringify([normalizar(pergunta), catalogo.map((r) => [r.id, r.objeto, r.tipo_negocio])]);
+  let recorte = cacheRecortesArea.get(chave);
+  if (!recorte || Date.now() - recorte.quando > CACHE_SCHEMA_MS) {
+    const bruto = await chamarIAbruta([{ role: "user", content:
+      `Classifique a AREA/SETOR pedida na pergunta usando TODOS os nomes reais abaixo. ` +
+      `Considere siglas e nomes por extenso semanticamente equivalentes. Nao selecione apenas palavras iguais. ` +
+      `Selecione somente a area, ignorando status, bairro, valores e quantidade solicitada; esses filtros serao aplicados depois. ` +
+      `Preserve registros distintos com mesmo nome e IDs diferentes. Nao invente IDs. ` +
+      `Retorne somente JSON {"ids":["id real", ...]}. Se nenhum pertencer a area, ids=[].\n` +
+      `PERGUNTA: ${JSON.stringify(pergunta)}\nCATALOGO: ${JSON.stringify(catalogo.map(({id,objeto,tipo_negocio}) => ({id,objeto,tipo_negocio})))}`
+    }], { max_tokens: 1800, temperature: 0, reasoning_effort: "low" });
+    const plano = objetoJSONEmTexto(bruto);
+    const permitidos = new Set(catalogo.map((r) => String(r.id)));
+    if (!Array.isArray(plano?.ids) || plano.ids.some((id) => !permitidos.has(String(id)))) {
+      throw new Error("Classificacao de area invalida; nenhum resultado foi calculado.");
+    }
+    const ids = [...new Set(plano.ids.map(String))];
+    const predicado = ids.length
+      ? `id::text IN (${ids.map((id) => `'${id.replace(/'/g, "''")}'`).join(", ")})`
+      : "id IS NULL AND id IS NOT NULL";
+    recorte = { quando: Date.now(), ids, predicado };
+    if (cacheRecortesArea.size >= 100) cacheRecortesArea.clear();
+    cacheRecortesArea.set(chave, recorte);
+  }
+  return { ...ctx, recorteArea: recorte };
+}
+
+function historicoParaPergunta(pergunta, historico) {
+  const p = normalizar(pergunta);
+  // A ampliacao explicita nao pode continuar ancorada numa SQL restrita antiga.
+  // Mantemos texto para resolver pessoas/pronomes, mas retiramos filtros salvos.
+  if (!/\b(em geral|todas as obras|todos os projetos|todas as licitacoes)\b/.test(p)) return historico;
+  return historico.map(({ sql, estado, ...m }) => ({ ...m,
+    content: m.role === "assistant" ? `(Resposta anterior, cujos filtros foram ampliados pelo usuario): ${m.content || ""}` : m.content
+  }));
+}
+
+function dividirRespostaCompleta(resposta, max = 3500) {
+  const partes = [];
+  let atual = "";
+  for (const linha of String(resposta).split("\n")) {
+    if (atual && atual.length + linha.length + 1 > max) {
+      partes.push(atual); atual = "";
+    }
+    // Nao corta registros nem caracteres. Uma linha excepcionalmente longa
+    // continua integra para o transporte decidir como apresentar.
+    atual += (atual ? "\n" : "") + linha;
+  }
+  if (atual) partes.push(atual);
+  return partes;
+}
 
 // ------------------------------------------------------------
 // Utilitarios
@@ -450,18 +510,6 @@ function objetoJSONEmTexto(texto = "") {
 
 function extrairSQLDaResposta(texto = "") {
   const t = stripThink(texto).trim();
-  const resultado = extrairSQLDaRespostaInterno(texto);
-  const formato = !t ? "vazio"
-    : objetoJSONEmTexto(t) ? "json"
-    : t.includes("```") ? "bloco"
-    : t.startsWith("{") ? "json_invalido"
-    : /\b(?:SELECT|WITH)\b/i.test(t) ? "texto" : "outro";
-  registrarSaidaSQL({ formato, caracteres: t.length, sqlExtraida: !!resultado.query });
-  return resultado;
-}
-
-function extrairSQLDaRespostaInterno(texto = "") {
-  const t = stripThink(texto).trim();
   if (!t) return { query: "", descricao: "" };
 
   // 1) JSON direto / 2) JSON embutido
@@ -505,17 +553,9 @@ async function relacaoPreferida() {
   throw new Error("Nao encontrei public.obras_chatbot nem public.obras no PostgreSQL.");
 }
 
-async function carregarSchemaContexto(...args) {
-  return medirEtapa("schema", () => carregarSchemaContextoInterno(...args));
-}
-
-async function carregarSchemaContextoInterno() {
+async function carregarSchemaContexto() {
   const agora = Date.now();
-  if (cacheSchema.contexto && agora - cacheSchema.quando < CACHE_SCHEMA_MS) {
-    registrarCacheSchema(true);
-    return cacheSchema.contexto;
-  }
-  registrarCacheSchema(false);
+  if (cacheSchema.contexto && agora - cacheSchema.quando < CACHE_SCHEMA_MS) return cacheSchema.contexto;
 
   const relacao = await relacaoPreferida();
   const colunasR = await queryReadOnly(`
@@ -541,12 +581,13 @@ async function carregarSchemaContextoInterno() {
   if (nomes.has("objeto")) {
     try {
       const extras = [
+        nomes.has("id") ? "id" : null,
         nomes.has("tipo_negocio") ? "tipo_negocio" : null,
         nomes.has("bairro") ? "bairro" : null,
       ].filter(Boolean);
       const campos = ["objeto", ...extras].join(", ");
       const rr = await queryReadOnly(
-        `SELECT DISTINCT ${campos} FROM public.${relacao} WHERE objeto IS NOT NULL AND BTRIM(objeto::text) <> '' ORDER BY objeto LIMIT 120`
+        `SELECT DISTINCT ${campos} FROM public.${relacao} WHERE objeto IS NOT NULL AND BTRIM(objeto::text) <> '' ORDER BY objeto LIMIT 501`
       );
       objetosCatalogo = rr.rows || [];
     } catch {
@@ -608,24 +649,26 @@ function schemaParaPrompt(ctx) {
   // Isso reduz TPM sem esconder do agente os valores reais importantes.
   const valores = Object.entries(ctx.categorias || {})
     .filter(([, arr]) => arr?.length)
-    .map(([k, arr]) => `- ${k}: ${arr.slice(0, 15).join(" | ")}`)
+    .map(([k, arr]) => `- ${k}: ${arr.slice(0, 24).join(" | ")}`)
     .join("\n");
 
-  const objetos = (ctx.objetosCatalogo || []).slice(0, 60).map((r) => {
+  const objetos = (ctx.objetosCatalogo || []).map((r) => {
     const partes = [];
+    if (r.id !== undefined) partes.push(`id=${r.id}`);
     if (r.tipo_negocio) partes.push(r.tipo_negocio);
     partes.push(r.objeto);
     if (r.bairro) partes.push(`bairro=${r.bairro}`);
     return `- ${partes.join(" | ")}`;
   }).join("\n");
 
-  const chavesExtras = (ctx.chavesDadosExtras || []).slice(0, 120).join(" | ");
+  const chavesExtras = (ctx.chavesDadosExtras || []).slice(0, 180).join(" | ");
 
   return `RELACAO AUTORIZADA: public.${ctx.relacao}\n\nCOLUNAS REAIS:\n${colunas}` +
+    (ctx.recorteArea ? `\n\nRECORTE SEMANTICO DE AREA VALIDADO: use EXATAMENTE o predicado (${ctx.recorteArea.predicado}) no WHERE. Ele ja contempla todos os equipamentos selecionados. Nao acrescente filtros por palavras em objeto/categoria para classificar essa mesma area. Acrescente somente os outros criterios explicitamente pedidos (tipo_negocio, status, bairro etc.).\n` : "") +
     `\n\nCHAVES REAIS DE dados_extras (JSONB):\n${chavesExtras || "(nenhuma coletada)"}` +
     `\n\nVALORES REAIS IMPORTANTES:\n${valores || "(nao coletados)"}` +
     `\n\nCATALOGO DE OBJETOS REAIS (use para ligacao semantica; nao invente nomes):\n${objetos || "(nao coletado)"}` +
-    `\n\nUMA AMOSTRA DE FORMATO:\n${jsonSeguro(ctx.amostras, 1200)}`;
+    `\n\nUMA AMOSTRA DE FORMATO:\n${jsonSeguro(ctx.amostras, 2500)}`;
 }
 
 function regrasNegocio(ctx) {
@@ -660,11 +703,7 @@ function regrasNegocio(ctx) {
 // ------------------------------------------------------------
 // Geracao SQL (estagio 1)
 // ------------------------------------------------------------
-async function gerarSQL(...args) {
-  return medirEtapa("geracao_sql", () => gerarSQLInterno(...args));
-}
-
-async function gerarSQLInterno(pergunta, historico, ctx, correcao = "") {
+async function gerarSQL(pergunta, historico, ctx, correcao = "") {
   const prompt = `Voce e um SQL AGENT especializado em PostgreSQL para um chatbot de obras publicas.\n` +
     `Transforme a pergunta do usuario em UMA consulta SQL que responda exatamente ao pedido.\n\n` +
     `${regrasNegocio(ctx)}\n` +
@@ -683,7 +722,9 @@ async function gerarSQLInterno(pergunta, historico, ctx, correcao = "") {
     `- Prefira agregacoes SQL reais (COUNT, SUM, AVG, GROUP BY, ORDER BY) quando a pergunta pedir calculo/ranking.\n` +
     `- SOMA/MEDIA EXPLICAVEL: quando somar ou calcular media de um conjunto e houver nomes/valores por registro, prefira retornar a composicao junto do agregado, por exemplo objeto + valor_total + SUM(valor_total) OVER () AS total_investido. Assim a resposta consegue explicar de onde saiu o total.\n` +
     `- RANKING POR ENTIDADE + VALOR TOTAL: se a pergunta for qual engenheiro/responsavel/empresa/bairro tem MAIOR ou MENOR valor total/investido no conjunto, agrupe pela entidade e use SUM(valor_total). NUNCA use MAX(valor_total) para esse pedido, porque MAX representa somente a maior obra individual. Use MAX apenas quando o usuario pedir explicitamente a maior obra/maior valor individual.\n` +
-    `- RANKING POR QUANTIDADE: se a pergunta for qual engenheiro/responsavel/empresa/bairro tem mais ou menos obras, use COUNT(*) por entidade, GROUP BY, ORDER BY COUNT ASC/DESC e retorne sempre a entidade junto da contagem.\n` +
+    `- RANKING POR QUANTIDADE: se a pergunta for qual engenheiro/responsavel/empresa/bairro tem mais ou menos obras, use COUNT(*) por entidade, GROUP BY, ORDER BY COUNT ASC/DESC e retorne sempre a entidade junto da contagem. Exclua NULL e texto vazio do ranking de profissionais; ausencia de cadastro nao e uma pessoa.\n` +
+    `- IDENTIFICACAO: ao listar registros, selecione id e contrato quando existirem para distinguir nomes iguais. id e interno, nunca sera exibido ao cidadao.\n` +
+    `- LOCALIZACAO: bairro pode conter um endereco inteiro. Nao invente um bairro nem deduza pelo nome da obra. Preserve o texto como localizacao quando necessario.\n` +
     `- EXISTENCIA/ALGUM: perguntas do tipo "existe/tem algum" NAO devem ser respondidas escolhendo um registro arbitrario com LIMIT 1. Use COUNT, agrupamento por tipo_negocio ou liste o conjunto real. Se nao houver universo claro nem recorte anterior, resuma por tipo_negocio em vez de escolher um item ao acaso.\n` +
     `- Para 'quais engenheiros dessas obras?', se o usuario quer apenas a lista de nomes, SELECT DISTINCT engenheiro e valido; se ele pedir quem e responsavel por cada obra, retorne objeto + engenheiro.\n` +
     `- FOLLOW-UP DE CAMPO SOBRE UM CONJUNTO: quando o usuario perguntar 'quais os recursos?', 'quais os status?', 'quais os engenheiros?', 'quais os contratos?' etc. sobre varios registros ja em contexto, prefira UMA LINHA POR REGISTRO com objeto + campo pedido. So use DISTINCT campo sozinho quando ele pedir explicitamente valores unicos/diferentes ou apenas os nomes sem associar a cada registro.\n` +
@@ -703,23 +744,18 @@ async function gerarSQLInterno(pergunta, historico, ctx, correcao = "") {
     `- Para alvo proprio/especifico (nome de bairro, rua, equipamento com nome proprio), seja conservador: nao expanda para conceitos diferentes.\n` +
     `- Em busca ampla por assunto, voce pode procurar em objeto, categoria e dados_extras::text quando essas colunas existirem; mantenha o tipo_negocio correto.\n` +
     `- Se um termo livre puder ser nome parcial, use ILIKE/LOWER de forma tolerante.\n` +
-    `- QUALQUER PERGUNTA SOBRE A PLANILHA deve virar consulta: cada coluna e cada chave de dados_extras e um campo consultavel (datas, prazos, contratos, numeros de processo, empresas, fiscais, observacoes, percentuais, aditivos, enderecos etc.). Nunca responda query="" so porque a pergunta e incomum; procure a coluna ou a chave de dados_extras mais proxima do conceito pedido.\n` +
-    `- BUSCA TOLERANTE A ACENTO E CAIXA: para texto livre compare com translate(lower(campo),'áàâãäéèêëíìîïóòôõöúùûüç','aaaaaeeeeiiiiooooouuuuc') ILIKE '%termo_sem_acento%'.\n` +
-    `- DATAS: chaves de dados_extras sao texto; para comparar/ordenar datas use to_date quando o formato for claro (ex.: dd/mm/yyyy) e proteja com um filtro de formato (campo ~ '^\\d{2}/\\d{2}/\\d{4}$'). Para 'atrasadas'/'vencidas' compare a previsao de termino com CURRENT_DATE.\n` +
-    `- NUMEROS EM TEXTO: valores em dados_extras podem vir como 'R$ 1.234,56'; converta com NULLIF(regexp_replace(replace(replace(campo,'.',''),',','.'),'[^0-9.-]','','g'),'')::numeric.\n` +
-    `- COMPARACOES E PERCENTUAIS: 'qual percentual', 'quanto % do total', 'comparar bairros/empresas/anos' -> use GROUP BY e calcule participacao com SUM(x) / NULLIF(SUM(SUM(x)) OVER (),0).\n` +
-    `- PERGUNTAS ABERTAS ('resumo', 'panorama', 'como estao as obras', 'o que tem na planilha'): retorne um resumo agrupado por tipo_negocio/status com COUNT e SUM(valor_total).\n` +
     `- Retorne colunas suficientes para responder, mas nao SELECT * sem necessidade.\n` +
     `- Retorne SOMENTE JSON {"description":"...","query":"SELECT ..."}. Se nao puder responder com o schema, use query="".\n\n` +
     `SCHEMA E DADOS REAIS:\n${schemaParaPrompt(ctx)}\n\n` +
     `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
     `ANCORA DO CONTEXTO ATUAL:\n${ancoraContextoRecente(historico)}\n\n` +
     `REFERENCIA DE PESSOA NO CONTEXTO:\n${contextoReferenciaPessoa(historico, pergunta)}\n\n` +
+    `REFERENCIA DE PESSOA NO CONTEXTO:\n${contextoReferenciaPessoa(historico, pergunta)}\n\n` +
     (correcao ? `CONTEXTO DE CORRECAO: ${correcao}\n\n` : "") +
     `PERGUNTA ATUAL: ${JSON.stringify(pergunta)}`;
 
   const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
-    max_tokens: 420,
+    max_tokens: 1200,
     temperature: 0,
     reasoning_effort: "low",
   });
@@ -752,6 +788,13 @@ function relacoesReferenciadas(sql = "") {
 function validarSQL(sql, ctx) {
   const s = limparSQL(sql);
   if (!s) return { ok: false, motivo: "consulta vazia" };
+  if (ctx.recorteArea) {
+    const compacto = (v) => v.replace(/\s+/g, "").toLowerCase();
+    if (!compacto(s).includes(compacto(ctx.recorteArea.predicado)) ||
+        /\b(?:objeto|categoria)\s+(?:not\s+)?(?:ilike|like)\b/i.test(s)) {
+      return { ok: false, motivo: "Use o predicado completo do RECORTE SEMANTICO DE AREA VALIDADO, sem refiltrar a mesma area por palavras." };
+    }
+  }
   if (!/^(select|with)\b/i.test(s)) return { ok: false, motivo: "somente SELECT/WITH SELECT e permitido" };
   if (PALAVRAS_PROIBIDAS.test(s)) return { ok: false, motivo: "comando de escrita/DDL bloqueado" };
   if (FUNCOES_PROIBIDAS.test(s)) return { ok: false, motivo: "funcao de sistema bloqueada" };
@@ -801,11 +844,7 @@ function diagnosticoErroPG(e) {
 // ------------------------------------------------------------
 // Estagio 2: avaliacao e self-healing
 // ------------------------------------------------------------
-async function repararSQL(...args) {
-  return medirEtapa("reparo_sql", () => repararSQLInterno(...args));
-}
-
-async function repararSQLInterno({ pergunta, historico, ctx, sqlAtual, erro = null, linhas = [], motivoSemantico = "" }) {
+async function repararSQL({ pergunta, historico, ctx, sqlAtual, erro = null, linhas = [], motivoSemantico = "" }) {
   const erroTexto = erro
     ? `ERRO POSTGRESQL REAL:\n${jsonSeguro(erro, 4000)}`
     : motivoSemantico
@@ -829,7 +868,7 @@ async function repararSQLInterno({ pergunta, historico, ctx, sqlAtual, erro = nu
     `Se a SQL atual deve ser mantida (por exemplo, 0 linhas e isso e plausivel), retorne fixedQuery exatamente igual a SQL atual.`;
 
   const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
-    max_tokens: 420,
+    max_tokens: 1200,
     temperature: 0,
     reasoning_effort: "low",
   });
@@ -1036,7 +1075,7 @@ function rotuloHumano(campo = "") {
 
 function valorFallback(campo, valor) {
   if (valor === null || valor === undefined || valor === "") return null;
-  if (["valor_total", "valor_executado", "quanto_falta", "saldo_devedor", "aditivo"].includes(campo)) {
+  if (campoPareceFinanceiro(campo)) {
     const n = Number(valor);
     if (Number.isFinite(n)) {
       return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(n);
@@ -1085,7 +1124,7 @@ function campoParecePercentual(campo = "") {
 
 function campoPareceFinanceiro(campo = "") {
   if (campoPareceContagem(campo) || campoParecePercentual(campo)) return false;
-  return /(valor|invest|custo|gasto|pago|saldo|aditivo|contrapartida|restante|falta|orcamento|or[cç]amento)/i.test(campo);
+  return /(valor|executad|contratad|invest|custo|gasto|pago|saldo|aditivo|contrapartida|restante|falta|orcamento|or[cç]amento)/i.test(campo);
 }
 
 function respostaFinanceiraDiretaSegura(pergunta = "", rows = []) {
@@ -1104,10 +1143,66 @@ function respostaFinanceiraDiretaSegura(pergunta = "", rows = []) {
   if (!moeda) return null;
 
   const p = normalizar(pergunta);
+  if (/execut/.test(normalizar(campo))) return `O valor total executado é **${moeda}**.`;
+  if (/pag/.test(normalizar(campo))) return `O valor total pago é **${moeda}**.`;
   if (/invest|valor total|quanto (?:foi|e|é)|custo|gasto/.test(p)) {
-    return `O valor total nesse recorte é ${moeda}.`;
+    return `O valor total nesse recorte é **${moeda}**.`;
   }
-  return `${rotuloHumano(campo)}: ${moeda}.`;
+  return `${rotuloHumano(campo)}: **${moeda}**.`;
+}
+
+function respostaTabularCompleta(pergunta, sql, rows) {
+  if (!rows.length) return "Não encontrei registros com esses critérios nos dados atuais.";
+  // Campos JSON ou narrativas livres ainda podem usar a redacao existente.
+  if (rows.some((r) => Object.values(r).some((v) => v !== null && typeof v === "object"))) return null;
+  const p = normalizar(pergunta);
+  const campos = [...new Set(rows.flatMap((r) => Object.keys(r)))];
+  const totais = campos.filter((k) => !["valor_total", "valor_executado", "valor_pago", "quanto_falta"].includes(k) && campoPareceFinanceiro(k) && /(?:total_|_total|soma|media|avg|sum)/i.test(k) &&
+    rows.every((r) => r[k] === rows[0][k]));
+  const pedeDetalhes = /\b(detalh|cada|individual|composicao)/.test(p);
+  if (rows.some((r) => r.objeto) && totais.length && /\b(total|soma|media)\b/.test(p) && !pedeDetalhes) {
+    // Agregados por janela sao calculados no PostgreSQL antes do LIMIT.
+    // Nunca recalculamos o total a partir de uma amostra de linhas.
+    const agregados = Object.fromEntries(totais.map((k) => [k, rows[0][k]]));
+    return respostaFinanceiraDiretaSegura(pergunta, [agregados]) || totais.map((k) =>
+      `${rotuloHumano(k)}: ${rows[0][k] == null ? "não informado" : `**${formatarMoedaSegura(rows[0][k])}**`}.`
+    ).join("\n");
+  }
+  const tecnicos = new Set(["id", "objeto", "dados_extras", "tipo_negocio", "subtipo_negocio", "em_andamento_obra", "concluido", "aba_origem", "total_encontrados"]);
+  const repetidos = new Set(rows.filter((r, i) => r.objeto && rows.some((o, j) => j !== i && normalizar(o.objeto) === normalizar(r.objeto))).map((r) => normalizar(r.objeto)));
+  const linha = (r) => {
+    const detalhes = Object.entries(r).filter(([k]) => !tecnicos.has(k) && !totais.includes(k)).map(([k, v]) => {
+      const rotulo = k === "bairro" ? "Localização" : rotuloHumano(k);
+      const valor = valorFallback(k, v);
+      return `${rotulo}: ${valor === null ? "não informado" : campoPareceFinanceiro(k) ? `**${valor}**` : valor}`;
+    });
+    if (repetidos.has(normalizar(r.objeto)) && !r.contrato) detalhes.push("Contrato: não informado no resultado");
+    return `• ${r.objeto || "Registro"}${detalhes.length ? ` — ${detalhes.join(" — ")}` : ""}`;
+  };
+  if (rows.some((r) => r.objeto)) {
+    const total = numeroParaAnalise(rows[0].total_encontrados);
+    const cabecalho = total !== null && total > rows.length
+      ? `Mostrando ${rows.length} de ${total} registros encontrados.`
+      : `Encontrei ${rows.length} ${rows.length === 1 ? "registro" : "registros"}.`;
+    const limite = rows.length >= MAX_RESULTADOS ? "\n\nO resultado atingiu o limite de registros por consulta; pode haver outros." : "";
+    return `${cabecalho}\n\n${rows.map(linha).join("\n")}${limite}`;
+  }
+  const medida = campos.find(campoPareceContagem);
+  const dimensao = campos.find((k) => !tecnicos.has(k) && k !== medida && !campoPareceFinanceiro(k));
+  if (medida && dimensao) {
+    const cadastrados = rows.filter((r) => r[dimensao] != null && String(r[dimensao]).trim());
+    const semCadastro = rows.filter((r) => r[dimensao] == null || !String(r[dimensao]).trim());
+    const lista = cadastrados.map((r) => `• ${r[dimensao]} — **${r[medida]}** ${/\bprojet/.test(p) ? "projetos" : "obras"}`);
+    const pendencias = semCadastro.map((r) => `${r[medida]} registros sem ${rotuloHumano(dimensao).toLowerCase()} cadastrado.`);
+    return [...lista, ...pendencias].join("\n");
+  }
+  if (rows.length === 1 && campos.length === 1 && /\bsum\s*\(/i.test(sql)) {
+    const financeira = respostaFinanceiraDiretaSegura(pergunta, rows);
+    if (financeira) return financeira;
+    const valor = rows[0][campos[0]];
+    return valor == null ? "Não há valor preenchido para calcular esse total." : `Total: **${formatarMoedaSegura(valor)}**.`;
+  }
+  return null;
 }
 
 function fallbackResposta(pergunta, rows = []) {
@@ -1134,12 +1229,11 @@ function fallbackResposta(pergunta, rows = []) {
     return linhas.join("\n") || "Encontrei o registro, mas não há detalhes adicionais informados.";
   }
 
-  const exibidas = rows.slice(0, 20);
+  const exibidas = rows;
   const linhas = exibidas.map((r, i) => {
     const nome = r.objeto ? String(r.objeto) : null;
     const detalhes = Object.entries(r)
       .filter(([k, v]) => !camposTecnicosOcultos.has(k) && v !== null && v !== undefined && v !== "")
-      .slice(0, 3)
       .map(([k, v]) => `${rotuloHumano(k)}: ${valorFallback(k, v)}`)
       .join(" — ");
     if (nome) return `${i + 1}. ${nome}${detalhes ? ` — ${detalhes}` : ""}`;
@@ -1198,7 +1292,8 @@ function respostaContagemDiretaSegura(pergunta = "", rows = []) {
   if (r.objeto) return null;
 
   const candidatos = Object.entries(r).filter(([k, v]) =>
-    /(?:^count$|count_|_count$|^total|total_|quantidade|qtd)/i.test(k) &&
+    !campoPareceFinanceiro(k) && !campoParecePercentual(k) &&
+    campoPareceContagem(k) &&
     v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v))
   );
   if (candidatos.length !== 1) return null;
@@ -1220,11 +1315,9 @@ function respostaContagemDiretaSegura(pergunta = "", rows = []) {
   return n === 1 ? "Encontrei 1 registro com esses critérios." : `Encontrei ${n} registros com esses critérios.`;
 }
 
-async function redigirResposta(...args) {
-  return medirEtapa("redacao", () => redigirRespostaInterno(...args));
-}
-
-async function redigirRespostaInterno(pergunta, historico, sql, rows, ctx) {
+async function redigirResposta(pergunta, historico, sql, rows, ctx) {
+  const tabular = respostaTabularCompleta(pergunta, sql, rows);
+  if (tabular) return tabular;
   // Ranking/agrupamento com uma dimensao + uma medida deve citar AMBOS.
   // Ex.: { engenheiro: "Eng. X", total_obras: 1 } nao pode virar apenas
   // "Ha 1 obra"; o nome do engenheiro e parte essencial da resposta.
@@ -1234,13 +1327,12 @@ async function redigirRespostaInterno(pergunta, historico, sql, rows, ctx) {
   // Se por qualquer motivo uma consulta de contagem ainda chegar apenas com o
   // agregado, nao envia contexto insuficiente para a IA completar com nomes.
   // Isso impede alucinacao de obras/valores que nao vieram do PostgreSQL.
-  const contagemSegura = respostaContagemDiretaSegura(pergunta, rows);
-  if (contagemSegura) return contagemSegura;
-
   // Agregado financeiro isolado (ex.: SUM(valor_total)=503000) nunca deve ser
   // interpretado pela IA como quantidade de registros.
   const financeiroSeguro = respostaFinanceiraDiretaSegura(pergunta, rows);
   if (financeiroSeguro) return financeiroSeguro;
+  const contagemSegura = respostaContagemDiretaSegura(pergunta, rows);
+  if (contagemSegura) return contagemSegura;
 
   const amostra = rows.slice(0, MAX_LINHAS_PARA_IA);
   const prompt = `Voce e o redator final de um chatbot de obras publicas no WhatsApp.\n` +
@@ -1269,9 +1361,7 @@ async function redigirRespostaInterno(pergunta, historico, sql, rows, ctx) {
     `PERCENTUAL: percentual_executado e percentual de EXECUCAO. Escreva sempre 'X% executado' ou 'X% de execucao'. NUNCA escreva 'X% concluido' para uma obra que ainda esta em andamento.\n` +
     `LICITACAO: se status_original vier no resultado, use-o como etapa/status especifico da licitacao (ex.: 'Habilitacao em andamento', 'Edital publicado'). Nao esconda essa etapa atras do rotulo generico 'Em licitacao'.\n` +
     `Recurso e tipo_recurso sao campos diferentes; nao troque um pelo outro.\n` +
-    `Nao mostre SQL ao usuario na resposta natural.\n` +
-    `Se a pergunta pedir algo que os dados retornados respondem so em parte, responda a parte disponivel e diga de forma simples qual informacao nao esta preenchida na planilha.\n` +
-    `Datas: escreva no formato dd/mm/aaaa. Valores: R$ com separador brasileiro (R$ 1.234,56).\n\n` +
+    `Nao mostre SQL ao usuario na resposta natural.\n\n` +
     `PERGUNTA: ${JSON.stringify(pergunta)}\n` +
     `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
     `SQL EXECUTADA: ${sql}\n` +
@@ -1308,12 +1398,9 @@ function estadoPublico(ctx, execucao) {
 // ------------------------------------------------------------
 // Fluxo principal
 // ------------------------------------------------------------
-export async function responderPergunta(pergunta, historico = [], opcoes = {}) {
-  return executarComMetricas(opcoes?.canal || "direto", () => responderPerguntaInterno(pergunta, historico));
-}
-
-async function responderPerguntaInterno(pergunta, historico = []) {
+export async function responderPergunta(pergunta, historico = []) {
   const texto = textoSeguro(pergunta, 1600);
+  historico = historicoParaPergunta(texto, Array.isArray(historico) ? historico : []);
   if (!texto) return { resposta: "Pode enviar sua pergunta sobre as obras?", erro: "pergunta_vazia" };
 
   const social = respostaSocial(texto, historico);
@@ -1329,7 +1416,7 @@ async function responderPerguntaInterno(pergunta, historico = []) {
   }
 
   try {
-    const ctx = await carregarSchemaContexto();
+    const ctx = await resolverRecorteArea(texto, await carregarSchemaContexto());
 
     // Estagio 1: para campos de ANALISE DE LICITACAO, o Node garante o
     // universo correto (tipo_negocio='licitacao'). Para todo o resto, o fluxo
@@ -1342,12 +1429,6 @@ async function responderPerguntaInterno(pergunta, historico = []) {
     if (!gerada.query) {
       // Uma segunda tentativa curta so para formato/interpretacao, sem criar regra de frase.
       gerada = await gerarSQL(texto, historico, ctx, "A tentativa anterior nao produziu SQL. Gere uma consulta SELECT valida usando apenas o schema fornecido.");
-    }
-    if (!gerada.query) {
-      // Ultima tentativa: em vez de desistir, busca um recorte amplo da planilha
-      // e deixa a etapa de redacao responder com base nos registros reais.
-      gerada = await gerarSQL(texto, historico, ctx,
-        "Ainda sem SQL. Nao desista: escolha as colunas/chaves de dados_extras mais relacionadas a pergunta e retorne ate 60 registros com objeto e esses campos, ou um resumo agrupado se a pergunta for geral.");
     }
     if (!gerada.query) {
       return {
@@ -1446,6 +1527,7 @@ async function responderPerguntaInterno(pergunta, historico = []) {
     const resposta = await redigirResposta(texto, historico, execucao.sql, execucao.rows, ctx);
     return {
       resposta,
+      mensagens: dividirRespostaCompleta(resposta),
       sql: execucao.sql,
       linhas: execucao.rows.length,
       estado: estadoPublico(ctx, execucao),
