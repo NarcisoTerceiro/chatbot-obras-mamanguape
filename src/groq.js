@@ -13,7 +13,7 @@ import { medirEtapa, medirRequisicaoIA, registrarChamadaIA } from "./telemetria.
 //
 //  Variaveis de ambiente:
 //    NVIDIA_API_KEY
-//    NVIDIA_MODEL    opcional; padrao openai/gpt-oss-120b
+//    NVIDIA_MODEL    opcional; padrao nvidia/nemotron-3-super-120b-a12b
 //    NVIDIA_BASE_URL opcional; padrao https://integrate.api.nvidia.com/v1
 //    GROQ_API_KEY
 //    GROQ_MODEL       opcional; padrao openai/gpt-oss-20b
@@ -22,12 +22,12 @@ import { medirEtapa, medirRequisicaoIA, registrarChamadaIA } from "./telemetria.
 // ============================================================
 
 const NVIDIA_KEY = (process.env.NVIDIA_API_KEY || "").trim();
-const NVIDIA_MODEL = (process.env.NVIDIA_MODEL || "openai/gpt-oss-120b").trim();
+const NVIDIA_MODEL = (process.env.NVIDIA_MODEL || "nvidia/nemotron-3-super-120b-a12b").trim();
 // Modelos NVIDIA tentados em ordem ANTES de sair da NVIDIA. Pode sobrescrever
 // com NVIDIA_MODELOS="modelo1,modelo2". So depois de todos falharem cai p/ Groq.
 const NVIDIA_MODELOS = [...new Set([
   NVIDIA_MODEL,
-  ...String(process.env.NVIDIA_MODELOS || "meta/llama-3.3-70b-instruct").split(","),
+  ...String(process.env.NVIDIA_MODELOS || "").split(","),   // sem padrão: o llama-3.3-70b foi aposentado (410)
 ].map((m) => m.trim()).filter(Boolean))];
 const modelosNvidiaIndisponiveis = new Set();
 const NVIDIA_BASE_URL = (process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1").trim();
@@ -80,7 +80,7 @@ const OPERACOES_VALIDAS = new Set([
 const provedorDescansando = new Map();
 const DESCANSO_PADRAO_MS = 15 * 1000;
 const TIMEOUT_IA_MS = 18 * 1000;
-const MAX_SAIDA_GLOBAL = 1000;
+const MAX_SAIDA_GLOBAL = 2000;
 // Em 429, tenta outro modelo/provedor primeiro. Se todos estiverem limitados,
 // pode aguardar uma unica janela curta indicada pelo Retry-After e tentar de novo.
 const MAX_ESPERA_429_MS = Math.max(0, Math.min(Number(process.env.IA_MAX_ESPERA_429_MS || 14000), 30000));
@@ -132,8 +132,15 @@ function textoDaRespostaOpenAI(data) {
   let texto = typeof msg.content === "string" ? msg.content
     : Array.isArray(msg.content) ? msg.content.map((p) => p?.text || "").join("") : "";
   // Remove raciocinio interno que alguns modelos devolvem no content.
-  texto = texto.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  texto = texto.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<think>[\s\S]*$/i, "").trim();
   return texto;
+}
+// Resposta cortada por falta de tokens (finish_reason "length"): NÃO é resposta válida.
+const cortadaOpenAI = (data) => data?.choices?.[0]?.finish_reason === "length";
+function erroCortado(prov, modelo) {
+  const err = new Error(`${prov} (${modelo}) cortou a resposta por limite de tokens`);
+  err.truncado = true;
+  return err;
 }
 
 async function chamarNvidia(body) {
@@ -142,6 +149,7 @@ async function chamarNvidia(body) {
     throw new Error("NVIDIA_BASE_URL deve ser HTTPS, sem credenciais, query ou fragmento.");
   }
   let ultimoErro = null;
+  const falhas = [];
   for (const modelo of NVIDIA_MODELOS) {
     if (modelosNvidiaIndisponiveis.has(modelo)) continue;
     const corpo = {
@@ -169,7 +177,8 @@ async function chamarNvidia(body) {
     }
     if (!resp.ok) {
       const erroTxt = resp.erroTxt || "";
-      if (resp.status === 404 || /model_not_found|not found|does not exist|not available/i.test(erroTxt)) {
+      // 404 e 410 (Gone) = modelo removido/aposentado: não adianta tentar de novo.
+      if (resp.status === 404 || resp.status === 410 || /model_not_found|not found|does not exist|not available|end of life|has reached/i.test(erroTxt)) {
         modelosNvidiaIndisponiveis.add(modelo);
       }
       const err = new Error(`nvidia (${modelo}) respondeu ${resp.status}: ${erroTxt.slice(0, 200)}`);
@@ -178,9 +187,11 @@ async function chamarNvidia(body) {
       // Chave invalida vale para todos os modelos: sai direto para o fallback.
       if (resp.status === 401 || resp.status === 403) throw err;
       ultimoErro = err;
+      falhas.push(err.message.slice(0, 160));
       console.warn(`DEBUG NVIDIA: ${err.message.slice(0, 120)}; tentando proximo modelo.`);
       continue;
     }
+    if (cortadaOpenAI(resp.data)) { ultimoErro = erroCortado("nvidia", modelo); falhas.push(ultimoErro.message); continue; }
     const texto = textoDaRespostaOpenAI(resp.data);
     if (!texto) {
       ultimoErro = new Error(`nvidia (${modelo}) devolveu resposta vazia`);
@@ -190,7 +201,9 @@ async function chamarNvidia(body) {
     console.log(`DEBUG IA usada: NVIDIA (principal) | modelo: ${modelo}`);
     return texto;
   }
-  throw ultimoErro || new Error("Nenhum modelo NVIDIA disponivel.");
+  const final = ultimoErro || new Error("Nenhum modelo NVIDIA disponivel.");
+  if (falhas.length > 1) final.message = falhas.join(" | ");   // mostra TODOS os modelos que falharam, não só o último
+  throw final;
 }
 
 async function chamarGroq(body) {
@@ -255,6 +268,7 @@ async function chamarGroq(body) {
     }
 
     const data = resp.data;
+    if (cortadaOpenAI(data)) throw erroCortado("groq", model);
     const texto = textoDaRespostaOpenAI(data);
     if (!texto) throw new Error(`groq (${model}) devolveu resposta vazia`);
     console.log(`DEBUG IA usada: Groq (fallback 1) | modelo: ${model}`);
@@ -324,12 +338,13 @@ async function chamarGemini(body) {
   const data = resp.data;
   const parts = data?.candidates?.[0]?.content?.parts || [];
   const texto = parts.map((p) => typeof p?.text === "string" ? p.text : "").join("").trim();
+  if (data?.candidates?.[0]?.finishReason === "MAX_TOKENS") throw erroCortado("gemini", GEMINI_MODEL);
   if (!texto) throw new Error("gemini devolveu resposta vazia");
   console.log(`DEBUG IA usada: Gemini (fallback 2) | modelo: ${GEMINI_MODEL}`);
   return texto;
 }
 
-async function chamarIA(body, tentativa429 = 0) {
+async function chamarIA(body, tentativa429 = 0, ampliado = false) {
   if (PROVEDORES.length === 0) {
     throw new Error("Nenhuma chave de IA configurada (NVIDIA_API_KEY, GROQ_API_KEY ou GEMINI_API_KEY).");
   }
@@ -361,6 +376,18 @@ async function chamarIA(body, tentativa429 = 0) {
     } catch (e) {
       ultimoErro = e;
       console.error(`IA (${prov.nome}) falhou:`, e.message);
+
+      // Resposta cortada: refaz UMA vez com o dobro de tokens e raciocínio baixo.
+      if (e.truncado && !ampliado) {
+        const atual = Number(body.max_completion_tokens ?? body.max_tokens ?? 384);
+        console.warn(`DEBUG IA: resposta cortada em ${prov.nome}; repetindo com mais tokens.`);
+        return chamarIA({ ...body, max_tokens: Math.min(atual * 2, MAX_SAIDA_GLOBAL), reasoning_effort: "low" }, tentativa429, true);
+      }
+      // Modelo aposentado em todos os modelos NVIDIA (404/410): pausa longa em vez de tentar a cada pergunta.
+      if (prov.nome === "nvidia" && ([404, 410].includes(e.status) || /Nenhum modelo NVIDIA/.test(e.message))) {
+        provedorDescansando.set("nvidia", Date.now() + 30 * 60 * 1000);
+        console.error("DEBUG nvidia: modelo(s) aposentado(s). Troque NVIDIA_MODEL no ambiente (liste em GET /v1/models).");
+      }
 
       if (e.status === 429) {
         const pausa = Math.max(1000, Math.min(e.retryAfterMs || DESCANSO_PADRAO_MS, 60_000));
@@ -835,6 +862,6 @@ export async function chamarIAbruta(mensagens, opcoes = {}) {
     messages: mensagens,
   };
   if (opcoes.temperature !== undefined) body.temperature = opcoes.temperature;
-  if (opcoes.reasoning_effort !== undefined) body.reasoning_effort = opcoes.reasoning_effort;
+  body.reasoning_effort = opcoes.reasoning_effort !== undefined ? opcoes.reasoning_effort : "low";
   return await chamarIA(body);
 }

@@ -1,5 +1,5 @@
 // ============================================================
-// agente.js - AGENTE DA PLANILHA (SEM BANCO) - V15
+// agente.js - AGENTE DA PLANILHA (SEM BANCO) - V16
 // ------------------------------------------------------------
 // Fluxo:  pergunta -> plano JSON (IA ou regras locais) -> execução em JS
 //         sobre as linhas da planilha (cache em memória) -> resposta.
@@ -54,6 +54,7 @@ const fmtValor = (c, n) => (ehPercentual(c) ? `${num(Math.abs(n) <= 5 ? n * 100 
 const fmtCelula = (c, v) => { if (typeof v === "string" && ehPercentual(c) && v.includes("%")) return v.trim(); const n = paraNumero(v); return n !== null && (ehMonetaria(c) || ehPercentual(c)) ? fmtValor(c, n) : String(v).trim(); };
 const rotuloColuna = (c) => (c === COL_PADRAO ? "Status" : c);
 const COL_PADRAO = "STATUS PADRÃO";
+const RE_VTOTAL = /^valor total da obra|^valor total$/;
 const ehColStatus = (c) => /^(status|situacao)( original)?$/.test(norm(c));
 // Acha o valor de uma coluna da linha por regex no nome normalizado.
 const colDe = (l, re) => Object.keys(l).find((c) => !colunaInterna(c) && re.test(norm(c)));
@@ -238,9 +239,32 @@ function aplicarFiltros(linhas, filtros, cat) {
       if (/bairro|localidade|endereco|objeto|rua|local/.test(norm(col)) || !exatoExiste) f = { ...f, op: "contem" };
     }
     const ff = f;
-    r = r.filter((l) => casa(l[col], ff));
+    const colObj = /^bairro|^localidade/.test(norm(col)) && ["contem", "igual", undefined].includes(ff.op) ? cat.colunas.find((c) => /^(objeto|obra|rua)( |$)/.test(norm(c.nome)))?.nome : null;
+    r = r.filter((l) => casa(l[col], ff) || (colObj && vazio(l[col]) && casa(l[colObj], { ...ff, op: "contem" })));
   }
   return r;
+}
+
+
+// ------------------------------------------------------------
+// Bairros: o campo vem como endereço livre ("Rua X, s/n - Centro", "AREAL", "Areal").
+// Extrai o bairro de CADA célula (sem varrer o texto atrás de palavras soltas).
+// ------------------------------------------------------------
+const IGNORA_BAIRRO = /^(rua|ruas|avenida|av|travessa|diversas?|estradas?|sitio|zona|zonas|localidades?|s\/n|projetada|mamanguape|pb|paraiba|municipio)\b/;
+const titulo = (t) => t.toLowerCase().replace(/(^|\s)(\S)/g, (m, a, b, off) => (/^(da|de|do|das|dos|e)\s/.test(t.toLowerCase().slice(off + a.length)) && off > 0 ? m : a + b.toUpperCase()));
+const candidatoValido = (n) => n.length >= 3 && n.length <= 25 && !/\d/.test(n) && !IGNORA_BAIRRO.test(n);
+const limpaSeg = (x) => x.replace(/[.]+$/, "").trim();
+function bairrosDaCelula(v) {
+  if (vazio(v)) return ["Não informado"];
+  const txt = String(v).trim();
+  const quebra = (t) => t.split(/[,;]|\s[-–]\s/).flatMap((x) => x.split(/\s+e\s+/i)).map(limpaSeg);
+  let cands = [];
+  if (/bairro:?/i.test(txt)) cands = quebra(txt.split(/bairro:?/i).pop());                       // "... Bairro: Centro e Gurguri"
+  else if (!/[,;]|\s[-–]\s/.test(txt)) cands = [limpaSeg(txt)];                                    // célula só com o bairro
+  else { const segs = txt.split(/[,;]|\s[-–]\s/).map(limpaSeg).reverse(); const ok = segs.find((x) => candidatoValido(norm(x))); cands = ok ? [ok] : []; }
+  const ach = [...new Set(cands.filter((x) => candidatoValido(norm(x))).map((x) => titulo(x)))];
+  if (ach.length) return ach;
+  return /zona rural|sitio|localidades rurais|estrada/.test(norm(txt)) ? ["Zona rural / estradas"] : ["Endereço sem bairro identificado"];
 }
 
 function executarPlano(plano, linhas, cat) {
@@ -262,7 +286,20 @@ function executarPlano(plano, linhas, cat) {
     }
     res.melhor = melhor;
   }
-  if (op === "agrupar" && colGrupo) {
+  if (op === "agrupar" && colGrupo && /^bairro/.test(norm(colGrupo))) {
+    const g = new Map(); let multi = false;
+    for (const l of filtradas) {
+      const bs = bairrosDaCelula(l[colGrupo]);
+      if (bs.length > 1) multi = true;
+      for (const k of bs) {
+        const e = g.get(k) || { qtd: 0, soma: 0 };
+        e.qtd++; const n = colValor ? paraNumero(l[colValor]) : null; if (n !== null) e.soma += n;
+        g.set(k, e);
+      }
+    }
+    res.grupos = [...g.entries()].sort((a, b) => (colValor ? b[1].soma - a[1].soma : b[1].qtd - a[1].qtd) || b[1].qtd - a[1].qtd || a[0].localeCompare(b[0]));
+    res.multi = multi;
+  } else if (op === "agrupar" && colGrupo) {
     const g = new Map();
     for (const l of filtradas) {
       const k = vazio(l[colGrupo]) ? "Não informado" : String(l[colGrupo]).trim();
@@ -270,7 +307,7 @@ function executarPlano(plano, linhas, cat) {
       e.qtd++; const n = colValor ? paraNumero(l[colValor]) : null; if (n !== null) e.soma += n;
       g.set(k, e);
     }
-    res.grupos = [...g.entries()].sort((a, b) => (colValor ? b[1].soma - a[1].soma : b[1].qtd - a[1].qtd));
+    res.grupos = [...g.entries()].sort((a, b) => (colValor ? b[1].soma - a[1].soma : b[1].qtd - a[1].qtd) || b[1].qtd - a[1].qtd || a[0].localeCompare(b[0]));
   }
   if (op === "listar" && colValor && plano.ordem) {
     const s = plano.ordem === "asc" ? 1 : -1;
@@ -289,7 +326,7 @@ function gruposPrincipais(cat) {
     [/^(bairro|localidade|endereco)/],
     [/^status padrao$/, /^(status|situacao)$/],
     [/^empresa/],
-    [/^valor total/, /^valor \(r\$\)|^valor( |$)/],
+    [RE_VTOTAL, /^valor \(r\$\)|^valor( |$)/],
     [/^valor executado/],
     [/^%|percent/],
   ];
@@ -318,11 +355,11 @@ function totaisLista(linhas, cat) {
     const vs = linhas.map((l) => paraNumero(l[c.nome])).filter((n) => n !== null);
     if (vs.length) out.push(`• ${c.nome}: ${brl(vs.reduce((a, b) => a + b, 0))}${vs.length < linhas.length ? ` (${vs.length} de ${linhas.length} com valor)` : ""}`);
   };
-  somar(/^valor total/); somar(/^valor executado/); somar(/^valor \(r\$\)/);
+  somar(RE_VTOTAL); somar(/^valor executado/); somar(/^valor pago$/); somar(/^valor \(r\$\)/);
   // restante = total − executado, só onde os dois existem (mesma conta do banco)
   let rest = 0, n = 0;
   for (const l of linhas) {
-    const t = paraNumero(valDe(l, /^valor total/)), e = paraNumero(valDe(l, /^valor executado/));
+    const t = paraNumero(valDe(l, RE_VTOTAL)), e = paraNumero(valDe(l, /^valor executado/));
     if (t !== null && e !== null) { rest += t - e; n++; }
   }
   if (n) out.push(`• Valor restante (total − executado): ${brl(rest)}`);
@@ -335,7 +372,7 @@ function avisosQualidade(linhas) {
   let zero = 0, acima = 0, futuro = 0;
   for (const l of linhas) {
     const st = l[COL_PADRAO];
-    const tot = paraNumero(valDe(l, /^valor total/)), exe = paraNumero(valDe(l, /^valor executado/));
+    const tot = paraNumero(valDe(l, RE_VTOTAL)), exe = paraNumero(valDe(l, /^valor executado/));
     if (st === "Concluída" && tot > 0 && (exe ?? 0) === 0) zero++;
     if (tot > 0 && exe !== null && exe > tot * 1.0001) acima++;
     const d = String(valDe(l, /termino/) ?? "").match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
@@ -361,7 +398,8 @@ function formatar(res, plano, cat) {
     case "contar": return `Encontrei *${res.total}* registro(s)${desc}.`;
     case "somar":
       if (!res.colValor) break;
-      return `A soma de *${res.colValor}*${desc} é *${fmtValor(res.colValor, res.valor)}* (${res.valoresUsados} de ${res.total} registro(s) com valor preenchido).`;
+      return `A soma de *${res.colValor}*${desc} é *${fmtValor(res.colValor, res.valor)}* (${res.valoresUsados} de ${res.total} registro(s) com valor preenchido).`
+        + (ehMonetaria(res.colValor) ? totaisLista(res.filtradas, cat) : "");
     case "media":
       if (!res.colValor || res.valor === null) break;
       return `A média de *${res.colValor}*${desc} é *${fmtValor(res.colValor, res.valor)}* (base: ${res.valoresUsados} registro(s)).`;
@@ -370,8 +408,10 @@ function formatar(res, plano, cat) {
       return `${res.op === "maior" ? "Maior" : "Menor"} *${res.colValor}*${desc}: *${fmtValor(res.colValor, res.melhor.n)}*\n${descreverLinha(res.melhor.l, colsDa(res.melhor.l))}`;
     case "agrupar":
       if (!res.grupos) break;
-      return `*${res.colGrupo}*${desc} — ${res.total} registro(s):\n` + res.grupos.slice(0, 30).map(([k, e]) =>
-        `• ${k}: ${e.qtd}${res.colValor ? ` — ${fmtValor(res.colValor, e.soma)}` : ""}`).join("\n");
+      return `*${res.colGrupo}*${desc} — ${res.total} registro(s), ${res.grupos.length} grupo(s):\n` + res.grupos.slice(0, 30).map(([k, e], i) =>
+        `${i + 1}. ${k}: ${e.qtd}${res.colValor ? ` — ${fmtValor(res.colValor, e.soma)}` : ""}`).join("\n")
+        + (res.grupos.length > 30 ? `\n…mostrando 30 de ${res.grupos.length} grupos.` : "")
+        + (res.multi ? "\n_Obras que citam mais de um bairro entram em cada um deles._" : "");
     case "detalhar":
       if (res.total <= 3 && !plano.soNomes) return res.filtradas.map(detalharLinha).join("\n\n");
       break;
@@ -433,7 +473,7 @@ function planoLocalFraco(pergunta, cat) {
   const filtros = [{ coluna: COL_PADRAO, op: "igual", valor: sts }];
   const descricao = sts.join("/");
   if (/\b(quantas|quantos|quantidade|numero de)\b/.test(p)) return { operacao: "contar", filtros, descricao };
-  if (/\b(soma|valor total|quanto (foi|custou|custaram|investido))\b/.test(p)) return { operacao: "somar", filtros, coluna_valor: "VALOR TOTAL", descricao };
+  if (/\b(soma|valor total|quanto (foi|custou|custaram|investido))\b/.test(p)) return { operacao: "somar", filtros, coluna_valor: /investid|gast/.test(p) ? "VALOR EXECUTADO" : "VALOR TOTAL DA OBRA", descricao };
   return { operacao: "listar", filtros, descricao };
 }
 
@@ -465,6 +505,9 @@ Formato:
 Regras:
 - Use valores que existem na lista quando possível ("igual"); para nomes parciais use "contem".
 - Local, bairro, rua ou objeto (ex.: "do centro", "Planalto"): SEMPRE op "contem" (o campo costuma trazer o endereço completo).
+- "valor investido / gasto / pago / já executado" => coluna "VALOR EXECUTADO" (ou "VALOR PAGO" se a pergunta disser "pago"); "valor da obra / contratado / custo total / quanto custa" => "VALOR TOTAL DA OBRA". Nunca use "VALOR TOTAL DOS ADITIVOS" ou "VALOR TOTAL DOS REAJUSTES" salvo pedido explícito.
+- "descricao": no máximo 6 palavras, só o filtro (ex.: "bairro Centro"), sem repetir a pergunta.
+- Ranking/"quais bairros": operacao "agrupar" com agrupar_por "BAIRRO".
 - Situação da obra: use a coluna "STATUS PADRÃO" quando existir (Concluída, Em andamento, Paralisada, Stand-by, Não iniciada, Outro). "concluída/executada/finalizada" = Concluída.
 - "quantas/quantos" => contar. "valor total/soma/quanto foi investido" => somar. "por bairro/status" => agrupar.
 - Pergunta sobre uma obra específica => detalhar com filtro "contem" (coluna * se não souber a coluna).
@@ -588,6 +631,7 @@ Regras OBRIGATÓRIAS:
     ], { max_tokens: 300, temperature: 0.2 });
     let final = String(texto || "").replace(/\*\*(.+?)\*\*/g, "*$1*").replace(/^#+\s*/gm, "").trim();
     if (!final) return respostaBase;
+    if (!/[.!?:)*_\p{Extended_Pictographic}]$/u.test(final)) { console.warn("AGENTE: redação cortada, descartada."); return respostaBase; }
     const antes = new Set(numerosDe(alvo)), depois = new Set(numerosDe(final));
     const perdeu = [...antes].some((n) => !depois.has(n));
     const inventou = [...depois].some((n) => !antes.has(n) && n.length > 1);
@@ -614,14 +658,15 @@ function colunaValorDaPergunta(p, cat) {
   if (/\bsaldo/.test(p)) return acha(/saldo/);
   if (/\bpag[oa]s?\b|\bpagamento/.test(p)) return acha(/^valor pago$/) || acha(/pago/);
   if (/\bexecutad[oa] (em )?(r\$|valor)|\bvalor executado/.test(p)) return acha(/valor executado/);
+  if (/\binvestid|\bgast[oa]|\bexecutad[oa]\b/.test(p)) return acha(/^valor executado/);
   if (/\baditiv/.test(p)) return acha(/aditivo/);
   if (/\breajuste/.test(p)) return acha(/reajuste/);
   if (/%|percentual|porcentagem|execucao fisica/.test(p)) return acha(/% de execucao|% executada|%/);
   if (/\bm2\b|\bm²|\bmetr|\barea\b|\bextensao/.test(p)) return acha(/m2|m²|metr|area|extensao/);
-  return acha(/^valor total/) || acha(/^valor( |$)|valor \(r\$\)/) || acha(/valor/);
+  return acha(RE_VTOTAL) || acha(/^valor( |$)|valor \(r\$\)/) || acha(/valor/);
 }
 function colunaGrupoDaPergunta(p, cat) {
-  const m = p.match(/\b(?:por|cada|separad[oa]s? por|agrupad[oa]s? por)\s+(bairro|empresa|status|situacao|recurso|fonte|engenheiro|tipo|aba|localidade|ano)/);
+  const m = p.match(/\b(?:por|cada|separad[oa]s? por|agrupad[oa]s? por|ranking (?:d[oa]s?|por)|quais (?:os |as )?)\s*(bairro|empresa|status|situacao|recurso|fonte|engenheiro|tipo|aba|localidade|ano)/);
   if (!m) return null;
   const alvo = { situacao: "status", fonte: "recurso", localidade: "bairro" }[m[1]] || m[1];
   if (alvo === "status" && cat.colunas.some((c) => c.nome === COL_PADRAO)) return COL_PADRAO;
@@ -652,12 +697,12 @@ function planoGeral(pergunta, cat, linhas) {
   else if (/\bmedia\b/.test(p)) operacao = "media";
   else if (/\b(maior|mais car[oa]|mais alt[oa]|mais valios|top)\b/.test(p)) operacao = "maior";
   else if (/\b(menor|mais barat[oa]|mais baix[oa])\b/.test(p)) operacao = "menor";
-  else if (/\b(soma|somar|valor total|total (investido|gasto|pago)|quanto (foi|se|ja|custou|custaram|investiu|pagou|gastou)|quanto (de|em) dinheiro|montante)\b/.test(p)) operacao = "somar";
+  else if (/\b(soma|somar|valor total|valor (investid|gast|pag|executad)\w*|total (investido|gasto|pago)|quanto (foi|se|ja|custou|custaram|investiu|pagou|gastou)|quanto (de|em) dinheiro|montante)\b/.test(p)) operacao = "somar";
   else if (livres.length && filtros.some((f) => f.coluna === "*") && !pedeTodas(p)) operacao = "detalhar";
   if (["somar", "media", "maior", "menor", "agrupar"].includes(operacao)) coluna_valor = colunaValorDaPergunta(p, cat);
   if (operacao === "agrupar" && !/\b(valor|soma|reais|r\$|investid)/.test(p)) coluna_valor = null;
   if (!filtros.length && operacao === "listar" && !pedeTodas(p)) return null;
-  const descricao = filtros.map((f) => [].concat(f.valor).join("/")).join(", ");
+  const descricao = [...filtros.filter((f) => f.coluna !== "*").map((f) => [].concat(f.valor).join("/")), livres.length && filtros.some((f) => f.coluna === "*") ? livres.join(" ") : ""].filter(Boolean).join(", ");
   return { operacao, filtros, coluna_valor, agrupar_por, ordem, descricao };
 }
 
