@@ -29,7 +29,10 @@ const norm = (s = "") => String(s ?? "").normalize("NFD").replace(/[\u0300-\u036
   .toLowerCase().replace(/\s+/g, " ").trim();
 const vazio = (v) => v === null || v === undefined || (typeof v === "string" && v.trim() === "");
 const colunaInterna = (c) => c.startsWith("_");
-const STOP = new Set("a o as os de da do das dos e em no na nos nas um uma uns umas para pra por com que qual quais quanto quantos quantas quanta me diga mostre mostrar liste listar tem ha existe existem sao foi foram esta estao obra obras sobre qual e ou ao aos se sua seu".split(" "));
+const STOP = new Set("a o as os de da do das dos e em no na nos nas um uma uns umas para pra por com que qual quais quanto quantos quantas quanta me diga mostre mostrar liste listar tem ha existe existem sao foi foram esta estao obra obras sobre qual e ou ao aos se sua seu fala falar fale der de dar dá da dê mostra mostrar mostre lista listar liste quero queria gostaria saber sei informe informa informar todas todos toda todo so somente apenas os nome nomes status situacao estado oi ola favor por voce vc pode poderia traga traz trazer ver veja manda mande envia envie relacao relatorio ai".split(" "));
+// Pedido só de nomes ("me dê só os nomes das obras concluídas").
+const pedeSoNomes = (p) => /\b(so|somente|apenas)\b[\s\S]{0,15}\bnomes?\b|\bnomes? (das|dos|de)\b|\bso o nome\b/.test(norm(p));
+const pedeTodas = (p) => /\b(todas|todos|quais|liste|listar|lista|relacao)\b/.test(norm(p));
 
 function paraNumero(v) {
   if (typeof v === "number") return Number.isFinite(v) ? v : null;
@@ -370,8 +373,16 @@ function formatar(res, plano, cat) {
       return `*${res.colGrupo}*${desc} — ${res.total} registro(s):\n` + res.grupos.slice(0, 30).map(([k, e]) =>
         `• ${k}: ${e.qtd}${res.colValor ? ` — ${fmtValor(res.colValor, e.soma)}` : ""}`).join("\n");
     case "detalhar":
-      if (res.total <= 3) return res.filtradas.map(detalharLinha).join("\n\n");
+      if (res.total <= 3 && !plano.soNomes) return res.filtradas.map(detalharLinha).join("\n\n");
       break;
+  }
+  if (plano.soNomes) {
+    const cNome = (l) => colDe(l, /^(objeto|obra|rua|descricao|nome)( |$)/);
+    const nomes = res.filtradas.map((l) => { const c = cNome(l); return c ? String(l[c]).trim() : descreverLinha(l, colsDa(l).slice(0, 2)); });
+    const lim = nomes.slice(0, 80);
+    let txt = "", n = 0;
+    for (const [i, x] of lim.entries()) { const t = `${i + 1}. ${x}\n`; if (txt.length + t.length > 3600) break; txt += t; n++; }
+    return `Encontrei *${res.total}* registro(s)${desc}:\n${txt.trimEnd()}${res.total > n ? `\n…mostrando ${n} de ${res.total}.` : ""}`;
   }
   if (res.total === 1) return `Encontrei 1 registro${desc}:\n${detalharLinha(res.filtradas[0])}`;
   const itens = []; let usado = 0;
@@ -413,6 +424,19 @@ function planoLocal(pergunta, cat) {
   return null;
 }
 
+// Plano "de segurança" quando a IA falha: usa o que deu para reconhecer na pergunta.
+function planoLocalFraco(pergunta, cat) {
+  const p = norm(pergunta);
+  const temPadrao = cat.colunas.some((c) => c.nome === COL_PADRAO);
+  const sts = temPadrao ? statusDaPergunta(p) : [];
+  if (!sts.length) return null;
+  const filtros = [{ coluna: COL_PADRAO, op: "igual", valor: sts }];
+  const descricao = sts.join("/");
+  if (/\b(quantas|quantos|quantidade|numero de)\b/.test(p)) return { operacao: "contar", filtros, descricao };
+  if (/\b(soma|valor total|quanto (foi|custou|custaram|investido))\b/.test(p)) return { operacao: "somar", filtros, coluna_valor: "VALOR TOTAL", descricao };
+  return { operacao: "listar", filtros, descricao };
+}
+
 function resumoCatalogo(cat) {
   return cat.colunas.map((c) => `- "${c.nome}" [${c.numerica ? "número" : "texto"}]${c.exemplos.length ? ` valores: ${c.exemplos.slice(0, c.categorica ? MAX_VALORES_CATALOGO : 6).join("; ").slice(0, 600)}` : ""}`).join("\n")
     + `\n- "_aba" [texto] valores: ${cat.abas.join("; ")}`;
@@ -450,7 +474,7 @@ Plano anterior: ${anterior ? JSON.stringify(anterior) : "nenhum"}`;
   const texto = await chamarIAbruta([
     { role: "system", content: sistema },
     { role: "user", content: `${conversa ? `Conversa recente:\n${conversa}\n\n` : ""}Pergunta: ${pergunta}` },
-  ], { max_tokens: 400, temperature: 0 });
+  ], { max_tokens: 800, temperature: 0 });
   return extrairJSON(texto);
 }
 
@@ -580,6 +604,89 @@ Regras OBRIGATÓRIAS:
 }
 
 // ------------------------------------------------------------
+// Planejador local "geral": entende operação, coluna de valor, agrupamento
+// e filtros (status, valores citados, palavras do nome/bairro/empresa)
+// sem depender da IA. Usado quando a IA falha ou devolve plano inválido.
+// ------------------------------------------------------------
+function colunaValorDaPergunta(p, cat) {
+  const nums = cat.colunas.filter((c) => c.numerica);
+  const acha = (re) => nums.find((c) => re.test(norm(c.nome)))?.nome;
+  if (/\bsaldo/.test(p)) return acha(/saldo/);
+  if (/\bpag[oa]s?\b|\bpagamento/.test(p)) return acha(/^valor pago$/) || acha(/pago/);
+  if (/\bexecutad[oa] (em )?(r\$|valor)|\bvalor executado/.test(p)) return acha(/valor executado/);
+  if (/\baditiv/.test(p)) return acha(/aditivo/);
+  if (/\breajuste/.test(p)) return acha(/reajuste/);
+  if (/%|percentual|porcentagem|execucao fisica/.test(p)) return acha(/% de execucao|% executada|%/);
+  if (/\bm2\b|\bm²|\bmetr|\barea\b|\bextensao/.test(p)) return acha(/m2|m²|metr|area|extensao/);
+  return acha(/^valor total/) || acha(/^valor( |$)|valor \(r\$\)/) || acha(/valor/);
+}
+function colunaGrupoDaPergunta(p, cat) {
+  const m = p.match(/\b(?:por|cada|separad[oa]s? por|agrupad[oa]s? por)\s+(bairro|empresa|status|situacao|recurso|fonte|engenheiro|tipo|aba|localidade|ano)/);
+  if (!m) return null;
+  const alvo = { situacao: "status", fonte: "recurso", localidade: "bairro" }[m[1]] || m[1];
+  if (alvo === "status" && cat.colunas.some((c) => c.nome === COL_PADRAO)) return COL_PADRAO;
+  if (alvo === "aba") return "_aba";
+  return acharColuna(cat, alvo);
+}
+function planoGeral(pergunta, cat, linhas) {
+  const p = norm(pergunta);
+  const temPadrao = cat.colunas.some((c) => c.nome === COL_PADRAO);
+  const filtros = [];
+  const sts = temPadrao ? statusDaPergunta(p) : [];
+  if (sts.length) filtros.push({ coluna: COL_PADRAO, op: "igual", valor: sts });
+  for (const c of cat.colunas.filter((x) => x.categorica && x.nome !== COL_PADRAO && !ehColStatus(x.nome))) {
+    const achados = c.distintos.filter((v) => { const n = norm(v); return n.length >= 4 && new RegExp(`\\b${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:s|es)?\\b`).test(p); });
+    if (achados.length) filtros.push({ coluna: c.nome, op: "igual", valor: achados });
+  }
+  // Palavras que sobram (ex.: "passagem molhada", "ubs areal") viram filtro de texto.
+  const palavrasOp = /^(soma|somar|total|valor|valores|media|maior|menor|mais|menos|caro|cara|barato|barata|quantidade|numero|cada|separado|agrupado|investido|gasto|custou|pago|paga|saldo|devedor|aditivo|aditivos|reajuste|percentual|porcentagem|bairro|bairros|empresa|empresas|recurso|engenheiro|tipo|ano|prazo|data|inicio|termino|conclu|executad|paralis|andamento|iniciad|stand)/;
+  const jaUsado = norm(filtros.flatMap((f) => f.valor).join(" "));
+  const livres = tokens(p).filter((t) => t.length >= 3 && !palavrasOp.test(t) && !jaUsado.includes(t));
+  if (livres.length) {
+    const casaTodos = (l) => { const txt = norm(Object.entries(l).filter(([c]) => !colunaInterna(c) && RE_CHAVE.test(norm(c))).map(([, v]) => v).join(" ")); return livres.every((t) => txt.includes(t)); };
+    if (linhas.some(casaTodos)) livres.forEach((t) => filtros.push({ coluna: "*", op: "contem", valor: t }));
+  }
+  let operacao = "listar", coluna_valor = null, agrupar_por = colunaGrupoDaPergunta(p, cat), ordem = null;
+  if (agrupar_por) operacao = "agrupar";
+  else if (/\b(quantas|quantos|quantidade|numero de|total de obras)\b/.test(p) && !/\b(valor|reais|r\$|custa|custou|investid)/.test(p)) operacao = "contar";
+  else if (/\bmedia\b/.test(p)) operacao = "media";
+  else if (/\b(maior|mais car[oa]|mais alt[oa]|mais valios|top)\b/.test(p)) operacao = "maior";
+  else if (/\b(menor|mais barat[oa]|mais baix[oa])\b/.test(p)) operacao = "menor";
+  else if (/\b(soma|somar|valor total|total (investido|gasto|pago)|quanto (foi|se|ja|custou|custaram|investiu|pagou|gastou)|quanto (de|em) dinheiro|montante)\b/.test(p)) operacao = "somar";
+  else if (livres.length && filtros.some((f) => f.coluna === "*") && !pedeTodas(p)) operacao = "detalhar";
+  if (["somar", "media", "maior", "menor", "agrupar"].includes(operacao)) coluna_valor = colunaValorDaPergunta(p, cat);
+  if (operacao === "agrupar" && !/\b(valor|soma|reais|r\$|investid)/.test(p)) coluna_valor = null;
+  if (!filtros.length && operacao === "listar" && !pedeTodas(p)) return null;
+  const descricao = filtros.map((f) => [].concat(f.valor).join("/")).join(", ");
+  return { operacao, filtros, coluna_valor, agrupar_por, ordem, descricao };
+}
+
+// Validação do plano da IA: descarta colunas inexistentes em vez de falhar.
+function validarPlano(plano, cat) {
+  const OPS = ["listar", "contar", "somar", "media", "maior", "menor", "agrupar", "detalhar", "fora_do_escopo"];
+  if (!plano || typeof plano !== "object" || !OPS.includes(plano.operacao)) return null;
+  plano.filtros = (Array.isArray(plano.filtros) ? plano.filtros : []).filter((f) => f && (f.coluna === "*" || acharColuna(cat, f.coluna) || f.coluna === COL_PADRAO) && (["vazio", "preenchido"].includes(f.op) || !vazio(f.valor)));
+  if (["somar", "media", "maior", "menor"].includes(plano.operacao) && !acharColuna(cat, plano.coluna_valor)) return null;
+  if (plano.operacao === "agrupar" && !acharColuna(cat, plano.agrupar_por)) return null;
+  return plano;
+}
+
+// Última saída: a IA lê as linhas relevantes (resumidas) e responde direto.
+async function respostaLivreIA(pergunta, historico, linhas, rotulo) {
+  const base = (buscaLivre(pergunta, linhas).length ? buscaLivre(pergunta, linhas) : linhas).slice(0, 60);
+  const cols = (l) => Object.entries(l).filter(([c, v]) => !colunaInterna(c) && !vazio(v) && !/latitude|longitude|link/.test(norm(c)))
+    .map(([c, v]) => `${rotuloColuna(c)}=${fmtCelula(c, v)}`).join("; ");
+  let dados = "";
+  for (const l of base) { const t = `- ${cols(l)}\n`; if (dados.length + t.length > 14000) break; dados += t; }
+  const conversa = historico.slice(-4).map((m) => `${m.role === "user" ? "Usuário" : "Bot"}: ${String(m.content || "").slice(0, 300)}`).join("\n");
+  const texto = await chamarIAbruta([
+    { role: "system", content: `Você é o assistente da planilha de obras de Mamanguape. Responda em português, curto e claro, formatado para WhatsApp (use *negrito*, listas com •). Use SOMENTE os dados abaixo (${rotulo}). Não invente números nem obras. Se a resposta não estiver nos dados, diga isso e sugira como perguntar.\n\nDADOS (${base.length} de ${linhas.length} registros):\n${dados}` },
+    { role: "user", content: `${conversa ? `Conversa recente:\n${conversa}\n\n` : ""}Pergunta: ${pergunta}` },
+  ], { max_tokens: 900, temperature: 0.1 });
+  return String(texto || "").replace(/\*\*(.+?)\*\*/g, "*$1*").replace(/^#+\s*/gm, "").trim().slice(0, 3900);
+}
+
+// ------------------------------------------------------------
 function respostaSocial(pergunta = "") {
   const p = norm(pergunta);
   if (/^(?:o+i+|oie+|ola+|opa+|e ai+|bom dia+|boa tarde+|boa noite+)[!.? ]*$/.test(p))
@@ -620,6 +727,17 @@ export async function responderPergunta(pergunta, historico = [], _opcoes = {}) 
   if (!plano) {
     try { plano = await planoIA(texto, hist, cat, categoria, rotulo); modo = "plano_ia"; }
     catch (e) { console.error("AGENTE: IA indisponível:", e.message); plano = null; }
+    plano = validarPlano(plano, cat);
+    if (!plano) { const g = planoGeral(texto, cat, universo); if (g) { plano = g; modo = "regra_geral"; } }
+    // IA falhou ou ignorou o status pedido: usa o plano local por status.
+    const fraco = planoLocalFraco(texto, cat);
+    const iaUsaStatus = (plano?.filtros || []).some((f) => /status|situacao/.test(norm(f.coluna || "")));
+    if (fraco && (!plano || plano.operacao === "fora_do_escopo" || !iaUsaStatus)) { plano = fraco; modo = "regra_local_status"; }
+  }
+  if (plano && plano.operacao !== "fora_do_escopo") {
+    if (pedeSoNomes(texto)) { plano.soNomes = true; if (["detalhar", "listar"].includes(plano.operacao)) plano.operacao = "listar"; }
+    // "todas as obras concluídas" é lista, não detalhe de 1 obra.
+    if (plano.operacao === "detalhar" && pedeTodas(texto)) plano.operacao = "listar";
   }
 
   if (plano?.operacao === "fora_do_escopo")
@@ -632,12 +750,19 @@ export async function responderPergunta(pergunta, historico = [], _opcoes = {}) 
   if (!res || (res.total === 0 && ["listar", "detalhar", "contar"].includes(plano?.operacao) && !filtraStatus)) {
     const achadas = buscaLivre(texto, universo);
     if (achadas.length) {
-      plano = { operacao: achadas.length <= 3 ? "detalhar" : "listar", filtros: [], descricao: "busca por palavras — resultado aproximado" };
+      plano = { operacao: achadas.length <= 3 && !pedeTodas(texto) ? "detalhar" : "listar", filtros: [], descricao: "busca por palavras — resultado aproximado", soNomes: pedeSoNomes(texto) };
       res = { op: plano.operacao, filtradas: achadas, total: achadas.length };
       modo = "busca_livre";
     }
   }
-  if (!res) return { resposta: "Não entendi bem. Pode reformular citando, por exemplo, o bairro, o status ou o nome?", modoAgente: "sem_plano", estado: { categoria } };
+  if (!res || res.total === 0) {
+    // Nada deu certo pelos cálculos: a IA lê os dados e responde direto.
+    try {
+      const livre = await respostaLivreIA(texto, hist, universo, rotulo);
+      if (livre) return { resposta: livre, modoAgente: "ia_com_dados", estado: { categoria } };
+    } catch (e) { console.error("AGENTE: falha na resposta livre:", e.message); }
+    if (!res) return { resposta: `Não achei isso na planilha de ${rotulo}. Tente citar o nome da obra, o bairro, a empresa ou o status.`, modoAgente: "sem_plano", estado: { categoria } };
+  }
   plano.descricao = [rotulo, plano.descricao].filter(Boolean).join(" — ");
 
   const respostaBase = formatar(res, plano, cat);
@@ -653,4 +778,4 @@ export async function responderPergunta(pergunta, historico = [], _opcoes = {}) 
 }
 
 // Exportado para testes.
-export const _interno = { deduplicar, statusPadrao, padronizarStatus, statusDaPergunta, montarUniverso, avisosQualidade, totaisLista, fmtValor, montarCatalogo, executarPlano, planoLocal, paraNumero, formatar, buscaLivre, numerosDe, redigirParaWhatsApp, categoriaDaPergunta, categoriaDaLinha };
+export const _interno = { planoGeral, validarPlano, planoLocalFraco, pedeSoNomes, pedeTodas, deduplicar, statusPadrao, padronizarStatus, statusDaPergunta, montarUniverso, avisosQualidade, totaisLista, fmtValor, montarCatalogo, executarPlano, planoLocal, paraNumero, formatar, buscaLivre, numerosDe, redigirParaWhatsApp, categoriaDaPergunta, categoriaDaLinha };
