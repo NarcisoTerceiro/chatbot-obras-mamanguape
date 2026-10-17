@@ -22,14 +22,32 @@ import { medirEtapa, medirRequisicaoIA, registrarChamadaIA } from "./telemetria.
 // ============================================================
 
 const NVIDIA_KEY = (process.env.NVIDIA_API_KEY || "").trim();
-const NVIDIA_MODEL = (process.env.NVIDIA_MODEL || "nvidia/nemotron-3-super-120b-a12b").trim();
-// Modelos NVIDIA tentados em ordem ANTES de sair da NVIDIA. Pode sobrescrever
-// com NVIDIA_MODELOS="modelo1,modelo2". So depois de todos falharem cai p/ Groq.
+// NVIDIA_MODEL / NVIDIA_MODELOS (opcionais) FORÇAM a lista. Vazio = escolha automática:
+// o código consulta GET /v1/models da SUA chave e usa os melhores modelos que existirem.
+const NVIDIA_MODEL = (process.env.NVIDIA_MODEL || "").trim();
 const NVIDIA_MODELOS = [...new Set([
   NVIDIA_MODEL,
-  ...String(process.env.NVIDIA_MODELOS || "").split(","),   // sem padrão: o llama-3.3-70b foi aposentado (410)
+  ...String(process.env.NVIDIA_MODELOS || "").split(","),
 ].map((m) => m.trim()).filter(Boolean))];
+// Ordem de preferência (rápidos e bons p/ classificar e redigir primeiro; os que raciocinam muito por último).
+const NVIDIA_PREFERIDOS = [
+  /^openai\/gpt-oss-120b$/i,
+  /deepseek.*v4.*flash/i,
+  /minimax.*m2/i,
+  /step-3\.5-flash/i,
+  /nemotron-3-super/i,
+  /^openai\/gpt-oss-20b$/i,
+  /qwen3\.5/i,
+  /kimi-k2/i,
+];
+const NVIDIA_MAX_MODELOS = 3;
+const NVIDIA_ORCAMENTO_MS = Math.max(5000, Number(process.env.NVIDIA_ORCAMENTO_MS || 16000)); // tempo total máx. na NVIDIA por pergunta
 const modelosNvidiaIndisponiveis = new Set();
+function marcarNvidiaLento(modelo) {
+  const e = modelosNvidiaLentos.get(modelo) || { n: 0 };
+  e.n++; e.ate = Date.now() + Math.min(60_000 * 2 ** (e.n - 1), 15 * 60_000);
+  modelosNvidiaLentos.set(modelo, e);
+}
 const NVIDIA_BASE_URL = (process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1").trim();
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_KEY = (process.env.GROQ_API_KEY || "").trim();
@@ -80,6 +98,14 @@ const OPERACOES_VALIDAS = new Set([
 const provedorDescansando = new Map();
 const DESCANSO_PADRAO_MS = 15 * 1000;
 const TIMEOUT_IA_MS = 18 * 1000;
+// NVIDIA tem timeout próprio e mais curto: existe fallback, então não vale esperar 18s.
+const NVIDIA_TIMEOUT_MS = Math.max(3000, Number(process.env.NVIDIA_TIMEOUT_MS || 12000));
+// Nemotron 3 Super raciocina por padrão (lento). Desligado aqui; NVIDIA_THINKING=true religa.
+const NVIDIA_THINKING = process.env.NVIDIA_THINKING === "true";
+const modelosNvidiaSemKwargs = new Set();
+const modelosNvidiaLentos = new Map();   // modelo -> { n, ate }: pausa por modelo após timeout/5xx
+let nvidiaCatalogo = { ids: null, em: 0 };
+let nvidiaFalhasSeguidas = 0;
 const MAX_SAIDA_GLOBAL = 2000;
 // Em 429, tenta outro modelo/provedor primeiro. Se todos estiverem limitados,
 // pode aguardar uma unica janela curta indicada pelo Retry-After e tentar de novo.
@@ -103,10 +129,11 @@ function retryDepoisMs(resp, corpoErro = "") {
 }
 
 async function fetchComTimeout(url, opcoes) {
+  const { timeoutMs, ...resto } = opcoes;
   const controlador = new AbortController();
-  const timer = setTimeout(() => controlador.abort(), TIMEOUT_IA_MS);
+  const timer = setTimeout(() => controlador.abort(), timeoutMs || TIMEOUT_IA_MS);
   try {
-    return await fetch(url, { ...opcoes, signal: controlador.signal });
+    return await fetch(url, { ...resto, signal: controlador.signal });
   } finally {
     clearTimeout(timer);
   }
@@ -143,6 +170,26 @@ function erroCortado(prov, modelo) {
   return err;
 }
 
+async function modelosNvidiaAtivos() {
+  if (NVIDIA_MODELOS.length) return NVIDIA_MODELOS;
+  const agora = Date.now();
+  const c = nvidiaCatalogo;
+  if (c.ids && agora - c.em < 30 * 60_000 && c.ids.some((id) => !modelosNvidiaIndisponiveis.has(id))) return c.ids;
+  let escolhidos = [];
+  try {
+    const resp = await fetchComTimeout(NVIDIA_BASE_URL.replace(/\/+$/, "") + "/models", { headers: { Authorization: `Bearer ${NVIDIA_KEY}` }, timeoutMs: 4000 });
+    if (resp.ok) {
+      const ids = ((await resp.json())?.data || []).map((m) => m.id).filter((id) => !modelosNvidiaIndisponiveis.has(id));
+      for (const re of NVIDIA_PREFERIDOS) { const m = ids.find((id) => re.test(id) && !escolhidos.includes(id)); if (m) escolhidos.push(m); }
+    } else console.warn(`DEBUG NVIDIA: /models respondeu ${resp.status}`);
+  } catch (e) { console.warn(`DEBUG NVIDIA: não consegui listar modelos (${e.name === "AbortError" ? "timeout" : e.message})`); }
+  if (!escolhidos.length) escolhidos = ["openai/gpt-oss-120b", "nvidia/nemotron-3-super-120b-a12b"].filter((m) => !modelosNvidiaIndisponiveis.has(m));
+  escolhidos = escolhidos.slice(0, NVIDIA_MAX_MODELOS);
+  nvidiaCatalogo = { ids: escolhidos, em: agora };
+  console.log(`DEBUG NVIDIA modelos escolhidos: ${escolhidos.join(", ") || "(nenhum)"}`);
+  return escolhidos;
+}
+
 async function chamarNvidia(body) {
   const url = new URL(NVIDIA_BASE_URL.replace(/\/+$/, "") + "/chat/completions");
   if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
@@ -150,8 +197,12 @@ async function chamarNvidia(body) {
   }
   let ultimoErro = null;
   const falhas = [];
-  for (const modelo of NVIDIA_MODELOS) {
+  const lista = await modelosNvidiaAtivos();
+  const t0 = Date.now();
+  for (const modelo of lista) {
     if (modelosNvidiaIndisponiveis.has(modelo)) continue;
+    if ((modelosNvidiaLentos.get(modelo)?.ate || 0) > Date.now()) continue;   // modelo lento/instável: pula por um tempo
+    if (Date.now() - t0 > NVIDIA_ORCAMENTO_MS) break;                         // não gasta a pergunta toda na NVIDIA
     const corpo = {
       model: modelo,
       messages: body.messages,
@@ -159,6 +210,10 @@ async function chamarNvidia(body) {
       stream: false,
     };
     if (body.temperature !== undefined) corpo.temperature = body.temperature;
+    // Nemotron 3: desliga o raciocínio (documentado via chat_template_kwargs.enable_thinking).
+    if (/nemotron-3/i.test(modelo) && !NVIDIA_THINKING && !modelosNvidiaSemKwargs.has(modelo)) {
+      corpo.chat_template_kwargs = { enable_thinking: false };
+    }
     if (/^openai\/gpt-oss-(?:20b|120b)$/i.test(modelo) && ["low", "medium", "high"].includes(body.reasoning_effort)) {
       corpo.reasoning_effort = body.reasoning_effort;
     }
@@ -168,21 +223,31 @@ async function chamarNvidia(body) {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${NVIDIA_KEY}` },
         body: JSON.stringify(corpo),
+        timeoutMs: NVIDIA_TIMEOUT_MS,
       }, { provedor: "nvidia", modelo });
     } catch (e) {
       // Timeout/rede: tenta o proximo modelo NVIDIA e depois cai p/ Groq.
+      marcarNvidiaLento(modelo);
       ultimoErro = new Error(`nvidia (${modelo}) sem resposta: ${e.name === "AbortError" ? "timeout" : e.message}`);
+      falhas.push(ultimoErro.message);
       console.warn(`DEBUG NVIDIA: ${ultimoErro.message}`);
       continue;
     }
     if (!resp.ok) {
       const erroTxt = resp.erroTxt || "";
+      // A API recusou o parâmetro de raciocínio: refaz sem ele (uma vez) em vez de falhar.
+      if (resp.status === 400 && corpo.chat_template_kwargs && /chat_template_kwargs|enable_thinking|extra|unexpected|unknown/i.test(erroTxt)) {
+        modelosNvidiaSemKwargs.add(modelo);
+        console.warn(`DEBUG NVIDIA: ${modelo} não aceita chat_template_kwargs; repetindo sem ele.`);
+        return chamarNvidia(body);
+      }
       // 404 e 410 (Gone) = modelo removido/aposentado: não adianta tentar de novo.
       if (resp.status === 404 || resp.status === 410 || /model_not_found|not found|does not exist|not available|end of life|has reached/i.test(erroTxt)) {
         modelosNvidiaIndisponiveis.add(modelo);
       }
       const err = new Error(`nvidia (${modelo}) respondeu ${resp.status}: ${erroTxt.slice(0, 200)}`);
       err.status = resp.status;
+      if (resp.status >= 500) marcarNvidiaLento(modelo);
       if (resp.status === 429) err.retryAfterMs = retryDepoisMs(resp, erroTxt);
       // Chave invalida vale para todos os modelos: sai direto para o fallback.
       if (resp.status === 401 || resp.status === 403) throw err;
@@ -198,7 +263,8 @@ async function chamarNvidia(body) {
       console.warn(`DEBUG NVIDIA: ${ultimoErro.message}`);
       continue;
     }
-    console.log(`DEBUG IA usada: NVIDIA (principal) | modelo: ${modelo}`);
+    modelosNvidiaLentos.delete(modelo);
+    console.log(`DEBUG IA usada: NVIDIA (principal) | modelo: ${modelo} | ${Date.now() - t0}ms`);
     return texto;
   }
   const final = ultimoErro || new Error("Nenhum modelo NVIDIA disponivel.");
@@ -372,6 +438,7 @@ async function chamarIA(body, tentativa429 = 0, ampliado = false) {
       const texto = prov.nome === "nvidia" ? await chamarNvidia(body)
         : prov.nome === "groq" ? await chamarGroq(body) : await chamarGemini(body);
       provedorDescansando.delete(prov.nome);
+      if (prov.nome === "nvidia") nvidiaFalhasSeguidas = 0;
       return texto;
     } catch (e) {
       ultimoErro = e;
@@ -400,7 +467,10 @@ async function chamarIA(body, tentativa429 = 0, ampliado = false) {
       if (prov.nome === "nvidia" && (!e.status || e.status >= 500)) {
         // Instabilidade/timeout: pausa curta para nao atrasar cada pergunta,
         // e logo volta a tentar a NVIDIA como principal.
-        provedorDescansando.set("nvidia", Date.now() + 20 * 1000);
+        // Backoff: 20s, 40s, 80s... até 5 min; zera quando a NVIDIA voltar a responder.
+        nvidiaFalhasSeguidas++;
+        const pausaNv = Math.min(20_000 * 2 ** (nvidiaFalhasSeguidas - 1), 5 * 60 * 1000);
+        provedorDescansando.set("nvidia", Date.now() + pausaNv);
       }
       const proximo = ordem[ordem.indexOf(prov) + 1];
       if (proximo) console.log(`DEBUG IA: ${prov.nome} falhou (${String(e.message).slice(0, 160)}) -> caindo para ${proximo.nome}.`);
@@ -865,3 +935,35 @@ export async function chamarIAbruta(mensagens, opcoes = {}) {
   body.reasoning_effort = opcoes.reasoning_effort !== undefined ? opcoes.reasoning_effort : "low";
   return await chamarIA(body);
 }
+
+
+// ============================================================
+//  Diagnóstico da NVIDIA: testa cada modelo escolhido e mostra o tempo.
+//  Uso (com a chave no ambiente):
+//    NVIDIA_API_KEY=nvapi-... node -e "import('./groq.js').then(m=>m.diagnosticarNvidia())"
+// ============================================================
+export async function diagnosticarNvidia() {
+  if (!NVIDIA_KEY) { console.log("NVIDIA_API_KEY não configurada."); return []; }
+  const lista = await modelosNvidiaAtivos();
+  const out = [];
+  for (const modelo of lista) {
+    const corpo = { model: modelo, max_tokens: 120, stream: false, messages: [{ role: "user", content: 'Responda somente com este JSON: {"ok":true}' }] };
+    if (/nemotron-3/i.test(modelo)) corpo.chat_template_kwargs = { enable_thinking: false };
+    if (/^openai\/gpt-oss-/i.test(modelo)) corpo.reasoning_effort = "low";
+    const t = Date.now();
+    try {
+      const resp = await fetchComTimeout(NVIDIA_BASE_URL.replace(/\/+$/, "") + "/chat/completions", {
+        method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${NVIDIA_KEY}` },
+        body: JSON.stringify(corpo), timeoutMs: 30_000,
+      });
+      const txt = await resp.text();
+      let conteudo = ""; try { conteudo = textoDaRespostaOpenAI(JSON.parse(txt)); } catch { conteudo = txt.slice(0, 120); }
+      out.push({ modelo, status: resp.status, ms: Date.now() - t, resposta: conteudo.slice(0, 80) });
+    } catch (e) { out.push({ modelo, status: "erro", ms: Date.now() - t, resposta: e.name === "AbortError" ? "timeout 30s" : e.message }); }
+  }
+  console.table(out);
+  return out;
+}
+
+// Aquece: já escolhe os modelos na subida e deixa isso no log.
+if (NVIDIA_KEY) modelosNvidiaAtivos().catch(() => {});
