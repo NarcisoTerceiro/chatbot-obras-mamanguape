@@ -12,10 +12,9 @@ import "dotenv/config";
 import crypto from "crypto";
 import express from "express";
 
-import { sincronizar } from "./ingestao.js";
+import { getObras, limparCache, getDiagnostico } from "./sheets.js";
 import { responderPergunta } from "./agente.js";
 import { enviarTexto } from "./whatsapp.js";
-import { queryReadOnly } from "./db.js";
 import { executarComMetricas, medirEtapa } from "./telemetria.js";
 
 const app = express();
@@ -42,9 +41,11 @@ if (!META_APP_SECRET) {
 if (!ADMIN_TOKEN) {
   throw new Error("ADMIN_TOKEN e obrigatorio para as rotas administrativas.");
 }
-if (!process.env.DATABASE_URL) {
-  throw new Error("DATABASE_URL read-only e obrigatoria para o agente SQL.");
+if (!process.env.GOOGLE_SHEETS_ID) {
+  throw new Error("GOOGLE_SHEETS_ID e obrigatorio: o agente le a planilha diretamente.");
 }
+// Aquece o cache da planilha na subida para a 1a resposta ser rapida.
+getObras().catch((e) => console.error("Falha ao pre-carregar planilha:", e.message));
 
 function compararSegredo(a, b) {
   const ba = Buffer.from((a || "").toString());
@@ -137,54 +138,30 @@ app.get("/", (_req, res) => res.send("Chatbot de Obras de Mamanguape no ar."));
 app.get("/diagnostico", async (req, res) => {
   if (!exigirAdmin(req, res)) return;
   try {
-    const [total, status, exemplo, sync, abas] = await Promise.all([
-      queryReadOnly('SELECT COUNT(*)::int AS total FROM public.obras'),
-      queryReadOnly("SELECT COALESCE(status, 'Não informado') AS status, COUNT(*)::int AS total FROM public.obras GROUP BY status ORDER BY total DESC LIMIT 20"),
-      queryReadOnly('SELECT id, objeto, bairro, status, categoria, aba_origem FROM public.obras ORDER BY id LIMIT 1'),
-      queryReadOnly('SELECT atualizada_em, registros FROM public.obras_sync WHERE id=1'),
-      queryReadOnly('SELECT planilha_id,aba,view_nome,registros,linhas_lidas,avisos,atualizada_em FROM public.planilha_abas WHERE ativa=true ORDER BY aba'),
-    ]);
+    const obras = await getObras();
+    const d = getDiagnostico();
     res.json({
-      fonte_do_atendimento: 'PostgreSQL/Supabase',
-      total_de_obras: total.rows[0]?.total || 0,
-      contagem_por_status: status.rows,
-      exemplo_de_obra: exemplo.rows[0] || null,
-      lido_em: sync.rows[0]?.atualizada_em || null,
-      ultima_sincronizacao: sync.rows[0]?.atualizada_em || null,
-      abas: abas.rows,
+      fonte_do_atendimento: "Google Sheets (direto, sem banco)",
+      total_de_registros: obras.length,
+      lido_em: d.quando,
+      abas: d.abas.map(({ celulas, ...resto }) => resto),
+      exemplo: obras[0] || null,
     });
   } catch (e) {
     res.status(500).json({ erro: e.message });
   }
 });
 
-// ------------------------------------------------------------
-//  SINCRONIZAR: a conta de servico LE o Google Sheets e esta rota popula o
-//  Supabase. O WhatsApp continua consultando somente o banco.
-//  Chame com POST + Authorization: Bearer SEU_ADMIN_TOKEN.
-// ------------------------------------------------------------
+// SINCRONIZAR: limpa o cache e rele a planilha na hora.
 async function executarRotaSincronizacao(req, res) {
   if (!exigirAdmin(req, res)) return;
   try {
-    const resultado = await sincronizar();
-    res.json({
-      ok: true,
-      obras_inseridas: resultado.inseridas,
-      abas: resultado.abas,
-      planilha_id: resultado.planilha_id,
-      quando: new Date().toISOString(),
-    });
+    limparCache();
+    const obras = await getObras({ force: true });
+    res.json({ ok: true, registros: obras.length, abas: getDiagnostico().abas.length, quando: new Date().toISOString() });
   } catch (e) {
-    // Mostra o erro completo para diagnostico (mensagem + tipo + detalhe).
-    const detalhe = e && (e.message || e.toString());
-    const codigo = e && (e.code || "");
-    console.error("ERRO na sincronizacao:", detalhe, codigo, e && e.stack);
-    res.status(500).json({
-      ok: false,
-      erro: detalhe || "erro desconhecido",
-      codigo: codigo || undefined,
-      dica: "Verifique DATABASE_ADMIN_URL no Render e as credenciais do Google.",
-    });
+    console.error("ERRO ao reler planilha:", e.message);
+    res.status(500).json({ ok: false, erro: e.message, dica: "Verifique GOOGLE_SHEETS_ID e GOOGLE_SERVICE_ACCOUNT_JSON." });
   }
 }
 
