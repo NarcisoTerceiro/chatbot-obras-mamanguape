@@ -17,7 +17,6 @@
 import { queryReadOnly as consultarBanco } from "./db.js";
 import { chamarIAbruta } from "./groq.js";
 import { executarComMetricas, medirEtapa, registrarCacheSchema, registrarSaidaSQL } from "./telemetria.js";
-import { analisarComPython, perguntaAnalitica } from "./analistaPython.js";
 
 async function queryReadOnly(...args) {
   return medirEtapa("banco", () => consultarBanco(...args));
@@ -1735,47 +1734,6 @@ function estadoPublico(ctx, execucao) {
 }
 
 // ------------------------------------------------------------
-// Analista Python (pandas): calcula sobre a planilha inteira.
-// Usado (a) primeiro em perguntas analiticas, (b) como rede de seguranca
-// quando o SQL falha, nao e gerado ou volta vazio.
-// ------------------------------------------------------------
-const MODO_PY = "sql_agent_v14_python_pandas";
-
-async function responderViaPython(texto, historico, ctx, dica = "") {
-  try {
-    const py = await medirEtapa("analise_python", () => analisarComPython({
-      pergunta: texto,
-      historicoTxt: resumoHistorico(historico),
-      relacao: ctx.relacao,
-      queryReadOnly,
-      chamarIAbruta,
-      dica,
-    }));
-    console.log("ANALISTA PY:", py.ok ? `ok (${py.rows.length} linhas)` : py.motivo, "| tentativas:", py.tentativas?.length || 0);
-    if (!py.ok) return null;
-    if (py.aviso) {
-      return { resposta: textoSeguro(py.aviso, 800), partes: [textoSeguro(py.aviso, 800)], linhas: 0, modoAgente: MODO_PY, codigoPython: py.codigo };
-    }
-    if (!py.rows.length) return { vazio: true, codigoPython: py.codigo };
-    const fonte = `-- analise pandas sobre public.${ctx.relacao}\n${py.codigo}`;
-    const resposta = await redigirResposta(texto, historico, fonte, py.rows, ctx, { area: null, limitado: false });
-    return {
-      resposta,
-      partes: dividirEmMensagens(resposta),
-      sql: fonte,
-      linhas: py.rows.length,
-      estado: { fonte: `public.${ctx.relacao}`, sql: fonte, linhas: py.rows.length, colunas_resultado: Object.keys(py.rows[0] || {}).slice(0, 30), motor: "python" },
-      codigoPython: py.codigo,
-      tentativasPython: py.tentativas,
-      modoAgente: MODO_PY,
-    };
-  } catch (e) {
-    console.warn("ANALISTA PY: falha:", e.message);
-    return null;
-  }
-}
-
-// ------------------------------------------------------------
 // Fluxo principal
 // ------------------------------------------------------------
 export async function responderPergunta(pergunta, historico = [], opcoes = {}) {
@@ -1805,14 +1763,6 @@ async function responderPerguntaInterno(pergunta, historico = []) {
     // universo correto (tipo_negocio='licitacao'). Para todo o resto, o fluxo
     // continua exatamente igual e a IA gera a SQL.
     const sqlAnaliseDireta = sqlAnaliseLicitacao(texto, ctx);
-    // Estagio 1b: perguntas analiticas (media, percentual, comparacao, prazo,
-    // tendencia, ranking...) vao primeiro para o analista pandas, que calcula
-    // de forma exata sobre a planilha inteira.
-    if (!sqlAnaliseDireta && perguntaAnalitica(texto)) {
-      const viaPy = await responderViaPython(texto, historico, ctx);
-      if (viaPy && !viaPy.vazio) return viaPy;
-    }
-
     let gerada = sqlAnaliseDireta
       ? { query: sqlAnaliseDireta, descricao: "consulta segura de análise de licitação" }
       : await gerarSQL(texto, historico, ctx);
@@ -1828,8 +1778,6 @@ async function responderPerguntaInterno(pergunta, historico = []) {
         "Ainda sem SQL. Nao desista: escolha as colunas/chaves de dados_extras mais relacionadas a pergunta e retorne ate 60 registros com objeto e esses campos, ou um resumo agrupado se a pergunta for geral.");
     }
     if (!gerada.query) {
-      const viaPy = await responderViaPython(texto, historico, ctx, "O gerador SQL nao conseguiu montar consulta; resolva com pandas.");
-      if (viaPy && !viaPy.vazio) return viaPy;
       return {
         resposta: "Não consegui transformar essa pergunta em uma consulta segura aos dados. Pode reformular?",
         erro: "sql_nao_gerada",
@@ -1919,28 +1867,13 @@ async function responderPerguntaInterno(pergunta, historico = []) {
     console.log("SQL AGENT - SQL INICIAL:", gerada.query, "| AREA:", area || "-");
 
     // Estagio 2: executa + self-healing com diagnostico real do PostgreSQL.
-    let execucao;
-    try {
-      execucao = await executarComSelfHealing({
-        pergunta: texto,
-        historico,
-        ctx,
-        sqlInicial: gerada.query,
-        area,
-      });
-    } catch (eSql) {
-      console.warn("SQL AGENT: SQL falhou, acionando analista Python:", eSql.message);
-      const viaPy = await responderViaPython(texto, historico, ctx, `A consulta SQL falhou com: ${textoSeguro(eSql.message, 300)}`);
-      if (viaPy && !viaPy.vazio) return viaPy;
-      throw eSql;
-    }
-
-    // Segunda opiniao: SQL vazio ou so com campos vazios -> pandas confere
-    // na planilha inteira (tolerante a acento, grafia e chaves de dados_extras).
-    if (!area && (!execucao.rows.length || resultadoSoComCamposVazios(execucao.rows))) {
-      const viaPy = await responderViaPython(texto, historico, ctx, "O SQL retornou vazio; confira com busca tolerante se realmente nao existe.");
-      if (viaPy && !viaPy.vazio) return viaPy;
-    }
+    const execucao = await executarComSelfHealing({
+      pergunta: texto,
+      historico,
+      ctx,
+      sqlInicial: gerada.query,
+      area,
+    });
     execucao.rows = await enriquecerContrato(execucao.rows, ctx);
 
     console.log("SQL AGENT - SQL FINAL:", execucao.sql);
