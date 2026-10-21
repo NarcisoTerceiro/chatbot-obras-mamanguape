@@ -16,6 +16,7 @@
 
 import { queryReadOnly as consultarBanco } from "./db.js";
 import { chamarIAbruta } from "./groq.js";
+import { entenderPergunta, ancorarTermos, clarificacaoPorAmbiguidadeDeNome, dicasDeAncoragem, verificarResultado } from "./compreensao.js";
 import { executarComMetricas, medirEtapa, registrarCacheSchema, registrarSaidaSQL } from "./telemetria.js";
 
 async function queryReadOnly(...args) {
@@ -1741,11 +1742,44 @@ export async function responderPergunta(pergunta, historico = [], opcoes = {}) {
 }
 
 async function responderPerguntaInterno(pergunta, historico = []) {
-  const texto = textoSeguro(pergunta, 1600);
+  const textoOriginal = textoSeguro(pergunta, 1600);
+  let texto = textoOriginal;
   if (!texto) return { resposta: "Pode enviar sua pergunta sobre as obras?", erro: "pergunta_vazia" };
 
   const social = respostaSocial(texto, historico);
   if (social) return { resposta: social, social: true, modoAgente: "social" };
+
+  // ===== V14: ENTENDER -> ANCORAR -> (esclarecer se preciso) =====
+  let compreensao = null;
+  let dicas = "";
+  try {
+    const ctx0 = await carregarSchemaContexto();
+    compreensao = await entenderPergunta(textoOriginal, historico, ctx0);
+    if (compreensao) {
+      console.log("COMPREENSAO:", JSON.stringify(compreensao));
+      if ((compreensao.tipo === "conversa" || compreensao.tipo === "fora_escopo") && compreensao.respostaDireta) {
+        return { resposta: compreensao.respostaDireta, social: true, modoAgente: "v14_" + compreensao.tipo,
+          estado: { perguntaAutonoma: compreensao.perguntaAutonoma } };
+      }
+      // So pergunta de volta quando a IA tem pouca confianca E ainda nao
+      // acabou de receber um esclarecimento (evita loop de perguntas).
+      if (compreensao.tipo === "ambigua" && compreensao.perguntaClarificacao && !compreensao.vinhaDeClarificacao && compreensao.confianca < 0.6) {
+        return { resposta: compreensao.perguntaClarificacao, modoAgente: "v14_clarificacao",
+          estado: { aguardandoClarificacao: true, perguntaOriginal: textoOriginal, perguntaClarificacao: compreensao.perguntaClarificacao } };
+      }
+      texto = compreensao.perguntaAutonoma || textoOriginal;
+      const achados = await ancorarTermos(compreensao.termos, ctx0);
+      const duvidaNome = !compreensao.vinhaDeClarificacao && clarificacaoPorAmbiguidadeDeNome(achados);
+      if (duvidaNome) {
+        return { resposta: duvidaNome, modoAgente: "v14_clarificacao_nome",
+          estado: { aguardandoClarificacao: true, perguntaOriginal: texto, perguntaClarificacao: duvidaNome } };
+      }
+      dicas = dicasDeAncoragem(achados);
+      if (dicas) console.log("ANCORAGEM:", dicas);
+    }
+  } catch (e) {
+    console.warn("COMPREENSAO V14 indisponivel, seguindo fluxo normal:", e.message);
+  }
 
   const ambiguidadeAnalise = respostaAmbiguidadeAnaliseLicitacao(texto);
   if (ambiguidadeAnalise) {
@@ -1765,7 +1799,7 @@ async function responderPerguntaInterno(pergunta, historico = []) {
     const sqlAnaliseDireta = sqlAnaliseLicitacao(texto, ctx);
     let gerada = sqlAnaliseDireta
       ? { query: sqlAnaliseDireta, descricao: "consulta segura de análise de licitação" }
-      : await gerarSQL(texto, historico, ctx);
+      : await gerarSQL(texto, historico, ctx, dicas);
 
     if (!gerada.query) {
       // Uma segunda tentativa curta so para formato/interpretacao, sem criar regra de frase.
@@ -1781,7 +1815,7 @@ async function responderPerguntaInterno(pergunta, historico = []) {
       return {
         resposta: "Não consegui transformar essa pergunta em uma consulta segura aos dados. Pode reformular?",
         erro: "sql_nao_gerada",
-        modoAgente: "sql_agent_self_healing_v13_9_sem_bibliotecas",
+        modoAgente: "sql_agent_v14_compreensao",
       };
     }
 
@@ -1874,6 +1908,25 @@ async function responderPerguntaInterno(pergunta, historico = []) {
       sqlInicial: gerada.query,
       area,
     });
+    // V14: VERIFICAR se o resultado responde de fato; se nao, refaz uma vez.
+    try {
+      const rev = await verificarResultado(texto, execucao.sql, execucao.rows);
+      if (!rev.ok && rev.motivo) {
+        console.log("REVISOR V14: resultado nao responde ->", rev.motivo);
+        const nova = await gerarSQL(texto, historico, ctx,
+          `${dicas}\nA consulta anterior estava ERRADA para esta pergunta.\nSQL anterior: ${execucao.sql}\nProblema apontado pelo revisor: ${rev.motivo}\nGere uma nova SQL corrigindo isso.`);
+        if (nova.query) {
+          const exec2 = await executarComSelfHealing({ pergunta: texto, historico, ctx,
+            sqlInicial: removerLimiteDeListagem(texto, nova.query), area });
+          if (exec2?.sql && !exec2.erro) {
+            const rev2 = await verificarResultado(texto, exec2.sql, exec2.rows);
+            if (rev2.ok || (exec2.rows?.length && !execucao.rows?.length)) Object.assign(execucao, exec2);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("REVISOR V14 falhou, mantendo resultado:", e.message);
+    }
     execucao.rows = await enriquecerContrato(execucao.rows, ctx);
 
     console.log("SQL AGENT - SQL FINAL:", execucao.sql);
@@ -1890,18 +1943,18 @@ async function responderPerguntaInterno(pergunta, historico = []) {
       partes,
       sql: execucao.sql,
       linhas: execucao.rows.length,
-      estado: { ...estadoPublico(ctx, execucao), recorteArea: area },
+      estado: { ...estadoPublico(ctx, execucao), recorteArea: area, perguntaAutonoma: texto, perguntaOriginal: textoOriginal },
       reparos: execucao.tentativa || 0,
       earlyAccept: !!execucao.earlyAccept,
       tentativas: execucao.tentativas,
-      modoAgente: "sql_agent_self_healing_v13_9_sem_bibliotecas",
+      modoAgente: "sql_agent_v14_compreensao",
     };
   } catch (e) {
     console.error("SQL AGENT: falha final:", e);
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "sql_agent_self_healing_v13_9_sem_bibliotecas_erro",
+      modoAgente: "sql_agent_v14_compreensao_erro",
     };
   }
 }
