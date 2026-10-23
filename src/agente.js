@@ -17,7 +17,6 @@
 import { queryReadOnly as consultarBanco } from "./db.js";
 import { chamarIAbruta } from "./groq.js";
 import { executarComMetricas, medirEtapa, registrarCacheSchema, registrarSaidaSQL } from "./telemetria.js";
-import { carregarValoresReais, conferirFiltros, textoDuvida, textoFiltrosUsados } from "./validacao_filtros.js";
 
 async function queryReadOnly(...args) {
   return medirEtapa("banco", () => consultarBanco(...args));
@@ -1865,22 +1864,6 @@ async function responderPerguntaInterno(pergunta, historico = []) {
     const ranking = ajustarRankingEntidade(texto, gerada.query);
     gerada = { ...gerada, query: ranking.sql };
 
-    // Etapa 3: confere os valores de filtro com o que existe de verdade na
-    // planilha. Corrige grafia quando ha um unico valor parecido; quando ha
-    // varios ou nenhum, pergunta ao usuario em vez de chutar.
-    const valoresReais = await carregarValoresReais(ctx, queryReadOnly);
-    const conferencia = conferirFiltros(gerada.query, valoresReais);
-    if (conferencia.duvida) {
-      console.log("SQL AGENT - FILTRO NAO CONFERE:", JSON.stringify(conferencia.duvida));
-      return {
-        resposta: textoDuvida(conferencia.duvida, rotuloHumano),
-        sql: gerada.query,
-        modoAgente: "clarificacao_filtro",
-      };
-    }
-    if (conferencia.correcoes.length) console.log("SQL AGENT - FILTROS CORRIGIDOS:", JSON.stringify(conferencia.correcoes));
-    gerada = { ...gerada, query: conferencia.sql };
-
     console.log("SQL AGENT - SQL INICIAL:", gerada.query, "| AREA:", area || "-");
 
     // Estagio 2: executa + self-healing com diagnostico real do PostgreSQL.
@@ -1896,16 +1879,11 @@ async function responderPerguntaInterno(pergunta, historico = []) {
     console.log("SQL AGENT - SQL FINAL:", execucao.sql);
     console.log("SQL AGENT - LINHAS:", execucao.rows.length, "| REPAROS:", execucao.tentativa || 0, "| EARLY_ACCEPT:", !!execucao.earlyAccept);
 
-    const respostaBase = await redigirResposta(texto, historico, execucao.sql, execucao.rows, ctx, {
+    const resposta = await redigirResposta(texto, historico, execucao.sql, execucao.rows, ctx, {
       area,
       limiteRanking: ranking.limite,
       limitado: !!execucao.limitado,
     });
-    // Etapa 5: mostra quais filtros foram usados. Os reparos podem ter mudado a
-    // SQL, entao confere de novo a SQL final que realmente executou.
-    const final = conferirFiltros(execucao.sql, valoresReais);
-    const notaFiltros = textoFiltrosUsados(final.filtros, conferencia.correcoes, rotuloHumano);
-    const resposta = notaFiltros ? `${respostaBase}\n\n${notaFiltros}` : respostaBase;
     const partes = dividirEmMensagens(resposta);
     return {
       resposta,
