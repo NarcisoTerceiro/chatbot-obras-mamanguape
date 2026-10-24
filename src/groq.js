@@ -24,11 +24,16 @@ import { medirEtapa, medirRequisicaoIA, registrarChamadaIA } from "./telemetria.
 const NVIDIA_KEY = (process.env.NVIDIA_API_KEY || "").trim();
 // NVIDIA_MODEL / NVIDIA_MODELOS (opcionais) FORÇAM a lista. Vazio = escolha automática:
 // o código consulta GET /v1/models da SUA chave e usa os melhores modelos que existirem.
-const NVIDIA_MODEL = (process.env.NVIDIA_MODEL || "").trim();
+function normalizarModeloNvidia(valor) {
+  const modelo = String(valor || "").trim();
+  // Corrige apenas o namespace conhecido; outros fornecedores mantêm seu ID.
+  return /^nemotron-/i.test(modelo) ? `nvidia/${modelo}` : modelo;
+}
+const NVIDIA_MODEL = normalizarModeloNvidia(process.env.NVIDIA_MODEL);
 const NVIDIA_MODELOS = [...new Set([
   NVIDIA_MODEL,
   ...String(process.env.NVIDIA_MODELOS || "").split(","),
-].map((m) => m.trim()).filter(Boolean))];
+].map(normalizarModeloNvidia).filter(Boolean))];
 // Ordem de preferência (rápidos e bons p/ classificar e redigir primeiro; os que raciocinam muito por último).
 const NVIDIA_PREFERIDOS = [
   /^openai\/gpt-oss-120b$/i,
@@ -48,7 +53,8 @@ function marcarNvidiaLento(modelo) {
   e.n++; e.ate = Date.now() + Math.min(60_000 * 2 ** (e.n - 1), 15 * 60_000);
   modelosNvidiaLentos.set(modelo, e);
 }
-const NVIDIA_BASE_URL = (process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1").trim();
+const NVIDIA_BASE_URL = (process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1")
+  .trim().replace(/\/+$/, "").replace(/\/chat\/completions$/, "");
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_KEY = (process.env.GROQ_API_KEY || "").trim();
 const GROQ_MODEL_ENV = (process.env.GROQ_MODEL || "").trim();
@@ -202,7 +208,7 @@ async function chamarNvidia(body) {
   for (const modelo of lista) {
     if (modelosNvidiaIndisponiveis.has(modelo)) continue;
     if ((modelosNvidiaLentos.get(modelo)?.ate || 0) > Date.now()) continue;   // modelo lento/instável: pula por um tempo
-    if (Date.now() - t0 > NVIDIA_ORCAMENTO_MS) break;                         // não gasta a pergunta toda na NVIDIA
+    if (Date.now() - t0 >= NVIDIA_ORCAMENTO_MS) break;                         // não gasta a pergunta toda na NVIDIA
     const corpo = {
       model: modelo,
       messages: body.messages,
@@ -223,7 +229,7 @@ async function chamarNvidia(body) {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${NVIDIA_KEY}` },
         body: JSON.stringify(corpo),
-        timeoutMs: NVIDIA_TIMEOUT_MS,
+        timeoutMs: Math.max(1, Math.min(NVIDIA_TIMEOUT_MS, NVIDIA_ORCAMENTO_MS - (Date.now() - t0))),
       }, { provedor: "nvidia", modelo });
     } catch (e) {
       // Timeout/rede: tenta o proximo modelo NVIDIA e depois cai p/ Groq.
@@ -241,11 +247,14 @@ async function chamarNvidia(body) {
         console.warn(`DEBUG NVIDIA: ${modelo} não aceita chat_template_kwargs; repetindo sem ele.`);
         return chamarNvidia(body);
       }
-      // 404 e 410 (Gone) = modelo removido/aposentado: não adianta tentar de novo.
+      // 410 confirma retirada. Um 404 pode ser nome/rota/acesso incorreto.
       if (resp.status === 404 || resp.status === 410 || /model_not_found|not found|does not exist|not available|end of life|has reached/i.test(erroTxt)) {
         modelosNvidiaIndisponiveis.add(modelo);
       }
-      const err = new Error(`nvidia (${modelo}) respondeu ${resp.status}: ${erroTxt.slice(0, 200)}`);
+      const orientacao = resp.status === 404
+        ? " Confira NVIDIA_MODEL (incluindo fornecedor/) e NVIDIA_BASE_URL; 404 não confirma aposentadoria."
+        : resp.status === 410 ? " Modelo retirado pelo provedor; configure outro ID disponível." : "";
+      const err = new Error(`nvidia (${modelo}) respondeu ${resp.status}: ${erroTxt.slice(0, 200)}${orientacao}`);
       err.status = resp.status;
       if (resp.status >= 500) marcarNvidiaLento(modelo);
       if (resp.status === 429) err.retryAfterMs = retryDepoisMs(resp, erroTxt);
@@ -450,10 +459,12 @@ async function chamarIA(body, tentativa429 = 0, ampliado = false) {
         console.warn(`DEBUG IA: resposta cortada em ${prov.nome}; repetindo com mais tokens.`);
         return chamarIA({ ...body, max_tokens: Math.min(atual * 2, MAX_SAIDA_GLOBAL), reasoning_effort: "low" }, tentativa429, true);
       }
-      // Modelo aposentado em todos os modelos NVIDIA (404/410): pausa longa em vez de tentar a cada pergunta.
+      // Modelo/rota indisponível (404) ou retirado (410): pausa para evitar repetição contínua.
       if (prov.nome === "nvidia" && ([404, 410].includes(e.status) || /Nenhum modelo NVIDIA/.test(e.message))) {
         provedorDescansando.set("nvidia", Date.now() + 30 * 60 * 1000);
-        console.error("DEBUG nvidia: modelo(s) aposentado(s). Troque NVIDIA_MODEL no ambiente (liste em GET /v1/models).");
+        console.error(e.status === 410
+          ? "DEBUG NVIDIA: modelo retirado (410). Confira um modelo disponível na sua conta."
+          : "DEBUG NVIDIA: modelo indisponível. Confira ID completo, endereço da API e acesso; 404 não comprova aposentadoria.");
       }
 
       if (e.status === 429) {
