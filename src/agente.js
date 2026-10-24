@@ -1,5 +1,7 @@
 // ============================================================
 // agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V13.9 SEM ARQUERO/DECIMAL
+// V14: separacao de totais gerais x grupo, valores originais preservados,
+//      campos solicitados validados, follow-up de campo e deduplicacao semantica.
 // ============================================================
 // Arquitetura baseada em duas referencias usadas no projeto:
 // 1) Conversational SQL Agent: schema/view + SQL dinamico + memoria de conversa.
@@ -478,6 +480,9 @@ function extrairSQLDaRespostaInterno(texto = "") {
         query: limparSQL(q),
         descricao: textoSeguro(obj.description ?? obj.descricao ?? obj.observation ?? obj.observacao ?? "", 700),
         modifiedUserPrompt: textoSeguro(obj.modifiedUserPrompt ?? obj.modified_user_prompt ?? "", 700),
+        campos: Array.isArray(obj.campos_solicitados ?? obj.campos)
+          ? (obj.campos_solicitados ?? obj.campos).map((c) => textoSeguro(c, 80)).filter(Boolean).slice(0, 15)
+          : [],
       };
     }
   }
@@ -952,6 +957,13 @@ function respostaAgrupada(pergunta = "", rows = [], meta = {}) {
   const dims = chaves.filter((k) => !medidas.includes(k));
   if (dims.length !== 1 || !medidas.length) return null;
   const dim = dims[0];
+
+  // V14: medidas constantes em todas as linhas (ex.: COUNT(*) OVER () AS total_bairros)
+  // sao totais GERAIS, nao contagens de cada grupo. Saem uma unica vez, fora dos itens.
+  const globais = medidasGlobais(rows, medidas);
+  const totaisGerais = globais.map((k) => ({ k, v: numeroParaAnalise(rows[0][k]) }));
+  medidas.splice(0, medidas.length, ...medidas.filter((k) => !globais.includes(k)));
+  if (!medidas.length) return null;
   const ehBairro = /bairro/i.test(dim);
   const somavel = (k) => ["contagem", "moeda"].includes(tipoMedida(k, rows.find((r) => r[k] != null)?.[k], pergunta)) && !/(media|avg|max|min)/i.test(k);
 
@@ -992,6 +1004,10 @@ function respostaAgrupada(pergunta = "", rows = [], meta = {}) {
   const vazios = grupos.filter((g) => g.semCadastro);
   const exibidos = meta.limiteRanking ? validos.slice(0, meta.limiteRanking) : validos;
   const rotDim = rotuloHumano(dim).toLowerCase();
+  const linhaTotaisGerais = totaisGerais
+    .filter(({ v }) => v !== null)
+    .map(({ k, v }) => `${rotuloHumano(k).replace(/^./, (c) => c.toUpperCase())}: ${formatarMedida(k, v, pergunta)}`)
+    .join(" — ");
   const fmtVals = (g) => medidas.map((m) => {
     const v = g.vals[m];
     if (v === null || v === undefined) return null;
@@ -1021,7 +1037,75 @@ function respostaAgrupada(pergunta = "", rows = [], meta = {}) {
       ? `Registros sem bairro identificado (vazio ou apenas endereço): ${detalhe}.`
       : `Registros sem ${rotDim} cadastrado (fora do ranking): ${detalhe}.`);
   }
+  if (linhaTotaisGerais) {
+    linhas.push("");
+    linhas.push(`Total geral — ${linhaTotaisGerais}.`);
+  }
   return linhas.join("\n");
+}
+
+// ------------------------------------------------------------
+// V14 - Apresentacao generica (vale para qualquer coluna/aba)
+// ------------------------------------------------------------
+
+// Medidas cujo valor e identico em todas as linhas enquanto outra medida varia:
+// representam um total do conjunto inteiro (window function), nao do grupo.
+function medidasGlobais(rows = [], medidas = []) {
+  if (rows.length < 2 || medidas.length < 2) {
+    // Com uma unica medida, so e global se o nome indicar total geral.
+    return rows.length >= 2
+      ? medidas.filter((k) => /geral|_over$|^total_geral/i.test(k) && rows.every((r) => String(r[k]) === String(rows[0][k])))
+      : [];
+  }
+  const constante = (k) => rows.every((r) => String(r[k]) === String(rows[0][k]));
+  const variaveis = medidas.filter((k) => !constante(k));
+  if (!variaveis.length) return [];
+  return medidas.filter((k) => constante(k));
+}
+
+// Palavras que nao mudam o significado do campo ("fonte do recurso" = "recurso",
+// "etapa/status atual" = "status"). Palavras como "tipo", "data", "valor"
+// continuam relevantes: "tipo_recurso" e diferente de "recurso".
+const PALAVRAS_NEUTRAS_CAMPO = new Set([
+  "fonte", "de", "do", "da", "dos", "das", "o", "a", "os", "as", "atual", "etapa",
+  "original", "orig", "nome", "informacao", "info", "campo", "cadastrado", "cadastrada", "registrado",
+]);
+
+function chaveSemanticaCampo(campo = "") {
+  const tokens = normalizar(String(campo)).split(/[^a-z0-9]+/).filter((t) => t && !PALAVRAS_NEUTRAS_CAMPO.has(t));
+  return [...new Set(tokens)].sort().join("_") || normalizar(campo);
+}
+
+// Quando o mesmo conceito aparece em mais de uma coluna, fica uma so.
+// Preferencia: a coluna com valor ORIGINAL da planilha (sufixo _original).
+// A decisao e feita pelo SIGNIFICADO do nome, nunca por coincidencia de valores.
+function camposDeduplicados(chaves = []) {
+  const escolhido = new Map();
+  for (const k of chaves) {
+    const sem = chaveSemanticaCampo(k);
+    const atual = escolhido.get(sem);
+    if (!atual) { escolhido.set(sem, k); continue; }
+    if (/_original$/i.test(k) && !/_original$/i.test(atual)) escolhido.set(sem, k);
+  }
+  const manter = new Set(escolhido.values());
+  return chaves.filter((k) => manter.has(k));
+}
+
+function campoCorresponde(chave = "", pedido = "") {
+  if (!chave || !pedido) return false;
+  return normalizar(chave) === normalizar(pedido) || chaveSemanticaCampo(chave) === chaveSemanticaCampo(pedido);
+}
+
+// Campos pedidos pelo usuario (informados pela IA na geracao) que nao vieram no resultado.
+function camposSolicitadosAusentes(rows = [], campos = []) {
+  if (!rows.length || !campos.length) return [];
+  const chaves = Object.keys(rows[0] || {});
+  return campos.filter((c) => !chaves.some((k) => campoCorresponde(k, c)));
+}
+
+function camposSolicitadosNoResultado(rows = [], campos = []) {
+  const chaves = Object.keys(rows[0] || {});
+  return chaves.filter((k) => campos.some((c) => campoCorresponde(k, c)));
 }
 
 function camposAgregadosJanela(rows = []) {
@@ -1088,7 +1172,17 @@ function respostaLista(pergunta = "", rows = [], meta = {}) {
   const contagem = new Map();
   for (const r of rows) contagem.set(normalizar(r.objeto), (contagem.get(normalizar(r.objeto)) || 0) + 1);
   const p = normalizar(pergunta);
-  const pedeContrato = /contrat/.test(p);
+  const pedeContrato = /contrat/.test(p) || (meta.campos || []).some((c) => /contrat/i.test(c));
+
+  // V14: quais colunas aparecem em cada item.
+  // - dedupe semantico (status x status_original, recurso x fonte do recurso);
+  // - se a IA informou os campos pedidos, mostra apenas eles (alem da identificacao),
+  //   e campos pedidos sem valor aparecem como "não preenchido".
+  const todas = Object.keys(rows[0] || {}).filter((k) => !ocultos.has(k));
+  const unicas = camposDeduplicados(todas);
+  const pedidos = camposSolicitadosNoResultado(rows, meta.campos || []);
+  const pedidosSet = new Set(camposDeduplicados(pedidos));
+  const visiveis = new Set(pedidosSet.size ? unicas.filter((k) => pedidosSet.has(k) || (/contrat/i.test(k))) : unicas);
 
   const nome = substantivoUniverso(pergunta, rows, N);
   const areaTxt = meta.area ? ` da área de ${AREAS_TEMATICAS[meta.area].rotulo}` : "";
@@ -1096,7 +1190,7 @@ function respostaLista(pergunta = "", rows = [], meta = {}) {
 
   // Totais calculados sobre exatamente as linhas listadas.
   const financeiros = Object.keys(rows[0] || {}).filter((k) =>
-    !ocultos.has(k) && !campoParecePercentual(k) && (campoPareceFinanceiro(k) || /execut/i.test(k)) &&
+    !ocultos.has(k) && visiveis.has(k) && !campoParecePercentual(k) && (campoPareceFinanceiro(k) || /execut/i.test(k)) &&
     rows.some((r) => numeroParaAnalise(r[k]) !== null)
   );
   for (const k of financeiros) {
@@ -1120,8 +1214,11 @@ function respostaLista(pergunta = "", rows = [], meta = {}) {
     if (contrato && (dup || pedeContrato)) partes.push(`Contrato: ${contrato.valor}`);
     else if (dup) partes.push("Contrato não informado");
     for (const [k, v] of Object.entries(r)) {
-      if (ocultos.has(k) || (contrato && k === contrato.campo)) continue;
-      if (v === null || v === undefined || String(v).trim() === "") continue;
+      if (ocultos.has(k) || !visiveis.has(k) || (contrato && k === contrato.campo)) continue;
+      if (v === null || v === undefined || String(v).trim() === "") {
+        if (pedidosSet.has(k)) partes.push(`${rotuloHumano(k)}: não preenchido`);
+        continue;
+      }
       if (/contrat/i.test(k) && !pedeContrato && !dup) continue;
       if (/bairro/i.test(k)) {
         const b = normalizarBairro(v);
@@ -1203,7 +1300,11 @@ async function gerarSQLInterno(pergunta, historico, ctx, correcao = "") {
     `- Para 'valor total investido' de um conjunto, some valor_total, salvo quando o usuario pedir explicitamente valor executado/pago.\n` +
     `- Para 'quanto falta', use valor_total - valor_executado quando essas colunas existirem.\n` +
     `- 'status de X' pede o campo status do alvo X; nao transforme a palavra status em filtro.\n` +
-    `- LICITACOES E ETAPA REAL: ao listar/detalhar licitacoes ou responder sobre seu status, se a coluna status_original existir selecione status_original junto de status. status_original representa a etapa especifica cadastrada (ex.: Habilitacao em andamento, Edital publicado) e deve ser preferida na resposta ao rotulo generico 'Em licitacao'.\n` +
+    `- VALOR ORIGINAL x NORMALIZADO: quando existir uma coluna X_original (ex.: status_original), ela guarda o texto exatamente como esta na planilha; X e apenas uma normalizacao para filtrar. Use X no WHERE se ajudar, mas para EXIBIR selecione X_original e NAO selecione X junto (evita duplicar a mesma informacao).\n` +
+    `- SEPARE O QUE FILTRAR DO QUE MOSTRAR: os filtros escolhem os registros; os campos pedidos sao o que deve aparecer. Todo campo pedido (ex.: 'as datas de envio', 'os engenheiros', 'o recurso') precisa estar no SELECT, mesmo que esteja vazio em alguns registros.\n` +
+    `- FOLLOW-UP QUE MUDA O CAMPO PEDIDO ('e os engenheiros dessas?', 'e as datas?'): mantenha o mesmo WHERE do recorte anterior, mas no SELECT traga somente a identificacao (id, objeto) e os NOVOS campos pedidos. Nao repita colunas da resposta anterior que nao foram pedidas agora.\n` +
+    `- NAO DUPLIQUE A MESMA INFORMACAO: nao selecione duas colunas que representam o mesmo conceito (ex.: recurso e dados_extras->>'FONTE DO RECURSO'; status e status_original). Campos de conceitos diferentes (recurso x tipo_recurso) continuam separados.\n` +
+    `- TOTAIS GERAIS EM AGRUPAMENTOS: em GROUP BY, cada linha deve trazer apenas a medida do proprio grupo. Se precisar de um total do conjunto inteiro, use alias com 'total_geral_' (ex.: COUNT(*) OVER () AS total_geral_bairros) e nunca o nomeie como se fosse medida do grupo.\n` +
     `- Nao invente valores de status, nomes, bairros, engenheiros ou empresas; use os valores reais do schema/contexto.\n` +
     `- LIGACAO SEMANTICA: quando o usuario pedir uma CLASSE ou CONCEITO amplo (sigla, tipo de equipamento, servico ou categoria), nao filtre apenas a palavra literal. Considere abreviacoes, forma por extenso e sinonimos realmente equivalentes em portugues e compare com o CATALOGO DE OBJETOS REAIS. Use OR com ILIKE apenas para equivalencias semanticamente justificadas.\n` +
     `- AREA TEMATICA (saude, educacao): o sistema aplica AUTOMATICAMENTE o recorte da area sobre public.${ctx.relacao}, cobrindo todas as descricoes (UBS, USF, PSF, CAPS, Ambulatorio, hospital etc.). NAO escreva filtros de area/objeto ILIKE para essas categorias; aplique apenas os demais filtros pedidos (status, universo, pessoa).\n` +
@@ -1220,7 +1321,7 @@ async function gerarSQLInterno(pergunta, historico, ctx, correcao = "") {
     `- COMPARACOES E PERCENTUAIS: 'qual percentual', 'quanto % do total', 'comparar bairros/empresas/anos' -> use GROUP BY e calcule participacao com SUM(x) / NULLIF(SUM(SUM(x)) OVER (),0).\n` +
     `- PERGUNTAS ABERTAS ('resumo', 'panorama', 'como estao as obras', 'o que tem na planilha'): retorne um resumo agrupado por tipo_negocio/status com COUNT e SUM(valor_total).\n` +
     `- Retorne colunas suficientes para responder, mas nao SELECT * sem necessidade.\n` +
-    `- Retorne SOMENTE JSON {"description":"...","query":"SELECT ..."}. Se nao puder responder com o schema, use query="".\n\n` +
+    `- Retorne SOMENTE JSON {"description":"...","campos_solicitados":["alias1","alias2"],"query":"SELECT ..."}. campos_solicitados = aliases EXATOS das colunas do SELECT que respondem ao que o usuario pediu para VER agora (nao inclua id/objeto nem colunas usadas so para filtrar; para contagem/ranking use [] ). Se nao puder responder com o schema, use query="".\n\n` +
     `SCHEMA E DADOS REAIS:\n${schemaParaPrompt(ctx)}\n\n` +
     `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
     `ANCORA DO CONTEXTO ATUAL:\n${ancoraContextoRecente(historico, pergunta)}\n\n` +
@@ -1525,7 +1626,7 @@ function rotuloHumano(campo = "") {
   const mapa = {
     bairro: "Bairro",
     status: "Status",
-    status_original: "Etapa/status atual",
+    status_original: "Status",
     categoria: "Categoria",
     engenheiro: "Engenheiro",
     empresa: "Empresa",
@@ -1545,7 +1646,12 @@ function rotuloHumano(campo = "") {
     observacoes: "Observações",
     quantidade: "Quantidade",
   };
-  return mapa[campo] || campo.replace(/_/g, " ");
+  if (mapa[campo]) return mapa[campo];
+  // Coluna X_original e o valor original de X: usa o mesmo rotulo.
+  const base = String(campo).replace(/_original$/i, "");
+  if (base !== campo && mapa[base]) return mapa[base];
+  const t = base.replace(/_/g, " ").trim();
+  return t ? t.charAt(0).toLocaleUpperCase("pt-BR") + t.slice(1) : campo;
 }
 
 function valorFallback(campo, valor) {
@@ -1618,8 +1724,9 @@ function fallbackResposta(pergunta, rows = []) {
 
     const linhas = [];
     if (r.objeto) linhas.push(`• ${r.objeto}`);
+    const unicas = new Set(camposDeduplicados(Object.keys(r)));
     for (const [k, v] of Object.entries(r)) {
-      if (camposTecnicosOcultos.has(k)) continue;
+      if (camposTecnicosOcultos.has(k) || !unicas.has(k)) continue;
       const fmt = valorFallback(k, v);
       if (fmt === null) continue;
       linhas.push(`  ${rotuloHumano(k)}: ${fmt}`);
@@ -1699,7 +1806,12 @@ async function redigirRespostaInterno(pergunta, historico, sql, rows, ctx, meta 
     `Recurso e tipo_recurso sao campos diferentes; nao troque um pelo outro.\n` +
     `Nao mostre SQL ao usuario na resposta natural.\n` +
     `Se a pergunta pedir algo que os dados retornados respondem so em parte, responda a parte disponivel e diga de forma simples qual informacao nao esta preenchida na planilha.\n` +
-    `Datas: escreva no formato dd/mm/aaaa. Valores: R$ com separador brasileiro (R$ 1.234,56).\n\n` +
+    `Datas: escreva no formato dd/mm/aaaa. Valores: R$ com separador brasileiro (R$ 1.234,56).\n` +
+    `VALORES ORIGINAIS: copie textos de status, etapa, nomes e categorias EXATAMENTE como vieram (ex.: 'Em elaboração' nao vira 'Em projeto'; 'Concluído' nao vira 'Concluída'; 'Habilitação em andamento' nao vira 'Em licitação'). Nao ajuste genero, numero nem sinonimos.\n` +
+    `NAO DUPLIQUE: se duas colunas representam a mesma informacao (ex.: status e etapa/status atual; recurso e fonte do recurso), mostre uma so, preferindo o valor original.\n` +
+    `TOTAIS GERAIS: um valor igual em todas as linhas e total do conjunto; informe-o uma unica vez, nunca dentro de cada item.\n` +
+    (meta.campos?.length ? `CAMPOS SOLICITADOS (mostre exatamente estes para cada registro, alem do nome; se vazio escreva 'não preenchido'; nao acrescente outros campos): ${meta.campos.join(", ")}\n` : "") +
+    `\n` +
     `PERGUNTA: ${JSON.stringify(pergunta)}\n` +
     `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
     `SQL EXECUTADA: ${sql}\n` +
@@ -1781,7 +1893,7 @@ async function responderPerguntaInterno(pergunta, historico = []) {
       return {
         resposta: "Não consegui transformar essa pergunta em uma consulta segura aos dados. Pode reformular?",
         erro: "sql_nao_gerada",
-        modoAgente: "sql_agent_self_healing_v13_9_sem_bibliotecas",
+        modoAgente: "sql_agent_self_healing_v14",
       };
     }
 
@@ -1874,34 +1986,59 @@ async function responderPerguntaInterno(pergunta, historico = []) {
       sqlInicial: gerada.query,
       area,
     });
-    execucao.rows = await enriquecerContrato(execucao.rows, ctx);
+    let execucaoFinal = execucao;
+    const campos = gerada.campos || [];
 
-    console.log("SQL AGENT - SQL FINAL:", execucao.sql);
-    console.log("SQL AGENT - LINHAS:", execucao.rows.length, "| REPAROS:", execucao.tentativa || 0, "| EARLY_ACCEPT:", !!execucao.earlyAccept);
+    // V14 - Validacao pedido x resultado: todo campo pedido deve estar no resultado.
+    const ausentes = camposSolicitadosAusentes(execucaoFinal.rows, campos);
+    if (ausentes.length) {
+      console.log("SQL AGENT - CAMPOS SOLICITADOS AUSENTES:", ausentes.join(", "));
+      try {
+        const reparo = await repararSQL({
+          pergunta: texto, historico, ctx, sqlAtual: execucaoFinal.sql, linhas: execucaoFinal.rows,
+          motivoSemantico: `O usuario pediu para ver: ${ausentes.join(", ")}. Esses campos nao estao no SELECT. ` +
+            `Mantenha EXATAMENTE o mesmo WHERE/recorte e acrescente esses campos com esses aliases (procure a coluna ou a chave de dados_extras correspondente). Nao remova filtros.`,
+        });
+        if (reparo.query && limparSQL(reparo.query) !== limparSQL(execucaoFinal.sql)) {
+          const nova = await executarComSelfHealing({ pergunta: texto, historico, ctx, sqlInicial: reparo.query, area });
+          const melhorou = nova.rows.length === execucaoFinal.rows.length &&
+            camposSolicitadosAusentes(nova.rows, campos).length < ausentes.length;
+          if (melhorou) execucaoFinal = { ...nova, tentativa: (execucao.tentativa || 0) + 1 + (nova.tentativa || 0) };
+        }
+      } catch (e) {
+        console.warn("AGENTE SQL: reparo de campos solicitados falhou:", e.message);
+      }
+    }
+    const execucaoRef = execucaoFinal;
+    execucaoRef.rows = await enriquecerContrato(execucaoRef.rows, ctx);
 
-    const resposta = await redigirResposta(texto, historico, execucao.sql, execucao.rows, ctx, {
+    console.log("SQL AGENT - SQL FINAL:", execucaoRef.sql);
+    console.log("SQL AGENT - LINHAS:", execucaoRef.rows.length, "| REPAROS:", execucaoRef.tentativa || 0, "| EARLY_ACCEPT:", !!execucaoRef.earlyAccept);
+
+    const resposta = await redigirResposta(texto, historico, execucaoRef.sql, execucaoRef.rows, ctx, {
       area,
       limiteRanking: ranking.limite,
-      limitado: !!execucao.limitado,
+      limitado: !!execucaoRef.limitado,
+      campos,
     });
     const partes = dividirEmMensagens(resposta);
     return {
       resposta,
       partes,
-      sql: execucao.sql,
-      linhas: execucao.rows.length,
-      estado: { ...estadoPublico(ctx, execucao), recorteArea: area },
-      reparos: execucao.tentativa || 0,
-      earlyAccept: !!execucao.earlyAccept,
-      tentativas: execucao.tentativas,
-      modoAgente: "sql_agent_self_healing_v13_9_sem_bibliotecas",
+      sql: execucaoRef.sql,
+      linhas: execucaoRef.rows.length,
+      estado: { ...estadoPublico(ctx, execucaoRef), recorteArea: area, camposSolicitados: campos },
+      reparos: execucaoRef.tentativa || 0,
+      earlyAccept: !!execucaoRef.earlyAccept,
+      tentativas: execucaoRef.tentativas,
+      modoAgente: "sql_agent_self_healing_v14",
     };
   } catch (e) {
     console.error("SQL AGENT: falha final:", e);
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "sql_agent_self_healing_v13_9_sem_bibliotecas_erro",
+      modoAgente: "sql_agent_self_healing_v14_erro",
     };
   }
 }
