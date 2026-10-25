@@ -1,5 +1,9 @@
 // ============================================================
 // agente.js - SQL AGENT CONVERSACIONAL + SELF-HEALING + CONTEXTO FORTE + RESPOSTAS HUMANAS (Node.js) - V13.9 SEM ARQUERO/DECIMAL
+// V15: verificacao semantica Q* (traducao reversa + conferencia de intencao)
+//      e Feedback+ (reparo guiado pelo perfil real do resultado), conforme
+//      "Talk Less, Verify More" (arXiv:2601.00224). Executar sem erro deixou
+//      de ser criterio de aceite: a SQL so e aceita se comprovar que responde ao pedido.
 // V14: separacao de totais gerais x grupo, valores originais preservados,
 //      campos solicitados validados, follow-up de campo e deduplicacao semantica.
 // ============================================================
@@ -31,6 +35,8 @@ const MAX_RESULTADOS = Math.max(20, Math.min(Number(process.env.AGENTE_MAX_RESUL
 const MAX_LINHAS_PARA_IA = Math.max(10, Math.min(Number(process.env.AGENTE_MAX_LINHAS_IA || 60), 100));
 const CACHE_SCHEMA_MS = Math.max(60_000, Math.min(Number(process.env.AGENTE_CACHE_SCHEMA_MS || 300_000), 30 * 60_000));
 const MAX_HISTORICO_PROMPT = 6;
+const VERIFICACAO_SEMANTICA = process.env.AGENTE_VERIFICACAO_SEMANTICA !== "0";
+const MAX_VERIFICACOES = Math.max(1, Math.min(Number(process.env.AGENTE_MAX_VERIFICACOES || 3), 5));
 const MAX_CARACTERES_MENSAGEM = Math.max(1000, Math.min(Number(process.env.AGENTE_MAX_CHARS_MSG || 3500), 4000));
 
 let cacheSchema = { quando: 0, contexto: null };
@@ -596,7 +602,44 @@ async function carregarSchemaContextoInterno() {
     }
   }
 
+  // V15 - Dicionario de dados com evidencia real: quantos registros tem cada
+  // coluna/chave preenchida e exemplos de valores. E isso que permite ao
+  // verificador perceber que o dado pedido mora em OUTRO campo (ex.: o campo
+  // escolhido esta vazio/tem outro significado e uma chave parecida esta cheia).
+  const dicionario = [];
+  try {
+    const cols = colunas.filter((c) => !["json", "jsonb"].includes(c.udt_name));
+    if (cols.length) {
+      const partes = cols.map((c) =>
+        `SELECT ${"'"}${c.column_name.replace(/'/g, "''")}${"'"}::text AS campo, 'coluna'::text AS origem, ` +
+        `COUNT(*) FILTER (WHERE NULLIF(BTRIM("${c.column_name}"::text), '') IS NOT NULL)::int AS preenchidos, ` +
+        `(ARRAY(SELECT DISTINCT LEFT("${c.column_name}"::text, 60) FROM public.${relacao} ` +
+        `WHERE NULLIF(BTRIM("${c.column_name}"::text), '') IS NOT NULL LIMIT 4)) AS exemplos FROM public.${relacao}`
+      );
+      const rr = await queryReadOnly(partes.join(" UNION ALL "));
+      dicionario.push(...(rr.rows || []));
+    }
+  } catch { /* dicionario e opcional */ }
+  if (nomes.has("dados_extras")) {
+    try {
+      const rr = await queryReadOnly(
+        `SELECT 'dados_extras->>' || e.key AS campo, 'dados_extras'::text AS origem, ` +
+        `COUNT(*) FILTER (WHERE NULLIF(BTRIM(e.value), '') IS NOT NULL)::int AS preenchidos, ` +
+        `(ARRAY_AGG(DISTINCT LEFT(e.value, 60)) FILTER (WHERE NULLIF(BTRIM(e.value), '') IS NOT NULL))[1:4] AS exemplos ` +
+        `FROM public.${relacao}, LATERAL jsonb_each_text(COALESCE(dados_extras, '{}'::jsonb)) e GROUP BY e.key ORDER BY e.key LIMIT 200`
+      );
+      dicionario.push(...(rr.rows || []));
+    } catch { /* idem */ }
+  }
+  let totalRegistros = null;
+  try {
+    const rr = await queryReadOnly(`SELECT COUNT(*)::int AS n FROM public.${relacao}`);
+    totalRegistros = rr.rows?.[0]?.n ?? null;
+  } catch {}
+
   const contexto = {
+    dicionario,
+    totalRegistros,
     relacao,
     colunas,
     amostras,
@@ -1331,7 +1374,7 @@ async function gerarSQLInterno(pergunta, historico, ctx, correcao = "") {
     `PERGUNTA ATUAL: ${JSON.stringify(pergunta)}`;
 
   const bruto = await chamarIAbruta([{ role: "user", content: prompt }], {
-    max_tokens: 420,
+    max_tokens: 600,
     temperature: 0,
     reasoning_effort: "low",
   });
@@ -1421,7 +1464,7 @@ async function repararSQLInterno({ pergunta, historico, ctx, sqlAtual, erro = nu
   const erroTexto = erro
     ? `ERRO POSTGRESQL REAL:\n${jsonSeguro(erro, 4000)}`
     : motivoSemantico
-      ? `ALERTA SEMANTICO APOS EXECUCAO:\n${motivoSemantico}\nA consulta trouxe linha(s), mas os campos que deveriam responder ao pedido vieram vazios/nulos. Verifique as CHAVES REAIS DE dados_extras e se a SQL usou um campo apenas parecido com o que o usuario pediu. Nao force um valor se o dado realmente nao existir.`
+      ? `ALERTA SEMANTICO APOS EXECUCAO:\n${motivoSemantico}\nA consulta pode ter trazido linha(s), mas os campos que deveriam responder ao pedido vieram vazios/nulos. Verifique as CHAVES REAIS DE dados_extras e se a SQL usou um campo apenas parecido com o que o usuario pediu. Nao force um valor se o dado realmente nao existir.`
       : `A consulta executou sem erro, mas retornou 0 linhas. Isso PODE ser correto. So altere a SQL se houver um motivo concreto no schema/valores reais indicando filtro, coluna ou semantica errados. Nao force resultado nao-vazio.`;
 
   const prompt = `Voce e o AVALIADOR/REFINADOR de um SQL Agent PostgreSQL.\n` +
@@ -1430,6 +1473,7 @@ async function repararSQLInterno({ pergunta, historico, ctx, sqlAtual, erro = nu
     `${regrasNegocio(ctx)}\n` +
     `SEGURANCA: somente SELECT/WITH SELECT em public.${ctx.relacao}.\n\n` +
     `SCHEMA REAL:\n${schemaParaPrompt(ctx)}\n\n` +
+    `DICIONARIO DE DADOS (preenchimento e exemplos reais):\n${dicionarioParaPrompt(ctx)}\n\n` +
     `HISTORICO:\n${resumoHistorico(historico)}\n\n` +
     `ANCORA DO CONTEXTO ATUAL:\n${ancoraContextoRecente(historico, pergunta)}\n\n` +
     (areaDaPergunta(pergunta, historico) ? `RECORTE DE AREA AUTOMATICO ATIVO (aplicado pelo sistema): nao adicione filtro de area.\n` : "") +
@@ -1473,7 +1517,145 @@ function resultadoSoComCamposVazios(rows = []) {
   return !temAlgumValor;
 }
 
-async function executarComSelfHealing({ pergunta, historico, ctx, sqlInicial, area = null }) {
+// ------------------------------------------------------------
+// V15 - Verificacao semantica (Q*) + Feedback+  [arXiv:2601.00224]
+// ------------------------------------------------------------
+// Q*: (1) TRADUCAO REVERSA - um modelo le apenas a SQL e o dicionario de dados
+//     e descreve, sem ver a pergunta, que pergunta essa SQL responde e o que
+//     cada campo/filtro/calculo significa. (2) CONFERENCIA SEMANTICA - um
+//     discriminador compara essa descricao com a pergunta do usuario.
+// Feedback+: a execucao vira evidencia (preenchimento e exemplos de cada
+//     campo devolvido) e, havendo divergencia, o refinador recebe a divergencia
+//     + o feedback de execucao + campos candidatos do dicionario.
+// Nada aqui depende de frases ou campos especificos: vale para qualquer pergunta.
+
+function dicionarioParaPrompt(ctx, max = 160) {
+  const total = ctx?.totalRegistros;
+  const linhas = (ctx?.dicionario || []).slice(0, max).map((d) => {
+    const ex = (d.exemplos || []).filter(Boolean).map((x) => JSON.stringify(x)).join(", ");
+    return `- ${d.campo}: ${d.preenchidos}${total ? `/${total}` : ""} preenchidos; exemplos: ${ex || "(vazio)"}`;
+  });
+  return linhas.length ? linhas.join("\n") : "(dicionario indisponivel)";
+}
+
+function perfilResultado(rows = []) {
+  const chaves = [...new Set(rows.flatMap((r) => Object.keys(r || {})))];
+  return chaves.map((k) => {
+    const valores = rows.map((r) => r?.[k]);
+    const cheios = valores.filter((v) => v !== null && v !== undefined && String(v).trim() !== "");
+    const distintos = [...new Set(cheios.map((v) => textoSeguro(typeof v === "object" ? JSON.stringify(v) : v, 60)))];
+    return { campo: k, preenchidos: cheios.length, total: rows.length, distintos: distintos.length, exemplos: distintos.slice(0, 5) };
+  });
+}
+
+async function traducaoReversa(sql, ctx) {
+  // A pergunta do usuario NAO entra aqui de proposito: evita que o modelo
+  // "racionalize" a SQL como correta so por conhecer a intencao.
+  const prompt = `Voce e um analista que explica consultas SQL para leigos.\n` +
+    `Leia a SQL e o DICIONARIO DE DADOS (campos reais, preenchimento e exemplos) e descreva o que ela realmente responde.\n\n` +
+    `DICIONARIO DE DADOS de public.${ctx.relacao}:\n${dicionarioParaPrompt(ctx)}\n\n` +
+    `SQL:\n${sql}\n\n` +
+    `Retorne SOMENTE JSON: {"pergunta_respondida":"pergunta em portugues que esta SQL responde",` +
+    `"campos":[{"campo":"nome/alias","origem":"coluna ou chave real","significado":"o que esse dado representa, segundo os exemplos"}],` +
+    `"filtros":["cada condicao do WHERE em linguagem natural"],"calculos":["agregacoes/ordenacoes/limites em linguagem natural"]}`;
+  const bruto = await chamarIAbruta([{ role: "user", content: prompt }], { max_tokens: 500, temperature: 0, reasoning_effort: "low" });
+  return objetoJSONEmTexto(bruto) || { pergunta_respondida: textoSeguro(stripThink(bruto), 600) };
+}
+
+async function conferirIntencao({ pergunta, historico, ctx, sql, reversa, rows }) {
+  const perfil = perfilResultado(rows);
+  const prompt = `Voce e o VERIFICADOR SEMANTICO de um SQL Agent. Sua unica tarefa e decidir se a consulta responde EXATAMENTE ao que o usuario pediu.\n` +
+    `Executar sem erro ou retornar linhas NAO prova nada. Confira, um a um:\n` +
+    `1) CAMPOS: cada informacao pedida veio do campo cujo SIGNIFICADO (pelos exemplos do dicionario) corresponde ao pedido? ` +
+    `Nome parecido nao basta (ex.: um campo de "tipo" de algo nao e a "origem/fonte/nome" desse algo).\n` +
+    `2) FILTROS: o recorte (universo, status, pessoa, periodo, area) e o pedido, sem sobrar nem faltar?\n` +
+    `3) CALCULOS: contagem/soma/media/ranking/agrupamento correspondem ao pedido?\n` +
+    `4) EVIDENCIA DA EXECUCAO: se um campo devolvido veio vazio ou com valores que nao parecem a resposta, ` +
+    `mas o dicionario mostra outro campo preenchido com o significado pedido, a consulta esta ERRADA.\n` +
+    `Resultado vazio pode ser correto; nao reprove so por isso.\n\n` +
+    `DICIONARIO DE DADOS:\n${dicionarioParaPrompt(ctx)}\n\n` +
+    `HISTORICO RECENTE:\n${resumoHistorico(historico)}\n\n` +
+    `PERGUNTA DO USUARIO: ${JSON.stringify(pergunta)}\n\n` +
+    `TRADUCAO REVERSA DA SQL (feita sem ver a pergunta):\n${jsonSeguro(reversa, 2500)}\n\n` +
+    `SQL: ${sql}\n\n` +
+    `PERFIL DO RESULTADO (${rows.length} linhas):\n${jsonSeguro(perfil, 2500)}\n\n` +
+    `Retorne SOMENTE JSON: {"corresponde":true|false,"nota":0-10,` +
+    `"divergencias":[{"tipo":"campo|filtro|calculo","problema":"...","correcao":"campo/condicao real que deveria ser usado"}]}`;
+  const bruto = await chamarIAbruta([{ role: "user", content: prompt }], { max_tokens: 450, temperature: 0, reasoning_effort: "low" });
+  const j = objetoJSONEmTexto(bruto);
+  if (!j) return { corresponde: true, nota: null, divergencias: [], indeterminado: true, perfil };
+  const divergencias = Array.isArray(j.divergencias) ? j.divergencias.slice(0, 6) : [];
+  const nota = Number.isFinite(Number(j.nota)) ? Number(j.nota) : null;
+  const corresponde = j.corresponde === true && !divergencias.length;
+  return { corresponde, nota, divergencias, perfil };
+}
+
+async function verificarSemantica(args) {
+  return medirEtapa("verificacao_semantica", async () => {
+    const reversa = await traducaoReversa(args.sql, args.ctx);
+    const veredito = await conferirIntencao({ ...args, reversa });
+    return { ...veredito, reversa };
+  });
+}
+
+function feedbackParaReparo(verif) {
+  const div = (verif.divergencias || []).map((d, i) =>
+    `${i + 1}. [${d.tipo || "?"}] ${textoSeguro(d.problema, 300)}${d.correcao ? ` -> use: ${textoSeguro(d.correcao, 200)}` : ""}`
+  ).join("\n");
+  return `VERIFICACAO SEMANTICA REPROVOU A CONSULTA (ela executou, mas nao responde ao pedido).\n` +
+    `A SQL atual responde, na pratica: ${JSON.stringify(textoSeguro(verif.reversa?.pergunta_respondida || "", 400))}\n` +
+    `DIVERGENCIAS:\n${div || "(nao detalhadas)"}\n` +
+    `FEEDBACK DA EXECUCAO (preenchimento real de cada campo devolvido):\n${jsonSeguro(verif.perfil, 1800)}\n` +
+    `Corrija SOMENTE o que diverge, usando o campo/chave real do DICIONARIO cujo significado corresponde ao pedido. ` +
+    `Preserve os demais filtros e o recorte da conversa.`;
+}
+
+async function executarComSelfHealing(args) {
+  const base = await executarComSelfHealingTecnico(args);
+  if (!VERIFICACAO_SEMANTICA) return base;
+
+  const { pergunta, historico, ctx } = args;
+  let atual = base;
+  let melhor = null;
+  const verificacoes = [];
+
+  for (let i = 0; i < MAX_VERIFICACOES; i++) {
+    let verif;
+    try {
+      verif = await verificarSemantica({ pergunta, historico, ctx, sql: atual.sql, rows: atual.rows });
+    } catch (e) {
+      console.warn("AGENTE SQL: verificacao semantica falhou:", e.message);
+      return { ...atual, verificacao: { indeterminado: true } };
+    }
+    verificacoes.push({ sql: atual.sql, corresponde: verif.corresponde, nota: verif.nota, divergencias: verif.divergencias });
+    console.log("SQL AGENT - Q*:", verif.corresponde ? "CORRESPONDE" : "DIVERGE", "| nota:", verif.nota,
+      "| responde:", textoSeguro(verif.reversa?.pergunta_respondida || "", 200));
+
+    const pontuado = { ...atual, verificacao: verif, verificacoes };
+    if (!melhor || (verif.nota ?? 0) > (melhor.verificacao.nota ?? 0)) melhor = pontuado;
+    if (verif.corresponde) return { ...pontuado, earlyAccept: true, verificado: true };
+    if (i >= MAX_VERIFICACOES - 1) break;
+
+    // Feedback+: refinamento guiado pela divergencia + evidencia de execucao.
+    const reparo = await repararSQL({
+      pergunta, historico, ctx, sqlAtual: atual.sql, linhas: atual.rows,
+      motivoSemantico: feedbackParaReparo(verif),
+    });
+    const candidata = limparSQL(reparo.query);
+    if (!candidata || candidata === limparSQL(atual.sql)) break;
+    try {
+      atual = await executarComSelfHealingTecnico({ ...args, sqlInicial: candidata });
+    } catch (e) {
+      console.warn("AGENTE SQL: candidata do Feedback+ falhou:", e.message);
+      break;
+    }
+  }
+  // Nenhuma versao comprovou correspondencia: devolve a melhor avaliada,
+  // marcada como NAO verificada para a resposta avisar o usuario.
+  return { ...melhor, earlyAccept: false, verificado: false, verificacoes };
+}
+
+async function executarComSelfHealingTecnico({ pergunta, historico, ctx, sqlInicial, area = null }) {
   let sqlAtual = limparSQL(sqlInicial);
   let melhor = null; // melhor consulta executada (inclusive vazia)
   const tentativas = [];
@@ -1893,7 +2075,7 @@ async function responderPerguntaInterno(pergunta, historico = []) {
       return {
         resposta: "Não consegui transformar essa pergunta em uma consulta segura aos dados. Pode reformular?",
         erro: "sql_nao_gerada",
-        modoAgente: "sql_agent_self_healing_v14",
+        modoAgente: "sql_agent_verificado_v15",
       };
     }
 
@@ -2021,9 +2203,17 @@ async function responderPerguntaInterno(pergunta, historico = []) {
       limitado: !!execucaoRef.limitado,
       campos,
     });
-    const partes = dividirEmMensagens(resposta);
+    let respostaFinal = resposta;
+    if (execucaoRef.verificado === false) {
+      const motivo = (execucaoRef.verificacao?.divergencias || [])[0]?.problema;
+      respostaFinal = `⚠️ Não consegui confirmar que estes dados respondem exatamente ao que você pediu` +
+        (motivo ? ` (${textoSeguro(motivo, 160)})` : "") + `. Confira ou reformule a pergunta.\n\n` + resposta;
+    }
+    const partes = dividirEmMensagens(respostaFinal);
     return {
-      resposta,
+      resposta: respostaFinal,
+      verificado: execucaoRef.verificado ?? null,
+      verificacoes: execucaoRef.verificacoes || [],
       partes,
       sql: execucaoRef.sql,
       linhas: execucaoRef.rows.length,
@@ -2031,14 +2221,14 @@ async function responderPerguntaInterno(pergunta, historico = []) {
       reparos: execucaoRef.tentativa || 0,
       earlyAccept: !!execucaoRef.earlyAccept,
       tentativas: execucaoRef.tentativas,
-      modoAgente: "sql_agent_self_healing_v14",
+      modoAgente: "sql_agent_verificado_v15",
     };
   } catch (e) {
     console.error("SQL AGENT: falha final:", e);
     return {
       resposta: "Tive um problema ao consultar os dados agora. Tente novamente em instantes.",
       erro: e.message,
-      modoAgente: "sql_agent_self_healing_v14_erro",
+      modoAgente: "sql_agent_verificado_v15_erro",
     };
   }
 }
