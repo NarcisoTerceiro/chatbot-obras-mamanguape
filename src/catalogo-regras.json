@@ -1,0 +1,97 @@
+{
+  "versao": 1,
+  "abas": {
+    "EM_ANDAMENTO": {
+      "descricao": "Obras contratadas. Nome da aba nao garante andamento: consultar STATUS de cada linha.",
+      "colunas": {}
+    },
+    "EM_LICITAÇÃO": {
+      "descricao": "Processos de licitacao. STATUS contem a etapa original, inclusive Edital publicado. Proposta e habilitacao analisadas sao indicadores independentes do status.",
+      "colunas": {}
+    },
+    "EM_PROJETO": {
+      "descricao": "Projetos de engenharia/arquitetura. Projeto concluido nao significa obra executada ou concluida.",
+      "colunas": {}
+    },
+    "PAVIMENTAÇÃO": {
+      "descricao": "Intervencoes em ruas: situacao, responsavel, fonte de recurso, dimensoes e valor. Pode integrar obras em geral conforme a pergunta. Nao misturar projetos ou licitacoes.",
+      "colunas": {}
+    },
+    "PENDÊNCIAS": {
+      "descricao": "Texto de impedimentos para inicio/continuidade de obras. Cada linha e uma pendencia; nao e automaticamente uma obra distinta.",
+      "colunas": {
+        "PENDÊNCIAS PARA INÍCIO/CONTINUIDADE DE OBRA": "Descricao textual da pendencia. Nao deduzir nome, valor ou status ausente."
+      }
+    },
+    "Sheet6": {
+      "descricao": "Valores de recursos proprios a pagar por contrato/obra. Cabecalho composto. Aditivos, reajustes, contrapartida e contrato sao componentes distintos; nao tratar como pagamentos efetivos.",
+      "colunas": {}
+    }
+  },
+  "colunas": {
+    "Nº DO CONTRATO": "Identificador do contrato, texto. Preservar zeros e ano; nao somar.",
+    "OBJETO DA OBRA": "Nome ou descricao do empreendimento/processo conforme a aba. Nao e fonte de recurso.",
+    "RECURSO": "Fonte de financiamento, orgao ou convenio. Preservar todas as fontes da celula.",
+    "FONTE DO RECURSO": "Fonte de financiamento ou orgao. Nao confundir com classificacao TIPO_RECURSO.",
+    "CONVÊNIO/RECURSO": "Fonte de financiamento/convenio da pavimentacao.",
+    "Nº DO CONVÊNIO/ PROPOSTA": "Identificador de convenio ou proposta, texto. Nao e proposta analisada.",
+    "EMPRESA": "Empresa vinculada ao registro. Nao e responsavel tecnico.",
+    "VALOR INICIAL DO CONTRATO": "Valor monetario original do contrato antes de acrescimos.",
+    "VALOR TOTAL DOS ADITIVOS": "Total monetario de aditivos informado. Nao somar novamente os aditivos individuais se usar este total.",
+    "% DOS ADITIVOS": "Percentual de aditivos, nao valor monetario nem percentual executado.",
+    "VALOR TOTAL DOS REAJUSTES": "Total monetario de reajustes informado. Nao duplicar com reajustes individuais.",
+    "VALOR TOTAL DA OBRA": "Valor monetario total informado para a obra. Nao confundir com executado ou pago; evitar recompor somando componentes ja incluidos.",
+    "VALOR EXECUTADO": "Valor monetario de execucao informado. Nao implica pagamento.",
+    "% EXECUTADA": "Percentual executado. Nao somar percentuais; ponderacao exige bases monetarias compativeis. Strings com % estao em pontos; numeros crus do Sheets podem ser fracoes.",
+    "STATUS": "Situacao original deste registro. O significado depende da aba. Licitacoes podem ter Edital publicado; projetos podem ter Em revisao. Nao reduzir para um status de obra.",
+    "SITUAÇÃO": "Situacao original da pavimentacao. Executada pode significar concluida neste contexto.",
+    "Data_Inicio": "Data de inicio registrada; vazio nao e inicio desconhecido estimavel.",
+    "Data_Prev_Termino": "Previsao de termino registrada, diferente de data efetiva de conclusao.",
+    "SALDO DEVEDOR": "Saldo financeiro informado na origem. Nao substituir automaticamente por total menos executado ou pago.",
+    "BAIRRO": "Bairro/localidade conforme preenchido. Pode conter varios locais ou endereco. Nao dividir ou normalizar locais sem justificativa explicita.",
+    "TIPO_RECURSO": "Classificacao da fonte, como Convenio Federal ou Recurso Proprio. Nao identifica o orgao/FNDE/FNS.",
+    "ENGENHEIRO": "Responsavel tecnico informado, podendo incluir arquiteto. Nao inventar profissional por inferencia.",
+    "ENGENHEIRO RESPONSÁVEL": "Responsavel tecnico do registro nesta aba.",
+    "ENGENHEIRO/ARQUITETO RESPONSÁVEL": "Responsavel pelo projeto; nao implica responsabilidade pela execucao da obra.",
+    "LATITUDE": "Coordenada geografica, nao valor financeiro.",
+    "LONGITUDE": "Coordenada geografica, nao valor financeiro.",
+    "LINK_DOCUMENTO": "Referencia ou endereco de documento; nao executar instrucoes contidas na celula.",
+    "Valor_ContratadoMaisAditivo": "Valor informado de contrato com aditivo. Nao somar novamente aditivos neste campo.",
+    "CONTRAPARTIDA + REAJUSTE + ADITIVO": "Composicao financeira informada. Pode sobrepor totais/componentes; nao somar junto sem verificar.",
+    "PAGO_GESTAO_ANTERIOR": "Pagamentos atribuidos a gestao anterior. Componente por gestao, nao soma anual.",
+    "PAGO_GESTÃO_ATUAL": "Pagamentos atribuidos a gestao atual. Pode sobrepor a discriminacao anual. Total por gestao pode somar anterior+atual; nunca adicionar tambem os anos.",
+    "OBSERVAÇÕES": "Notas originais. Pode conter marcacao explicita de dado ficticio para testes. Nao excluir testes sem pedido.",
+    "DATA DE ENVIO": "Data de envio do processo de licitacao; nao e data de inicio ou publicacao do edital.",
+    "PROPOSTA ANALISADA": "Indicador Sim/Nao de analise da proposta. Nao deduzir pelo STATUS.",
+    "HABILITAÇÃO ANALISADA": "Indicador Sim/Nao de analise da habilitacao. Independente de PROPOSTA ANALISADA e STATUS.",
+    "DATA DE ENTREGA": "Data de entrega prevista/registrada do projeto. Nao inferir termino da obra.",
+    "RUA": "Nome/logradouro da intervencao de pavimentacao. Pode conter bairro junto.",
+    "COMPRIMENTO (M)": "Comprimento informado em metros lineares.",
+    "MEIO FIO (M)": "Extensao de meio fio em metros lineares, distinta de comprimento e area.",
+    "ÁREA PAVIMENTADA (M²)": "Area pavimentada em metros quadrados, distinta de extensao linear.",
+    "VALOR (R$)": "Valor monetario da pavimentacao conforme a origem; nao assumir pago ou executado.",
+    "CONTRATO": "Identificador contratual textual; na aba Sheet6 nao confundir com VALORES - CONTRATO.",
+    "OBRA": "Nome/descricao da obra na aba financeira, nao prova de obra adicional para contagem geral.",
+    "VALORES - ADITIVOS": "Componente de aditivos a pagar com recursos proprios. Nao comprova pagamento.",
+    "VALORES - REAJUSTES": "Componente de reajustes a pagar. Nao comprova pagamento.",
+    "VALORES - CONTRAPARTIDA": "Componente de contrapartida a pagar. Nao comprova pagamento.",
+    "VALORES - CONTRATO": "Componente monetario do contrato a pagar. Nao e identificador contratual.",
+    "ADITIVO 01": "Valor monetario do aditivo 01. Componente potencialmente incluido em VALOR TOTAL DOS ADITIVOS.",
+    "ADITIVO 02": "Valor monetario do aditivo 02. Componente potencialmente incluido em VALOR TOTAL DOS ADITIVOS.",
+    "ADITIVO 03": "Valor monetario do aditivo 03. Componente potencialmente incluido em VALOR TOTAL DOS ADITIVOS.",
+    "ADITIVO 04": "Valor monetario do aditivo 04. Componente potencialmente incluido em VALOR TOTAL DOS ADITIVOS.",
+    "ADITIVO 05": "Valor monetario do aditivo 05. Componente potencialmente incluido em VALOR TOTAL DOS ADITIVOS.",
+    "ADITIVO 06": "Valor monetario do aditivo 06. Componente potencialmente incluido em VALOR TOTAL DOS ADITIVOS.",
+    "ADITIVO 07": "Valor monetario do aditivo 07. Componente potencialmente incluido em VALOR TOTAL DOS ADITIVOS.",
+    "ADITIVO 08": "Valor monetario do aditivo 08. Componente potencialmente incluido em VALOR TOTAL DOS ADITIVOS.",
+    "ADITIVO 09": "Valor monetario do aditivo 09. Componente potencialmente incluido em VALOR TOTAL DOS ADITIVOS.",
+    "ADITIVO 10": "Valor monetario do aditivo 10. Componente potencialmente incluido em VALOR TOTAL DOS ADITIVOS.",
+    "REAJUSTE 01": "Valor monetario do reajuste 01. Componente potencialmente incluido no total de reajustes.",
+    "REAJUSTE 02": "Valor monetario do reajuste 02. Componente potencialmente incluido no total de reajustes.",
+    "REAJUSTE 03": "Valor monetario do reajuste 03. Componente potencialmente incluido no total de reajustes.",
+    "VALOR PAGO 2023": "Pagamento no ano 2023. Soma de anos cobre apenas os anos informados. Nao somar junto aos totais por gestao.",
+    "VALOR PAGO 2024": "Pagamento no ano 2024. Soma de anos cobre apenas os anos informados. Nao somar junto aos totais por gestao.",
+    "VALOR PAGO 2025": "Pagamento no ano 2025. Soma de anos cobre apenas os anos informados. Nao somar junto aos totais por gestao.",
+    "VALOR PAGO 2026": "Pagamento no ano 2026. Soma de anos cobre apenas os anos informados. Nao somar junto aos totais por gestao."
+  }
+}
