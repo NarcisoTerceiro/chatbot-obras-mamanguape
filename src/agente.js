@@ -114,18 +114,19 @@ export function criarAgente({ler=getObras,diagnostico=getDiagnostico,planejador=
       }
       return executarConsulta(q,linhas,cat,old);
      });
-     const v=await verificador(texto,cat,ctx,plano,resultados);
-     if(!v||v.aprovado!==true||!Array.isArray(v.divergencias)||v.divergencias.length){
-      feedback={tipo:'divergencia_semantica',divergencias:v?.divergencias||['Verificacao sem aprovacao.'],plano};tentativas.push({tentativa:n+1,aprovado:false,divergencias:feedback.divergencias});continue;
-     }
-     tentativas.push({tentativa:n+1,aprovado:true});
+     // Conferencia consultiva: nunca impede a entrega de um resultado executado.
+     let v;
+     try { v=await verificador(texto,cat,ctx,plano,resultados); }
+     catch(e) { v={aprovado:false,indeterminado:true,divergencias:[e.message]}; }
+     const aprovado=v?.aprovado===true && Array.isArray(v.divergencias) && !v.divergencias.length;
+     tentativas.push({tentativa:n+1,aprovado,divergencias:v?.divergencias||[]});
      const resposta=formatarResultado(plano,resultados);const refs=[...new Set(resultados.flatMap(r=>r.referencias))];
      const total=resultados.length===1?resultados[0].total:refs.length;
-     console.log('AGENTE PLANILHA: plano verificado; abas:',[...new Set(resultados.flatMap(r=>r.abas))].join(', '),'| registros:',total);
-     return {resposta,partes:dividirMensagens(resposta),linhas:total,verificado:true,plano,estado:{pergunta:texto,plano,cache:{chave,quando:Date.now(),versao,referencias:refs,conjuntos:resultados.map(r=>r.referencias)}},resposta_calculada:resposta,modoAgente:'planilha_ia_node_v17',diagnostico:{plano,verificacao:v,tentativas,resultados:resultados.map(r=>({abas:r.abas,total:r.total,exibidos:r.exibidos,total_saida:r.total_saida})),ms:Date.now()-inicio}};
+     console.log('AGENTE PLANILHA: verificado=',aprovado,'| abas:',[...new Set(resultados.flatMap(r=>r.abas))].join(', '),'| registros:',total);
+     return {resposta,partes:dividirMensagens(resposta),linhas:total,verificado:aprovado,plano,estado:{pergunta:texto,plano,cache:{chave,quando:Date.now(),versao,referencias:refs,conjuntos:resultados.map(r=>r.referencias)}},resposta_calculada:resposta,modoAgente:'planilha_ia_node_v17',diagnostico:{plano,verificacao:v,tentativas,resultados:resultados.map(r=>({abas:r.abas,total:r.total,exibidos:r.exibidos,total_saida:r.total_saida})),ms:Date.now()-inicio}};
     }catch(e){feedback={tipo:'erro_plano',mensagem:e.message};tentativas.push({tentativa:n+1,aprovado:false,erro:e.message});console.warn('AGENTE PLANILHA:',e.message);}
    }
-   return {resposta:'Não consegui confirmar uma resposta correta para essa pergunta. Pode detalhar quais informações deseja?',verificado:false,erro:'plano_nao_validado',modoAgente:'planilha_ia_node_v17_erro',diagnostico:{tentativas,ms:Date.now()-inicio}};
+   return {resposta:'Não consegui executar uma consulta com os campos disponíveis. Pode detalhar as informações que deseja?',verificado:false,erro:'plano_nao_validado',modoAgente:'planilha_ia_node_v17_erro',diagnostico:{tentativas,ms:Date.now()-inicio}};
   }catch(e){console.error('AGENTE PLANILHA:',e.message);return {resposta:'Não consegui acessar ou interpretar a planilha agora. Tente novamente em instantes.',erro:e.message,verificado:false,modoAgente:'planilha_ia_node_v17_erro'};}
  };
 }
