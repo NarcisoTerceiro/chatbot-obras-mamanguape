@@ -20,7 +20,7 @@ export function acharLinhaCabecalho(rows,maxLinhasAnalisadas=20){
  }
  if(best!==-1)return best;
  // Keep support for unknown tables, choosing the widest candidate when no strong header exists.
- let width=0;
+ let width=1;
  for(let i=0;i<Math.min(rows.length,maxLinhasAnalisadas);i++){
   const n=(rows[i]||[]).filter(filled).length;if(n>width){width=n;best=i;}
  }
@@ -31,21 +31,6 @@ export function rowsToObjects(rows,tabName){
  if(idx<0)return {obras:[],cabecalho:[],ignoradas:0};
  const width=rows.reduce((w,r)=>Math.max(w,(r||[]).length),0);
  const original=Array.from({length:width},(_,j)=>String(rows[idx]?.[j]??'').trim());
- // Cabeçalho em duas linhas (célula mesclada, ex.: VALORES > ADITIVOS | REAJUSTES):
- // junta "PAI - FILHO" para cada coluna e pula a linha de subcabeçalho.
- let inicio=idx+1;
- const sub=rows[idx+1]||[];
- const subCells=sub.map((v,j)=>[v,j]).filter(([v])=>filled(v));
- const ehTexto=v=>typeof v==='string'&&!/^[\d.,\s%R$-]+$/.test(v)&&!/\d{2,}\/\d{2,}/.test(v);
- if(subCells.length>=2&&subCells.every(([v])=>ehTexto(v))&&subCells.some(([,j])=>!original[j])){
-  let pai='';
-  for(let j=0;j<width;j++){
-   if(original[j])pai=original[j];
-   const filho=String(sub[j]??'').trim();
-   if(filho)original[j]=pai&&pai!==filho?`${pai} - ${filho}`:filho;
-  }
-  inicio=idx+2;
- }
  const counts=new Map();for(const name of original.filter(Boolean))counts.set(name,(counts.get(name)||0)+1);
  const letter=index=>{let out='';for(let n=index+1;n>0;n=Math.floor((n-1)/26))out=String.fromCharCode(65+(n-1)%26)+out;return out;};
  const used=new Set(original.filter(Boolean));const avisos=[];
@@ -59,7 +44,7 @@ export function rowsToObjects(rows,tabName){
  });
  const names=header.filter(Boolean);
  const obras=[];let ignoradas=0;
- for(let i=inicio;i<rows.length;i++){
+ for(let i=idx+1;i<rows.length;i++){
   const row=rows[i]||[];
   if(!row.some(filled)){ignoradas++;continue;}
   const obj={_aba:tabName,_linha:i+1,...(avisos.length?{_avisos:avisos}:{})};let count=0;
