@@ -1779,7 +1779,7 @@ CAMPOS DISPONIVEIS: ${jsonSeguro(ctx?.colunas?.map(c=>c.column_name)||[], 2200)}
   } catch(e) { console.warn('AGENTE: esclarecimento local:', e.message); }
   return {resposta, partes:dividirEmMensagens(resposta), precisaEsclarecimento:true,
     estado:{aguardandoEsclarecimento:true,perguntaOriginal:pergunta,perguntaEsclarecimento:resposta},
-    modoAgente:'sql_agent_v14_2_esclarecimento'};
+    modoAgente:'sql_agent_v14_3_esclarecimento'};
 }
 
 function contextoEsclarecimento(historico = []) {
@@ -1919,8 +1919,25 @@ export async function responderPergunta(pergunta, historico = [], opcoes = {}) {
   });
 }
 
+async function resolverIntencaoTurno(pergunta,historico){
+  if(!historico?.length)return {modo:'nova',pergunta_autonoma:pergunta};
+  const prompt=`Resolva a intencao do turno ANTES de gerar SQL. Retorne SOMENTE JSON {"modo":"nova|continuacao|esclarecer","pergunta_autonoma":"pedido completo","pergunta":"pergunta curta ao usuario se ambiguo"}.
+Uma pergunta completa e generica sobre quantidade, ranking ou registros, sem referencia restritiva explicita, e NOVA: nao herde status, bairro, pessoa ou periodo so porque estavam antes. A conjuncao "e" sozinha nao obriga herdar filtros. Ex.: depois de obras em andamento, "qual engenheiro tem mais obras?" e geral; "existem quantas obras?" e geral.
+Referencias explicitas (dessas obras, nesse bairro, ele/ela) ou fragmentos que exigem contexto podem continuar. Reconstrua a pergunta completa com SOMENTE os filtros que a referencia autoriza. "Em geral" amplia o recorte; preserve pessoa apenas se referida explicitamente. Nao copie a ultima SQL como intencao. Respostas anteriores podem estar erradas.
+Se duas interpretacoes importantes continuarem plausiveis e faltarem referentes, faca UMA pergunta de esclarecimento. Nao invente filtros. A resposta a um esclarecimento pendente deve completar o pedido original, quando houver relacao.
+HISTORICO: ${resumoHistorico(historico)}
+ATUAL: ${JSON.stringify(pergunta)}`;
+  const bruto=stripThink(await chamarIAbruta([{role:'user',content:prompt}],{max_tokens:500,temperature:0,reasoning_effort:'low'}));
+  let j;try{j=JSON.parse(bruto.replace(/```(?:json)?/g,'').trim());}catch{throw Error('Nao foi possivel resolver o contexto da pergunta');}
+  if(!['nova','continuacao','esclarecer'].includes(j?.modo))throw Error('Decisao de contexto invalida');
+  if(j.modo==='esclarecer'){if(typeof j.pergunta!=='string'||!j.pergunta.includes('?'))throw Error('Esclarecimento sem pergunta');return j;}
+  if(typeof j.pergunta_autonoma!=='string'||!j.pergunta_autonoma.trim())throw Error('Pergunta autonoma ausente');
+  console.log('AGENTE CONTEXTO:',JSON.stringify({modo:j.modo,original:pergunta,pergunta_autonoma:j.pergunta_autonoma}));
+  return j;
+}
+
 async function responderPerguntaInterno(pergunta, historico = [], opcoes = {}) {
-  const texto = textoSeguro(pergunta, 1600);
+  let texto = textoSeguro(pergunta, 1600);
   const pendente=contextoEsclarecimento(historico);
   if(pendente)historico=[{role:'system',memoriaResumo:true,content:pendente},...historico.filter(m=>!m?.memoriaResumo)];
   let ctx=null;
@@ -1939,6 +1956,12 @@ async function responderPerguntaInterno(pergunta, historico = [], opcoes = {}) {
   }
 
   try {
+    const intencao=await resolverIntencaoTurno(texto,historico);
+    if(intencao.modo==='esclarecer')return {resposta:intencao.pergunta,partes:dividirEmMensagens(intencao.pergunta),precisaEsclarecimento:true,estado:{aguardandoEsclarecimento:true,perguntaOriginal:texto,perguntaEsclarecimento:intencao.pergunta},modoAgente:'sql_agent_v14_3_esclarecimento'};
+    // A pergunta autonoma e a unica fonte do recorte para todos os estagios.
+    // O historico bruto nao pode recolocar filtros descartados na reformulacao.
+    texto=intencao.pergunta_autonoma;
+    historico=[];
     ctx = await carregarSchemaContexto();
 
     // Estagio 1: para campos de ANALISE DE LICITACAO, o Node garante o
@@ -2101,7 +2124,7 @@ async function responderPerguntaInterno(pergunta, historico = [], opcoes = {}) {
       reparos: execucaoRef.tentativa || 0,
       earlyAccept: !!execucaoRef.earlyAccept,
       tentativas: execucaoRef.tentativas,
-      modoAgente: "sql_agent_self_healing_v14_2",
+      modoAgente: "sql_agent_self_healing_v14_3",
     };
   } catch (e) {
     console.error("SQL AGENT: falha final:", e);
