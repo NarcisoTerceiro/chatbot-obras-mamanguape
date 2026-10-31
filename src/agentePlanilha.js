@@ -153,7 +153,23 @@ function historicoParaMensagens(historico = []) {
 function extrairCodigo(texto) {
   const t = String(texto || "");
   const bloco = t.match(/```(?:python)?\s*([\s\S]*?)```/i);
-  return (bloco ? bloco[1] : t).trim();
+  let codigo = (bloco ? bloco[1] : t).trim();
+  // Remove linhas de comentário inteiras (ex.: "# sem usar import"): elas
+  // poderiam bater no filtro de segurança do sandbox por conter palavras como
+  // "import". Mantém apenas o código executável.
+  codigo = codigo
+    .split("\n")
+    .filter((l) => !/^\s*#/.test(l))
+    .join("\n")
+    .trim();
+  return codigo;
+}
+
+// Saudações e small talk: não geram código, respondem com uma orientação curta.
+function ehSaudacao(texto) {
+  return /^(oi+|ol[aá]+|opa|e a[ií]|eai|salve|bom dia|boa tarde|boa noite|tudo bem\??|como vai\??|ajuda|menu|in[ií]cio|come[çc]ar|start)\W*$/i.test(
+    texto.trim()
+  );
 }
 
 // ---- MODO 1: execução de código no sandbox Python (igual ao Data Formulator) ----
@@ -163,10 +179,12 @@ async function responderComSandbox(pergunta, obras, historico) {
     `Você analisa a planilha de obras públicas escrevendo código Python (pandas).\n` +
     `Os dados estão num DataFrame chamado df (todas as abas juntas; a coluna _aba diz a aba).\n` +
     `${REGRAS_INTERPRETACAO}\n\n` +
-    `Escreva SOMENTE código Python, sem explicação, que calcule a resposta e atribua a uma\n` +
-    `variável chamada resultado (um número, texto, lista ou dict pequeno — já pronto para ser\n` +
-    `exibido). Regras do ambiente: NÃO use import, open, arquivos nem rede (só df, pd e funções\n` +
-    `básicas). Para dinheiro em texto brasileiro (ex.: "1.250.000,00"), limpe com métodos de\n` +
+    `Escreva APENAS código Python executável, SEM comentários e SEM explicações, que calcule a\n` +
+    `resposta e atribua a uma variável chamada resultado (um número, texto, lista ou dict pequeno,\n` +
+    `já pronto para ser exibido). Não escreva a palavra import em lugar nenhum. Use somente df, pd\n` +
+    `e funções básicas (sem abrir arquivos nem rede). Para filtrar por texto use métodos de string\n` +
+    `do pandas com case=False e na=False (ex.: .str.contains('conclu', case=False, na=False)).\n` +
+    `Para dinheiro em texto brasileiro (ex.: "1.250.000,00"), limpe com métodos de\n` +
     `string do pandas antes de converter: .str.replace('.', '', regex=False).str.replace(',', '.', regex=False)\n` +
     `e depois pd.to_numeric(..., errors='coerce'). Não trate célula vazia/NaN como zero.\n\n` +
     `ESQUEMA DAS ABAS:\n${esquema}`;
@@ -207,14 +225,16 @@ async function responderComSandbox(pergunta, obras, historico) {
   }
 
   if (erroAnterior) {
-    // Não conseguiu calcular com código: devolve orientação, sem inventar número.
+    // O código falhou após as tentativas: em vez de desistir, responde pelo
+    // modo alternativo (planilha + contagens no contexto), que não depende de
+    // gerar código. Assim o usuário sempre recebe uma resposta.
+    console.warn("Código falhou; usando modo alternativo. Último erro:", erroAnterior);
+    const alt = await responderSemSandbox(pergunta, obras, historico);
     return {
-      resposta:
-        "Não consegui calcular isso com segurança agora. Pode reformular a pergunta ou pedir de outra forma?",
-      erro: "falha_codigo",
-      diagnostico: erroAnterior,
+      ...alt,
+      modoAgente: "contexto-node (fallback)",
+      diagnosticoCodigo: erroAnterior,
       codigo: codigoFinal || null,
-      linhas: obras.length,
     };
   }
 
@@ -313,6 +333,20 @@ export async function responderPergunta(pergunta, historico = [], opts = {}) {
   const texto = String(pergunta || "").trim();
   if (!texto) return { resposta: "Pode me dizer sua pergunta sobre as obras?", linhas: 0 };
 
+  // Saudação/small talk: responde direto, sem gerar código nem ler a planilha.
+  if (ehSaudacao(texto)) {
+    return {
+      resposta:
+        "Olá! Sou o assistente de obras públicas de Mamanguape. Pergunte sobre as obras — por exemplo:\n\n" +
+        "— *Quais obras estão em andamento?*\n" +
+        "— *Quantas obras já foram concluídas?*\n" +
+        "— *Como está a obra da praça do centro?*\n" +
+        "— *Qual o valor contratado das obras de pavimentação?*",
+      linhas: 0,
+      modoAgente: "saudacao",
+    };
+  }
+
   let obras;
   try {
     obras = await getObras();
@@ -344,5 +378,5 @@ export async function responderPergunta(pergunta, historico = [], opts = {}) {
   }
 }
 
-export { montarContextoCompleto as montarContexto, montarEsquema };
+export { montarContextoCompleto as montarContexto, montarEsquema, extrairCodigo, ehSaudacao };
 export default { responderPergunta };

@@ -71,6 +71,11 @@ BUILTINS_SEGUROS = {
     "zip": zip, "map": map, "filter": filter, "list": list, "dict": dict,
     "set": set, "tuple": tuple, "str": str, "int": int, "float": float,
     "bool": bool, "any": any, "all": all, "print": print,
+    # Funções puras adicionais (sem acesso a arquivo/rede/escape) que a IA
+    # costuma usar ao escrever pandas; reduzem erros de execução.
+    "isinstance": isinstance, "format": format, "repr": repr,
+    "reversed": reversed, "divmod": divmod, "frozenset": frozenset,
+    "abs": abs,
 }
 
 
