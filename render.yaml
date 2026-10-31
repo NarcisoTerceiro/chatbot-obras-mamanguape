@@ -39,8 +39,12 @@ services:
         value: v22.0
       - key: GROQ_MODEL
         value: openai/gpt-oss-120b
+      # Vazio = lê TODAS as abas da planilha (igual ao Data Formulator).
       - key: SHEETS_TABS
-        value: EM_ANDAMENTO,EM_LICITACAO,EM_PROJETO,PAVIMENTACAO,PENDENCIAS
+        value: ""
+      # Abas que NÃO devem ser lidas (ex.: Resumo,Instruções), por vírgula.
+      - key: SHEETS_TABS_IGNORAR
+        value: ""
 
       # --- Credencial do Google (via Secret File no Render) ---
       # Voce vai criar um "Secret File" chamado service-account.json no painel;

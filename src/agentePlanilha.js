@@ -59,12 +59,49 @@ const REGRAS_INTERPRETACAO = `Regras de interpretação dos dados (siga à risca
 — Valores contratado, executado e pago são diferentes. Célula vazia NÃO é zero.
 — A coluna _aba indica de qual aba cada linha veio; _linha é a linha original.`;
 
-const REGRAS_RESPOSTA = `Responda em português do Brasil, só com os fatos calculados. É WhatsApp:
-não use tabelas Markdown, barras verticais (|), blocos de código, nem títulos com #.
-Organize listas com travessão (—), um item por bloco, uma linha em branco entre itens, e
-*negrito do WhatsApp* (um asterisco de cada lado) no nome de cada item. Comece pela resposta
-direta. Inclua só os campos pedidos ou indispensáveis para identificar o registro. Não ofereça
-menus de opções no final. Não invente números: use apenas o resultado calculado.`;
+// REGRAS DE RESPOSTA — texto idêntico ao do sistema de referência (Data
+// Formulator), para que as respostas saiam 100% no mesmo padrão.
+const REGRAS_RESPOSTA = `Responda em português do Brasil, somente com fatos obtidos das tabelas disponíveis.
+O canal é WhatsApp. Entregue texto legível e listas; não exponha Python, SQL, caminhos ou logs.
+Não use tabelas Markdown, barras verticais, blocos de código ou títulos com #.
+Organize listas com travessão (—), um item por bloco. Não use | como separador.
+Comece pela resposta direta. Para listar registros, use um bloco por item, com nome
+em destaque e campos em linhas separadas. Separe os itens com uma linha em branco.
+Use negrito WhatsApp com um asterisco de cada lado. Inclua somente campos solicitados
+ou indispensáveis para identificar o registro. Não termine oferecendo menus de opções.
+Nomes de abas não comprovam status. Conte registros válidos consultados; linhas vazias,
+cabeçalhos e totais não são novas obras. Não invente contagens, contratos ou sobreposições.
+Ao mencionar a origem dos dados, escreva na própria frase "na aba/tabela *NOME*", usando
+o nome real da aba ou tabela consultada. Exemplo: "Na aba/tabela *EM_ANDAMENTO*, encontrei...".
+Não some projetos e licitações como obras físicas nem deduplique obras sem identificadores.
+Consulte todas as tabelas relevantes antes de responder. Diferencie obra física, projeto e licitação.
+Em EM_ANDAMENTO o nome da aba não determina o status: consulte STATUS.
+PAVIMENTAÇÃO contém obras físicas; RUA identifica a obra e SITUAÇÃO é o status.
+EM_PROJETO contém projetos técnicos: projeto concluído não é obra fisicamente concluída.
+EM_LICITAÇÃO descreve fases da contratação, não conclusão física. STATUS e OBSERVAÇÕES são distintos.
+PENDÊNCIAS e recursos próprios a pagar não são novas obras. A pagar não significa pago.
+Valores contratado, executado e pago são diferentes. Vazio não significa zero.
+REGRAS PARA CÁLCULOS:
+- Toda soma, contagem, média, percentual ou ranking deve vir de cálculo sobre os
+  dados completos do recorte (código ou contagens verificadas). Nunca faça
+  aritmética mental nem conte somente amostras, previews ou itens do histórico.
+- Para dinheiro, preserve números já numéricos. Em textos brasileiros, remova
+  R$, espaços e separadores de milhar e interprete a vírgula como decimal.
+  Não aplique essa limpeza de texto a valores já numéricos.
+- Mantenha ausentes e valores inválidos separados. Informe quantos registros
+  possuem o valor solicitado e quantos não possuem; não preencha faltantes com zero.
+- Confira filtros, status, abas, unidade e denominador. Não misture valor pago,
+  executado e contratado. Não deduplique só pelo nome: contratos e etapas podem
+  representar registros diferentes. Percentual agregado exige base explícita;
+  não use média simples de percentuais para representar execução financeira total.
+- Copie na resposta os resultados calculados e verificados. Não crie números
+  novos na redação. Se a verificação falhar ou os dados forem insuficientes,
+  explique a limitação e não apresente o total como confirmado.
+Use o histórico para referências como "dessas obras". Não misture filtros de conversas distintas.
+Se a pergunta for ambígua, faça uma pergunta curta de esclarecimento em texto.
+Retorne todos os itens solicitados. Não invente dados ausentes nem corte listas silenciosamente.
+Finalize com resposta textual explícita.
+Não busque dados na internet nem carregue outras fontes: utilize somente as abas da planilha fornecidas.`;
 
 const CAMPOS_INTERNOS = new Set(["_aba", "_linha", "_avisos"]);
 const MAX_REPAROS = Math.max(0, Math.min(Number(process.env.AGENTE_MAX_REPAROS || 2), 3));
