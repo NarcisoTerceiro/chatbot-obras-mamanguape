@@ -1,21 +1,21 @@
 // ============================================================
 //  server.js  -  ponto de entrada do chatbot
 //
-//  Fluxo padrao:
-//  Google Sheets --(conta de servico/sincronizacao)--> Supabase
-//  WhatsApp -> Webhook validado -> agente SQL -> Supabase -> WhatsApp.
+//  Fluxo atual (sem banco de dados):
+//  WhatsApp -> Webhook validado -> agente de planilha -> Google Sheets -> WhatsApp.
 //
-//  O atendimento usa exclusivamente PostgreSQL; Sheets é lido na ingestão.
+//  O atendimento LÊ A PLANILHA DIRETO (src/agentePlanilha.js + src/sheets.js),
+//  usando os metadados e regras de interpretação do sistema de referência.
+//  Não usa mais PostgreSQL/Supabase.
 // ============================================================
 
 import "dotenv/config";
 import crypto from "crypto";
 import express from "express";
 
-import { sincronizar } from "./ingestao.js";
-import { responderPergunta } from "./agente.js";
+import { responderPergunta } from "./agentePlanilha.js";
 import { enviarTexto } from "./whatsapp.js";
-import { queryReadOnly } from "./db.js";
+import { getObras, getDiagnostico, limparCache } from "./sheets.js";
 import { executarComMetricas, medirEtapa } from "./telemetria.js";
 
 const app = express();
@@ -42,9 +42,8 @@ if (!META_APP_SECRET) {
 if (!ADMIN_TOKEN) {
   throw new Error("ADMIN_TOKEN e obrigatorio para as rotas administrativas.");
 }
-if (!process.env.DATABASE_URL) {
-  throw new Error("DATABASE_URL read-only e obrigatoria para o agente SQL.");
-}
+// O atendimento lê a planilha direto (sem banco). GOOGLE_SHEETS_ID é exigido
+// na primeira leitura dentro de sheets.js.
 
 function compararSegredo(a, b) {
   const ba = Buffer.from((a || "").toString());
@@ -137,21 +136,20 @@ app.get("/", (_req, res) => res.send("Chatbot de Obras de Mamanguape no ar."));
 app.get("/diagnostico", async (req, res) => {
   if (!exigirAdmin(req, res)) return;
   try {
-    const [total, status, exemplo, sync, abas] = await Promise.all([
-      queryReadOnly('SELECT COUNT(*)::int AS total FROM public.obras'),
-      queryReadOnly("SELECT COALESCE(status, 'Não informado') AS status, COUNT(*)::int AS total FROM public.obras GROUP BY status ORDER BY total DESC LIMIT 20"),
-      queryReadOnly('SELECT id, objeto, bairro, status, categoria, aba_origem FROM public.obras ORDER BY id LIMIT 1'),
-      queryReadOnly('SELECT atualizada_em, registros FROM public.obras_sync WHERE id=1'),
-      queryReadOnly('SELECT planilha_id,aba,view_nome,registros,linhas_lidas,avisos,atualizada_em FROM public.planilha_abas WHERE ativa=true ORDER BY aba'),
-    ]);
+    const obras = await getObras({ force: true });
+    const diag = getDiagnostico();
     res.json({
-      fonte_do_atendimento: 'PostgreSQL/Supabase',
-      total_de_obras: total.rows[0]?.total || 0,
-      contagem_por_status: status.rows,
-      exemplo_de_obra: exemplo.rows[0] || null,
-      lido_em: sync.rows[0]?.atualizada_em || null,
-      ultima_sincronizacao: sync.rows[0]?.atualizada_em || null,
-      abas: abas.rows,
+      fonte_do_atendimento: 'Google Sheets (leitura direta, sem banco)',
+      total_de_obras: diag.total ?? obras.length,
+      exemplo_de_obra: obras[0] || null,
+      lido_em: diag.quando || null,
+      abas: (diag.abas || []).map((a) => ({
+        aba: a.aba,
+        registros: a.obras,
+        linhas_lidas: a.linhas_lidas,
+        linhas_ignoradas: a.linhas_ignoradas,
+        avisos: a.avisos,
+      })),
     });
   } catch (e) {
     res.status(500).json({ erro: e.message });
@@ -166,24 +164,25 @@ app.get("/diagnostico", async (req, res) => {
 async function executarRotaSincronizacao(req, res) {
   if (!exigirAdmin(req, res)) return;
   try {
-    const resultado = await sincronizar();
+    // Sem banco: "sincronizar" agora apenas recarrega a planilha do cache.
+    limparCache();
+    const obras = await getObras({ force: true });
+    const diag = getDiagnostico();
     res.json({
       ok: true,
-      obras_inseridas: resultado.inseridas,
-      abas: resultado.abas,
-      planilha_id: resultado.planilha_id,
+      registros: obras.length,
+      abas: (diag.abas || []).map((a) => a.aba),
       quando: new Date().toISOString(),
     });
   } catch (e) {
-    // Mostra o erro completo para diagnostico (mensagem + tipo + detalhe).
     const detalhe = e && (e.message || e.toString());
     const codigo = e && (e.code || "");
-    console.error("ERRO na sincronizacao:", detalhe, codigo, e && e.stack);
+    console.error("ERRO ao recarregar a planilha:", detalhe, codigo, e && e.stack);
     res.status(500).json({
       ok: false,
       erro: detalhe || "erro desconhecido",
       codigo: codigo || undefined,
-      dica: "Verifique DATABASE_ADMIN_URL no Render e as credenciais do Google.",
+      dica: "Verifique GOOGLE_SHEETS_ID, as abas e o compartilhamento com a conta de serviço.",
     });
   }
 }
