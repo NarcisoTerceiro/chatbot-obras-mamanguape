@@ -98,16 +98,33 @@ export function criarLeitorSheets({api,env=process.env,now=()=>Date.now(),logger
   const currentGeneration=generation;
   const task=(async()=>{
    const sheets=await getApi();
-   let tabs=split(env.SHEETS_TABS);
-   if(!tabs.length){
-    const cacheTabsMs=duration(env.SHEETS_CACHE_ABAS_MS,300000);
-    if(!force&&tabsCache.nomes&&now()-tabsCache.time<cacheTabsMs)tabs=tabsCache.nomes;
-    else{
-     const resp=await sheets.spreadsheets.get({spreadsheetId:id,fields:'sheets.properties.title'});
-     const ignored=split(env.SHEETS_TABS_IGNORAR).map(normaliza);
-     tabs=(resp.data.sheets||[]).map(s=>s.properties?.title).filter(t=>t&&!ignored.includes(normaliza(t)));
-     if(generation===currentGeneration)tabsCache={nomes:tabs,time:now()};
+   // Descobre sempre os TÍTULOS REAIS das abas, para casar nomes pedidos mesmo
+   // com diferença de acento/maiúsculas (ex.: EM_LICITACAO -> EM_LICITAÇÃO) e
+   // nunca pedir uma aba inexistente (o Google recusa o lote inteiro: "Unable
+   // to parse range").
+   let titulosReais;
+   const cacheTabsMs=duration(env.SHEETS_CACHE_ABAS_MS,300000);
+   if(!force&&tabsCache.nomes&&now()-tabsCache.time<cacheTabsMs){
+    titulosReais=tabsCache.nomes;
+   }else{
+    const resp=await sheets.spreadsheets.get({spreadsheetId:id,fields:'sheets.properties.title'});
+    titulosReais=(resp.data.sheets||[]).map(s=>s.properties?.title).filter(Boolean);
+    if(generation===currentGeneration)tabsCache={nomes:titulosReais,time:now()};
+   }
+   const ignored=split(env.SHEETS_TABS_IGNORAR).map(normaliza);
+   const pedidas=split(env.SHEETS_TABS);
+   let tabs;
+   if(pedidas.length){
+    const porNorm=new Map(titulosReais.map(t=>[normaliza(t),t]));
+    tabs=[];
+    for(const p of pedidas){
+     const real=porNorm.get(normaliza(p));
+     if(real){if(!ignored.includes(normaliza(real)))tabs.push(real);}
+     else logger?.warn?.(`SHEETS: aba "${p}" não existe na planilha; ignorada.`);
     }
+    if(!tabs.length)throw Error('Nenhuma das abas de SHEETS_TABS existe na planilha. Confira os nomes (acentos e grafia).');
+   }else{
+    tabs=titulosReais.filter(t=>!ignored.includes(normaliza(t)));
    }
    let values=[];
    if(tabs.length){
