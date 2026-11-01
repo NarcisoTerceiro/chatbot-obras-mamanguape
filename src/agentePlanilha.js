@@ -174,7 +174,9 @@ function contagensVerificadas(aba, linhas, colunas) {
     ["status", "situacao", "situacao da obra", "fase"].includes(norm(c))
   );
   for (const col of colsStatus) {
-    const contagem = new Map();
+    // Agrupa sem diferenciar maiúscula/minúscula nem acento: "CONCLUÍDO",
+    // "Concluído" e "concluido" contam como o mesmo status.
+    const contagem = new Map(); // chaveNormalizada -> { label, n }
     let semValor = 0;
     for (const linha of linhas) {
       const v = linha[col];
@@ -182,12 +184,15 @@ function contagensVerificadas(aba, linhas, colunas) {
         semValor++;
         continue;
       }
-      const chave = String(v).trim();
-      contagem.set(chave, (contagem.get(chave) || 0) + 1);
+      const raw = String(v).trim();
+      const chave = norm(raw);
+      const atual = contagem.get(chave) || { label: raw, n: 0 };
+      atual.n += 1;
+      contagem.set(chave, atual);
     }
-    const itens = [...contagem.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .map(([k, n]) => `${k}: ${n}`);
+    const itens = [...contagem.values()]
+      .sort((a, b) => b.n - a.n)
+      .map((x) => `${x.label}: ${x.n}`);
     if (semValor) itens.push(`sem ${col}: ${semValor}`);
     if (itens.length) partes.push(`  Por ${col} — ${itens.join("; ")}.`);
   }
@@ -277,6 +282,11 @@ async function responderComSandbox(pergunta, obras, historico) {
     `Para dinheiro em texto brasileiro (ex.: "1.250.000,00"), limpe com métodos de\n` +
     `string do pandas antes de converter: .str.replace('.', '', regex=False).str.replace(',', '.', regex=False)\n` +
     `e depois pd.to_numeric(..., errors='coerce'). Não trate célula vazia/NaN como zero.\n` +
+    `Para comparar STATUS/SITUAÇÃO, normalize sempre: use .astype(str).str.strip().str.lower()\n` +
+    `antes de comparar (ex.: == 'concluído' ou .str.contains('conclu')), para não perder valores\n` +
+    `escritos em MAIÚSCULA ou com acentos diferentes.\n` +
+    `Ao listar registros, pegue os campos das PRÓPRIAS LINHAS filtradas do df (iterrows). NUNCA\n` +
+    `escreva nomes ou números de memória: só o que está no df.\n` +
     `IMPORTANTE para perguntas que envolvem VÁRIAS ABAS:\n` +
     `- Cada aba tem colunas diferentes; uma coluna pode não existir em todas (cheque "if col in sub.columns").\n` +
     `- Para combinar abas, filtre por df['_aba'].isin([...]) com os nomes EXATOS de _aba do esquema.\n` +
@@ -343,9 +353,9 @@ async function responderComSandbox(pergunta, obras, historico) {
     ...historicoParaMensagens(historico),
     {
       role: "user",
-      content: `Pergunta do cidadão: "${pergunta}".\n\nResultado calculado pelos dados da planilha (use só isto, não invente):\n${JSON.stringify(
+      content: `Pergunta do cidadão: "${pergunta}".\n\nResultado calculado pelos dados da planilha (use SOMENTE isto):\n${JSON.stringify(
         resultado
-      ).slice(0, 6000)}\n\nEscreva a resposta final para o WhatsApp.`,
+      ).slice(0, 6000)}\n\nEscreva a resposta final para o WhatsApp. Liste APENAS os itens que estão\nneste resultado — não acrescente, não invente nomes nem números, e não repita itens. Se o\nresultado trouxer uma contagem mas não a lista completa, informe o número e diga que pode\nlistar os nomes se o cidadão pedir, em vez de inventar a lista.`,
     },
   ];
   const resposta = await chamarIAbruta(msgsResposta, {
