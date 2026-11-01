@@ -129,6 +129,45 @@ function colunasDaAba(linhas) {
   return cols;
 }
 
+// Converte número no formato brasileiro ("R$ 1.250.000,00", "45%", "1.200")
+// para Number. Retorna null quando não é um número (não vira zero).
+function parseNumeroBR(v) {
+  if (typeof v === "number" && isFinite(v)) return v;
+  if (v === null || v === undefined) return null;
+  let raw = String(v).trim().replace(/R\$/gi, "").replace(/ /g, "").replace(/\s/g, "");
+  if (!raw) return null;
+  const pct = raw.endsWith("%");
+  if (pct) raw = raw.slice(0, -1);
+  if (raw.includes(",")) {
+    raw = raw.replace(/\./g, "").replace(",", "."); // 1.250.000,00 -> 1250000.00
+  } else if (/^-?\d{1,3}(\.\d{3})+$/.test(raw)) {
+    raw = raw.replace(/\./g, ""); // 1.250.000 -> 1250000 (ponto = milhar)
+  }
+  if (!/^-?\d+(\.\d+)?$/.test(raw)) return null;
+  const n = parseFloat(raw);
+  return pct ? n / 100 : n;
+}
+
+// Para cada coluna, decide se é numérica pelos próprios dados (não por chute)
+// e devolve soma + quantos têm valor + quantos não têm.
+function resumoNumerico(col, linhas) {
+  let soma = 0, comValor = 0, semValor = 0, naoNumerico = 0;
+  for (const linha of linhas) {
+    const v = linha[col];
+    if (v === null || v === undefined || String(v).trim() === "") { semValor++; continue; }
+    const n = parseNumeroBR(v);
+    if (n === null) { naoNumerico++; continue; }
+    soma += n; comValor++;
+  }
+  // Numérica só se a maioria dos preenchidos é número (evita somar texto).
+  const numerica = comValor >= 1 && comValor >= naoNumerico;
+  return { numerica, soma, comValor, semValor };
+}
+
+function fmtNum(n) {
+  return Number.isInteger(n) ? String(n) : n.toFixed(2);
+}
+
 function contagensVerificadas(aba, linhas, colunas) {
   const partes = [`Aba *${aba}*: ${linhas.length} registro(s).`];
   const colsStatus = colunas.filter((c) =>
@@ -152,14 +191,28 @@ function contagensVerificadas(aba, linhas, colunas) {
     if (semValor) itens.push(`sem ${col}: ${semValor}`);
     if (itens.length) partes.push(`  Por ${col} — ${itens.join("; ")}.`);
   }
+  // Somas verificadas das colunas numéricas (valores, áreas, %, etc.).
+  for (const col of colunas) {
+    const r = resumoNumerico(col, linhas);
+    if (!r.numerica) continue;
+    partes.push(
+      `  Soma de ${col} = ${fmtNum(r.soma)} (em ${r.comValor} registro(s) com valor; ${r.semValor} sem valor).`
+    );
+  }
   return partes.join("\n");
 }
 
 // Esquema compacto (colunas + significado + contagens + 2 exemplos por aba),
 // entregue à IA para ela escrever o código pandas certo.
+function totalGeral(obras) {
+  const grupos = agruparPorAba(obras);
+  const porAba = [...grupos.entries()].map(([a, l]) => `${a}: ${l.length}`);
+  return `TOTAL GERAL: ${obras.length} registro(s) em ${grupos.size} aba(s) — ${porAba.join("; ")}.`;
+}
+
 function montarEsquema(obras) {
   const grupos = agruparPorAba(obras);
-  const blocos = [];
+  const blocos = [totalGeral(obras)];
   for (const [aba, linhas] of grupos) {
     const colunas = colunasDaAba(linhas);
     const exemplos = linhas.slice(0, 2).map((l) => {
@@ -223,8 +276,14 @@ async function responderComSandbox(pergunta, obras, historico) {
     `do pandas com case=False e na=False (ex.: .str.contains('conclu', case=False, na=False)).\n` +
     `Para dinheiro em texto brasileiro (ex.: "1.250.000,00"), limpe com métodos de\n` +
     `string do pandas antes de converter: .str.replace('.', '', regex=False).str.replace(',', '.', regex=False)\n` +
-    `e depois pd.to_numeric(..., errors='coerce'). Não trate célula vazia/NaN como zero.\n\n` +
-    `ESQUEMA DAS ABAS:\n${esquema}`;
+    `e depois pd.to_numeric(..., errors='coerce'). Não trate célula vazia/NaN como zero.\n` +
+    `IMPORTANTE para perguntas que envolvem VÁRIAS ABAS:\n` +
+    `- Cada aba tem colunas diferentes; uma coluna pode não existir em todas (cheque "if col in sub.columns").\n` +
+    `- Para combinar abas, filtre por df['_aba'].isin([...]) com os nomes EXATOS de _aba do esquema.\n` +
+    `- Some/CONTE por aba e depois junte os resultados; confira o total contra a soma das partes.\n` +
+    `- Obras físicas = EM_ANDAMENTO e PAVIMENTAÇÃO; projetos (EM_PROJETO) e licitações (EM_LICITAÇÃO)\n` +
+    `  NÃO entram em "obras físicas". Não misture valor contratado, pago e executado.\n\n` +
+    `ESQUEMA DAS ABAS (com contagens e somas já verificadas — use para conferir seu resultado):\n${esquema}`;
 
   let erroAnterior = "";
   let resultado = null;
@@ -336,8 +395,10 @@ function montarContextoCompleto(obras) {
     aviso = "\n[Dados truncados por tamanho; peça para restringir por aba/bairro se faltar algo.]";
   }
   return (
-    "CONTAGENS VERIFICADAS (use estes números para contagens):\n" +
+    "CONTAGENS E SOMAS VERIFICADAS (use SEMPRE estes números; não recalcule somando as linhas na mão):\n" +
+    totalGeral(obras) + "\n" +
     contagens.join("\n") +
+    "\nPara perguntas que cruzam abas, some os números já verificados das abas certas; não conte linha por linha." +
     "\n\nDADOS DAS TABELAS:\n" +
     dados +
     aviso
