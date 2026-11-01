@@ -437,6 +437,183 @@ async function responderSemSandbox(pergunta, obras, historico) {
   };
 }
 
+// ====================================================================
+// MODO PLANO (determinístico, igual ao Data Formulator): a IA só traduz a
+// pergunta num PLANO; quem FILTRA, CONTA, SOMA e LISTA é o Node, sobre os
+// dados reais. Assim o modelo nunca "conta de cabeça" nem inventa nomes —
+// funciona bem até com modelo pequeno.
+// ====================================================================
+
+function extrairJSON(texto) {
+  const t = String(texto || "");
+  const m = t.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try { return JSON.parse(m[0]); } catch { return null; }
+}
+
+function resolverColuna(nome, colunas) {
+  if (!nome) return null;
+  const alvo = norm(nome);
+  let hit = colunas.find((c) => norm(c) === alvo);
+  if (hit) return hit;
+  hit = colunas.find((c) => norm(c).includes(alvo) || alvo.includes(norm(c)));
+  return hit || null;
+}
+
+const CONCEITO_STATUS = ["status", "situacao", "situacao da obra", "fase"];
+const ehConceitoStatus = (nome) => CONCEITO_STATUS.includes(norm(nome));
+const colunaStatusDe = (keys) => keys.find((k) => CONCEITO_STATUS.includes(norm(k))) || null;
+
+function executarPlano(plano, obras) {
+  const grupos = agruparPorAba(obras);
+  const todasAbas = [...grupos.keys()];
+  // Resolve abas pedidas (por nome normalizado); vazio/"todas" = todas.
+  let abasPedidas = Array.isArray(plano.abas) ? plano.abas : plano.abas ? [plano.abas] : [];
+  abasPedidas = abasPedidas.map((a) => String(a)).filter(Boolean);
+  let abasAlvo;
+  if (!abasPedidas.length || abasPedidas.some((a) => norm(a) === "todas")) {
+    abasAlvo = todasAbas;
+  } else {
+    abasAlvo = todasAbas.filter((real) =>
+      abasPedidas.some((p) => norm(p) === norm(real) || norm(real).includes(norm(p)) || norm(p).includes(norm(real)))
+    );
+    if (!abasAlvo.length) abasAlvo = todasAbas;
+  }
+
+  let linhas = [];
+  for (const aba of abasAlvo) linhas.push(...grupos.get(aba));
+
+  // Aplica filtros de texto (sem ligar para maiúscula/acento).
+  const filtros = Array.isArray(plano.filtros) ? plano.filtros : [];
+  for (const f of filtros) {
+    if (!f || !f.coluna || f.valor === undefined || f.valor === null) continue;
+    const alvoVal = norm(f.valor);
+    const operador = norm(f.operador || "contem");
+    linhas = linhas.filter((l) => {
+      const keys = Object.keys(l);
+      let col = resolverColuna(f.coluna, keys);
+      // Se pediu STATUS mas a aba usa SITUAÇÃO (ou vice-versa), acha a de status.
+      if (!col && ehConceitoStatus(f.coluna)) col = colunaStatusDe(keys);
+      if (!col) return false;
+      const v = norm(l[col]);
+      if (!v) return false;
+      return operador.startsWith("igual") ? v === alvoVal : v.includes(alvoVal);
+    });
+  }
+
+  const operacao = norm(plano.operacao || "contar");
+  const porAba = {};
+  for (const l of linhas) porAba[l._aba] = (porAba[l._aba] || 0) + 1;
+
+  if (operacao.startsWith("som") || operacao.startsWith("med")) {
+    // alguma coluna de valor
+    const col0 = plano.coluna_valor || plano.colunaValor || "";
+    let soma = 0, comValor = 0, semValor = 0;
+    for (const l of linhas) {
+      const col = resolverColuna(col0, Object.keys(l));
+      const n = col ? parseNumeroBR(l[col]) : null;
+      if (n === null) { semValor++; continue; }
+      soma += n; comValor++;
+    }
+    const valor = operacao.startsWith("med") ? (comValor ? soma / comValor : 0) : soma;
+    return {
+      tipo: operacao.startsWith("med") ? "media" : "soma",
+      coluna: col0, valor, soma, comValor, semValor, total: linhas.length, porAba,
+      resumoTexto:
+        `${operacao.startsWith("med") ? "Média" : "Soma"} de ${col0}: ${fmtNum(valor)} ` +
+        `(em ${comValor} registro(s) com valor; ${semValor} sem valor; ${linhas.length} no recorte).`,
+    };
+  }
+
+  if (operacao.startsWith("list")) {
+    const campos = (Array.isArray(plano.campos) ? plano.campos : [plano.campos])
+      .filter(Boolean);
+    const itens = linhas.slice(0, 60).map((l) => {
+      if (!campos.length) {
+        const col = resolverColuna("OBJETO", Object.keys(l)) || resolverColuna("RUA", Object.keys(l));
+        return { aba: l._aba, texto: col ? String(l[col]) : `linha ${l._linha}` };
+      }
+      const partes = campos.map((c) => {
+        const col = resolverColuna(c, Object.keys(l));
+        return col ? `${col}: ${l[col]}` : null;
+      }).filter(Boolean);
+      return { aba: l._aba, texto: partes.join(" — ") };
+    });
+    return {
+      tipo: "lista", total: linhas.length, porAba, itens,
+      resumoTexto: `${linhas.length} registro(s) encontrados. Lista (até 60): ` +
+        itens.map((i) => `• ${i.texto} [${i.aba}]`).join("\n"),
+    };
+  }
+
+  // padrão: contagem
+  const porAbaTxt = Object.entries(porAba).map(([a, n]) => `${a}: ${n}`).join("; ");
+  return {
+    tipo: "contagem", total: linhas.length, porAba,
+    resumoTexto: `${linhas.length} registro(s)` + (porAbaTxt ? ` — por aba: ${porAbaTxt}.` : "."),
+  };
+}
+
+const PLANO_SYSTEM = `Você traduz a pergunta do cidadão num PLANO JSON para consultar a planilha de obras.
+NÃO calcule nada: só diga O QUE consultar. Quem conta/soma/lista é o sistema.
+Responda SOMENTE com um JSON neste formato (sem texto fora do JSON):
+{"abas":["NOME_DA_ABA"] ou ["todas"],
+ "filtros":[{"coluna":"STATUS","operador":"igual","valor":"concluída"}],
+ "operacao":"contar" | "listar" | "somar" | "media",
+ "coluna_valor":"VALOR TOTAL DA OBRA",
+ "campos":["OBJETO DA OBRA"]}
+Regras:
+- Use os nomes EXATOS de abas e colunas do ESQUEMA abaixo.
+- "operador":"igual" para status exato (ex.: concluída); "contem" para texto parcial (bairro, rua, nome).
+- "coluna_valor" só para somar/media. "campos" só para listar (o que mostrar).
+- Obras físicas = abas EM_ANDAMENTO e PAVIMENTAÇÃO (não inclua projetos/licitações).
+- Não diferencie maiúscula/acento nos valores; o sistema normaliza.`;
+
+async function responderComPlano(pergunta, obras, historico) {
+  const esquema = montarEsquema(obras);
+  const planoRaw = await chamarIAbruta(
+    [
+      { role: "system", content: `${PLANO_SYSTEM}\n\nESQUEMA:\n${esquema}` },
+      ...historicoParaMensagens(historico),
+      { role: "user", content: `Pergunta: "${pergunta}". Devolva só o JSON do plano.` },
+    ],
+    { max_tokens: 500, temperature: 0, reasoning_effort: "medium" }
+  );
+  const plano = extrairJSON(planoRaw);
+  if (!plano) throw new Error("plano inválido");
+
+  const resultado = executarPlano(plano, obras);
+
+  // A IA só REDIGE a partir do resultado determinístico do Node.
+  const resposta = await chamarIAbruta(
+    [
+      {
+        role: "system",
+        content: `Você é o assistente de obras de Mamanguape no WhatsApp.\n${REGRAS_RESPOSTA}`,
+      },
+      ...historicoParaMensagens(historico),
+      {
+        role: "user",
+        content:
+          `Pergunta: "${pergunta}".\n\nResultado JÁ CALCULADO pelo sistema sobre a planilha (use SOMENTE isto, ` +
+          `não recalcule, não invente nomes nem números):\n${JSON.stringify(resultado).slice(0, 7000)}\n\n` +
+          `Escreva a resposta final para o WhatsApp a partir desse resultado.`,
+      },
+    ],
+    { max_tokens: 1200, temperature: 0.2, reasoning_effort: "low" }
+  );
+
+  return {
+    resposta:
+      String(resposta || "").trim() ||
+      resultado.resumoTexto ||
+      "Não consegui formular a resposta agora.",
+    linhas: obras.length,
+    modoAgente: "plano-node",
+    plano,
+  };
+}
+
 export async function responderPergunta(pergunta, historico = [], opts = {}) {
   const texto = String(pergunta || "").trim();
   if (!texto) return { resposta: "Pode me dizer sua pergunta sobre as obras?", linhas: 0 };
@@ -473,6 +650,13 @@ export async function responderPergunta(pergunta, historico = [], opts = {}) {
     };
   }
 
+  // 1º: modo PLANO determinístico (Node calcula). 2º: sandbox de código.
+  // 3º: contexto. Cada um cai para o próximo se falhar.
+  try {
+    return await responderComPlano(texto, obras, historico);
+  } catch (e1) {
+    console.warn("Plano falhou, tentando próximo modo:", e1.message);
+  }
   try {
     if (sandboxDisponivel()) return await responderComSandbox(texto, obras, historico);
     return await responderSemSandbox(texto, obras, historico);
@@ -486,5 +670,5 @@ export async function responderPergunta(pergunta, historico = [], opts = {}) {
   }
 }
 
-export { montarContextoCompleto as montarContexto, montarEsquema, extrairCodigo, ehSaudacao };
+export { montarContextoCompleto as montarContexto, montarEsquema, extrairCodigo, ehSaudacao, executarPlano };
 export default { responderPergunta };
