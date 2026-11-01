@@ -566,8 +566,19 @@ Regras:
 - Use os nomes EXATOS de abas e colunas do ESQUEMA abaixo.
 - "operador":"igual" para status exato (ex.: concluída); "contem" para texto parcial (bairro, rua, nome).
 - "coluna_valor" só para somar/media. "campos" só para listar (o que mostrar).
-- Obras físicas = abas EM_ANDAMENTO e PAVIMENTAÇÃO (não inclua projetos/licitações).
-- Não diferencie maiúscula/acento nos valores; o sistema normaliza.`;
+- Não diferencie maiúscula/acento nos valores; o sistema normaliza.
+- Quando a pergunta é sobre uma CATEGORIA que é o tema de uma aba, selecione ESSA aba e
+  NÃO adicione filtro: licitações -> EM_LICITAÇÃO; projetos -> EM_PROJETO; pendências ->
+  PENDÊNCIAS; obras (em geral/físicas) -> EM_ANDAMENTO e PAVIMENTAÇÃO. Nunca filtre por um
+  valor igual ao nome da categoria (não existe STATUS "licitação").
+- Obras físicas = EM_ANDAMENTO e PAVIMENTAÇÃO (não inclua projetos nem licitações).
+EXEMPLOS:
+- "quantas licitações?" -> {"abas":["EM_LICITAÇÃO"],"operacao":"contar"}
+- "quantos projetos?" -> {"abas":["EM_PROJETO"],"operacao":"contar"}
+- "quantas pendências?" -> {"abas":["PENDÊNCIAS"],"operacao":"contar"}
+- "quantas obras concluídas?" -> {"abas":["EM_ANDAMENTO","PAVIMENTAÇÃO"],"filtros":[{"coluna":"STATUS","operador":"igual","valor":"concluída"}],"operacao":"contar"}
+- "obras no bairro Centro" -> {"abas":["EM_ANDAMENTO","PAVIMENTAÇÃO"],"filtros":[{"coluna":"BAIRRO","operador":"contem","valor":"centro"}],"operacao":"listar","campos":["OBJETO DA OBRA"]}
+- "valor total das obras concluídas" -> {"abas":["EM_ANDAMENTO"],"filtros":[{"coluna":"STATUS","operador":"igual","valor":"concluída"}],"operacao":"somar","coluna_valor":"VALOR TOTAL DA OBRA"}`;
 
 async function responderComPlano(pergunta, obras, historico) {
   const esquema = montarEsquema(obras);
