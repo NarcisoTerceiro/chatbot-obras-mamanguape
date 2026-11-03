@@ -51,3 +51,45 @@ services:
       # o Render o monta neste caminho, ja apontado aqui:
       - key: GOOGLE_APPLICATION_CREDENTIALS
         value: /etc/secrets/service-account.json
+
+      # --- Liga o bot ao SANDBOX (motor PandasAI) ---
+      # SANDBOX_URL: cole a URL do servico sandbox depois do 1o deploy
+      # (algo como https://chatbot-obras-sandbox.onrender.com).
+      - key: SANDBOX_URL
+        sync: false
+      # O token e gerado no servico sandbox e copiado para ca automaticamente.
+      - key: SANDBOX_TOKEN
+        fromService:
+          type: web
+          name: chatbot-obras-sandbox
+          envVarKey: SANDBOX_TOKEN
+
+  # ============================================================
+  #  Servico 2: SANDBOX (Python) - motor PandasAI.
+  #  A IA escreve e EXECUTA SQL sobre as abas, com auto-correcao.
+  #  Tambem no plano gratuito.
+  # ============================================================
+  - type: web
+    name: chatbot-obras-sandbox
+    runtime: python
+    plan: free
+    branch: main
+    rootDir: sandbox
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # Token compartilhado: gerado aqui e copiado para o bot (acima).
+      - key: SANDBOX_TOKEN
+        generateValue: true
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      # A chave do Groq e a MESMA do bot; copiada automaticamente de la.
+      - key: GROQ_API_KEY
+        fromService:
+          type: web
+          name: chatbot-obras-mamanguape
+          envVarKey: GROQ_API_KEY

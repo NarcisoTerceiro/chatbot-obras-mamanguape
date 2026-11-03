@@ -660,10 +660,15 @@ async function responderComPandasAI(pergunta, obras, historico) {
           `Pergunta: "${pergunta}".\n\nResultado JÁ CALCULADO pelo sistema sobre a planilha ` +
           `(use SOMENTE isto, não recalcule, não invente nomes nem números):\n` +
           `${JSON.stringify({ tipo: calc.tipo, valor: calc.valor }).slice(0, 7000)}\n\n` +
-          `Escreva a resposta final para o WhatsApp a partir desse resultado.`,
+          `Escreva a resposta final para o WhatsApp de forma CLARA E EXPLICADA (não seca):\n` +
+          `— Comece com a resposta direta à pergunta.\n` +
+          `— Depois contextualize em 1–2 frases: de qual aba/tipo de registro veio e o que o número ou a lista representa ` +
+          `(ex.: "são obras de pavimentação concluídas", "projetos técnicos, que são diferentes de obras físicas").\n` +
+          `— Se for uma lista, organize com um item por linha e, quando ajudar, agrupe ou diga quantos são.\n` +
+          `— Seja completo e natural, como quem explica para um cidadão, mas sem inventar nada além do resultado acima.`,
       },
     ],
-    { max_tokens: 1200, temperature: 0.2, reasoning_effort: "low" }
+    { max_tokens: 1400, temperature: 0.3, reasoning_effort: "low" }
   );
 
   return {
