@@ -198,6 +198,38 @@ def run():
     return jsonify({"ok": False, "erro": valor})
 
 
+@app.post("/perguntar")
+def perguntar():
+    """Modo PandasAI: recebe a PERGUNTA + as abas e deixa a IA escrever e
+    executar SQL (DuckDB) sobre os dados, com auto-correcao. Devolve o
+    resultado ja calculado; o bot (Node) redige a frase final."""
+    if SANDBOX_TOKEN:
+        if request.headers.get("X-Sandbox-Token", "") != SANDBOX_TOKEN:
+            return jsonify({"ok": False, "erro": "nao autorizado"}), 401
+
+    dados = request.get_json(silent=True) or {}
+    pergunta = dados.get("pergunta", "")
+    abas = dados.get("abas", [])
+    regras = dados.get("regras", "")
+
+    if not isinstance(pergunta, str) or not pergunta.strip():
+        return jsonify({"ok": False, "erro": "pergunta vazia"}), 400
+    if not isinstance(abas, list) or not abas:
+        return jsonify({"ok": False, "erro": "abas deve ser uma lista nao vazia"}), 400
+
+    try:
+        from pandasai_groq import responder
+    except Exception as e:
+        return jsonify({"ok": False, "erro": f"PandasAI indisponivel no sandbox: {e}"}), 503
+
+    try:
+        resultado = responder(pergunta.strip(), abas, regras if isinstance(regras, str) else "")
+        status = 200 if resultado.get("ok") else 500
+        return jsonify(resultado), status
+    except Exception as e:  # erro na geracao/execucao
+        return jsonify({"ok": False, "erro": f"{type(e).__name__}: {e}"}), 500
+
+
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=porta)

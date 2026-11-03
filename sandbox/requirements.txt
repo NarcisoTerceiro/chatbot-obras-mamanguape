@@ -1,4 +1,6 @@
 flask==3.0.3
-pandas==2.2.2
-numpy==1.26.4
 gunicorn==22.0.0
+# Motor PandasAI (a IA escreve e executa SQL/pandas, com auto-correcao).
+# Puxa pandas, numpy, duckdb, pyarrow, pydantic, etc. automaticamente.
+pandasai==3.0.0
+requests==2.32.3

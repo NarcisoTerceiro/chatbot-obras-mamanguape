@@ -77,3 +77,58 @@ export async function executarNoSandbox(codigo, obras) {
 
   throw ultimoErro || new Error("sandbox nao respondeu");
 }
+
+// Modo PandasAI: envia a PERGUNTA + as abas e o sandbox (com PandasAI) deixa
+// a IA escrever e executar SQL sobre os dados, com auto-correcao. Devolve o
+// resultado ja calculado { ok, tipo, valor, texto }. Mesma logica de "acordar"
+// o servico no plano gratuito do Render.
+export async function perguntarNoSandbox(pergunta, abas, regras = "") {
+  if (!SANDBOX_URL) throw new Error("SANDBOX_URL nao configurada");
+
+  const url = `${SANDBOX_URL.replace(/\/$/, "")}/perguntar`;
+  const MAX_TENTATIVAS = 3;
+  let ultimoErro = null;
+
+  for (let tentativa = 1; tentativa <= MAX_TENTATIVAS; tentativa++) {
+    // A geracao de SQL pela IA pode demorar; damos um limite generoso.
+    const limite = tentativa === 1 ? 90000 : 60000;
+    const controle = new AbortController();
+    const t = setTimeout(() => controle.abort(), limite);
+
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(SANDBOX_TOKEN ? { "X-Sandbox-Token": SANDBOX_TOKEN } : {}),
+        },
+        body: JSON.stringify({ pergunta, abas, regras }),
+        signal: controle.signal,
+      });
+
+      if (resp.status === 502 || resp.status === 503) {
+        ultimoErro = new Error(`sandbox acordando (HTTP ${resp.status})`);
+        await new Promise((r) => setTimeout(r, 4000));
+        continue;
+      }
+
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || !data.ok) {
+        throw new Error(`sandbox /perguntar: ${data.erro || `HTTP ${resp.status}`}`);
+      }
+      return data; // { ok, tipo, valor, texto }
+    } catch (e) {
+      ultimoErro = e;
+      // Erro de dados/execucao (nao e "acordando") nao deve ser repetido.
+      if (e.name !== "AbortError" && !/acordando/.test(e.message)) break;
+      if (tentativa < MAX_TENTATIVAS) {
+        await new Promise((r) => setTimeout(r, 3000));
+        continue;
+      }
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  throw ultimoErro || new Error("sandbox /perguntar nao respondeu");
+}

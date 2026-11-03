@@ -17,7 +17,7 @@
 
 import { getObras } from "./sheets.js";
 import { chamarIAbruta } from "./groq.js";
-import { sandboxDisponivel, executarNoSandbox } from "./sandboxClient.js";
+import { sandboxDisponivel, executarNoSandbox, perguntarNoSandbox } from "./sandboxClient.js";
 
 const norm = (s) =>
   String(s ?? "")
@@ -625,6 +625,59 @@ async function responderComPlano(pergunta, obras, historico) {
   };
 }
 
+// MODO PANDASAI — a IA escreve e EXECUTA SQL sobre as abas (DuckDB), com
+// auto-correção, no sandbox. Cada aba vira uma tabela com nome e descrição.
+// O Node só REDIGE a frase final a partir do resultado já calculado.
+async function responderComPandasAI(pergunta, obras, historico) {
+  const grupos = agruparPorAba(obras);
+  const abas = [];
+  for (const [nome, linhas] of grupos) {
+    const registros = linhas.map((l) => {
+      const limpo = {};
+      for (const [k, v] of Object.entries(l)) {
+        if (CAMPOS_INTERNOS.has(k)) continue; // remove _aba/_linha/_avisos
+        limpo[k] = v;
+      }
+      return limpo;
+    });
+    abas.push({ nome, descricao: significadoDaAba(nome), registros });
+  }
+
+  const regras = `${REGRAS_RESPOSTA}\n${REGRAS_INTERPRETACAO}`;
+  const calc = await perguntarNoSandbox(pergunta, abas, regras); // { ok, tipo, valor, texto }
+
+  // A IA só REDIGE a partir do resultado JÁ CALCULADO pelo PandasAI.
+  const resposta = await chamarIAbruta(
+    [
+      {
+        role: "system",
+        content: `Você é o assistente de obras de Mamanguape no WhatsApp.\n${REGRAS_RESPOSTA}`,
+      },
+      ...historicoParaMensagens(historico),
+      {
+        role: "user",
+        content:
+          `Pergunta: "${pergunta}".\n\nResultado JÁ CALCULADO pelo sistema sobre a planilha ` +
+          `(use SOMENTE isto, não recalcule, não invente nomes nem números):\n` +
+          `${JSON.stringify({ tipo: calc.tipo, valor: calc.valor }).slice(0, 7000)}\n\n` +
+          `Escreva a resposta final para o WhatsApp a partir desse resultado.`,
+      },
+    ],
+    { max_tokens: 1200, temperature: 0.2, reasoning_effort: "low" }
+  );
+
+  return {
+    resposta:
+      String(resposta || "").trim() ||
+      calc.texto ||
+      "Não consegui formular a resposta agora.",
+    linhas: obras.length,
+    modoAgente: "pandasai",
+    tipo: calc.tipo,
+    valor: calc.valor,
+  };
+}
+
 export async function responderPergunta(pergunta, historico = [], opts = {}) {
   const texto = String(pergunta || "").trim();
   if (!texto) return { resposta: "Pode me dizer sua pergunta sobre as obras?", linhas: 0 };
@@ -661,8 +714,17 @@ export async function responderPergunta(pergunta, historico = [], opts = {}) {
     };
   }
 
-  // 1º: modo PLANO determinístico (Node calcula). 2º: sandbox de código.
-  // 3º: contexto. Cada um cai para o próximo se falhar.
+  // 1º: PandasAI (a IA escreve e EXECUTA SQL, com auto-correção) — só quando
+  // o sandbox está ligado. É o modo mais robusto para cálculos.
+  if (sandboxDisponivel()) {
+    try {
+      return await responderComPandasAI(texto, obras, historico);
+    } catch (e0) {
+      console.warn("PandasAI falhou, tentando próximo modo:", e0.message);
+    }
+  }
+  // 2º: modo PLANO determinístico (Node calcula). 3º: sandbox de código.
+  // 4º: contexto. Cada um cai para o próximo se falhar.
   try {
     return await responderComPlano(texto, obras, historico);
   } catch (e1) {
